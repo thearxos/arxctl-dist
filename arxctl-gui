@@ -1,0 +1,586 @@
+#!/usr/bin/env python3
+# arxctl-gui — ARXOS Control Center (GTK3). Fully GUI; styled to the ARXOS design.
+import gi, subprocess, time, os, threading, shlex, re, json, random, datetime, urllib.request, urllib.parse
+# GUI children (arx, anonkit, leak test…) inherit our env. The panel gives us
+# no TERM, so any tput in a sourced rc/tool printed "No value for $TERM". Set a
+# sane default once → every output window is clean.
+if os.environ.get("TERM", "") in ("", "unknown", "dumb"): os.environ["TERM"] = "xterm-256color"
+os.environ.setdefault("COLUMNS", "100")
+gi.require_version('Gtk', '3.0')
+from gi.repository import Gtk, Gdk, GLib
+
+VERSION = "0.0.1"
+
+CSS = b"""
+window, dialog { background:#08080a; }
+.title  { font-family:'Playfair Display','DejaVu Serif',serif; font-style:italic; font-size:25px; color:#ffffff; }
+.subtitle { color:#5f5f66; font-size:9px; }
+.greeting { color:#cdb892; font-size:12px; font-style:italic; }
+.statlabel { color:#5a5a61; font-size:10px; }
+.statvalue { color:#eaeaec; font-size:12px; font-weight:600; }
+.statvalue.on { color:#5fd17a; }
+.statvalue.warn { color:#e8702a; }
+/* function cards: soft depth + a gold hover glow */
+.card { background:linear-gradient(150deg, rgba(255,255,255,0.055), rgba(255,255,255,0.018)); border:1px solid rgba(255,255,255,0.09); border-radius:14px; transition:all 150ms ease-out; }
+.card:hover { background:linear-gradient(150deg, rgba(232,112,42,0.17), rgba(232,112,42,0.04)); border:1px solid rgba(232,112,42,0.55); box-shadow:0 0 16px rgba(232,112,42,0.16); }
+.cardicon { color:#b7935f; }
+.card:hover .cardicon { color:#e8702a; }
+.cardtitle { color:#dadade; font-size:12px; font-weight:600; }
+.card:hover .cardtitle { color:#ffffff; }
+.sep { background:rgba(255,255,255,0.07); min-height:1px; }
+.mono { font-family:'JetBrains Mono',monospace; font-size:11px; color:#cfd2d6; }
+.krow { color:#e8e8ea; font-size:13px; }
+.krun { color:#5fd17a; font-weight:700; }
+button.card { padding:0; background:linear-gradient(150deg, rgba(255,255,255,0.055), rgba(255,255,255,0.018)); }
+/* buttons: quiet by default, warm to gold on hover; suggested = gold fill */
+button { border-radius:9px; border:1px solid rgba(255,255,255,0.11); background-image:none; background-color:rgba(255,255,255,0.04); color:#dedee2; }
+button:hover { background-color:rgba(232,112,42,0.15); border-color:rgba(232,112,42,0.5); color:#ffffff; }
+button.suggested-action { background-color:rgba(232,112,42,0.9); border-color:#e8702a; color:#ffffff; }
+button.suggested-action:hover { background-color:#e8702a; }
+switch:checked { background-color:#e8702a; }
+switch:checked slider { background-color:#ffffff; }
+"""
+
+def sh(c):
+    try: return subprocess.check_output(c, shell=True, text=True, stderr=subprocess.DEVNULL).strip()
+    except Exception: return ""
+
+def bg(cmd): subprocess.Popen(cmd, shell=True)
+
+# ---- greeting (time of day + live weather/location) ----
+GREETINGS = {
+    "morning":   ["Good morning", "Morning", "Rise and shine"],
+    "afternoon": ["Good afternoon", "Afternoon", "Hope the day's treating you well"],
+    "evening":   ["Good evening", "Evening", "Winding down for the day"],
+    "night":     ["Working late", "Good evening", "Burning the midnight oil"],
+}
+WEATHER_FLAVOR = [
+    ("sun", "the sun is shining"), ("clear", "clear skies out there"),
+    ("partly", "a little cloudy out"), ("cloud", "cloudy outside"),
+    ("overcast", "grey skies today"), ("drizzle", "a light drizzle outside"),
+    ("rain", "it's raining, stay dry"), ("snow", "snow outside, bundle up"),
+    ("thunder", "storms rolling through"), ("mist", "misty out there"),
+    ("fog", "foggy outside"), ("haze", "a bit hazy out"),
+]
+
+def _daypart(h):
+    if 5 <= h < 12:  return "morning"
+    if 12 <= h < 17: return "afternoon"
+    if 17 <= h < 22: return "evening"
+    return "night"
+
+def fetch_weather():
+    """(city, temp_C, desc) from wttr.in, honoring ~/.config/arxos/location, else IP geo."""
+    loc = ""
+    try:
+        lf = os.path.expanduser("~/.config/arxos/location")
+        if os.path.exists(lf): loc = open(lf).read().strip()
+    except Exception: pass
+    url = ("https://wttr.in/%s?format=j1" % urllib.parse.quote(loc)) if loc else "https://wttr.in/?format=j1"
+    req = urllib.request.Request(url, headers={"User-Agent": "curl/8"})
+    d = json.load(urllib.request.urlopen(req, timeout=8))
+    cur = d["current_condition"][0]
+    area = (d.get("nearest_area") or [{}])[0]
+    city = ((area.get("areaName") or [{}])[0].get("value", "") if area else "") or loc
+    return city, cur.get("temp_C", ""), (cur.get("weatherDesc") or [{}])[0].get("value", "")
+
+def greeting_text(city=None, temp=None, desc=None):
+    base = random.choice(GREETINGS[_daypart(datetime.datetime.now().hour)])
+    if not desc:
+        return base + " · welcome back"
+    flavor = next((f for k, f in WEATHER_FLAVOR if k in desc.lower()), "it's " + desc.lower().strip())
+    loc = (" in %s" % city) if city else ""
+    if temp not in (None, "", "?"):
+        return "%s · %s%s, %s°C" % (base, flavor, loc, temp)
+    return "%s · %s%s" % (base, flavor, loc)
+
+def run_win(title, cmd, privileged=False):
+    win = Gtk.Window(title=title); win.set_default_size(680, 470); win.set_position(Gtk.WindowPosition.CENTER)
+    try: win.set_icon_name("utilities-system-monitor")
+    except Exception: pass
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+    for m in ("set_margin_top","set_margin_bottom","set_margin_start","set_margin_end"): getattr(box, m)(14)
+    tl = Gtk.Label(); tl.set_markup("<b>%s</b>" % title); tl.set_xalign(0); box.pack_start(tl, False, False, 0)
+    tv = Gtk.TextView(); tv.set_editable(False); tv.set_cursor_visible(False); tv.set_monospace(True); tv.get_style_context().add_class("mono")
+    sc = Gtk.ScrolledWindow(); sc.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC); sc.add(tv); box.pack_start(sc, True, True, 0)
+    cb = Gtk.Button(label="Working…"); cb.set_sensitive(False); cb.connect("clicked", lambda *_: win.destroy()); box.pack_start(cb, False, False, 0)
+    win.add(box); win.show_all(); buf = tv.get_buffer()
+    full = ("pkexec bash -lc %s" if privileged else "bash -lc %s") % shlex.quote(cmd)
+    def append(t):
+        buf.insert(buf.get_end_iter(), t); tv.scroll_to_iter(buf.get_end_iter(), 0, False, 0, 0); return False
+    def reader():
+        try:
+            pr = subprocess.Popen(full, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+            for line in pr.stdout:
+                GLib.idle_add(append, re.sub(r'\x1b\[[0-9;?]*[a-zA-Z]', '', line))
+            pr.wait()
+        except Exception as e:
+            GLib.idle_add(append, "\nerror: %s\n" % e)
+        GLib.idle_add(append, "\n— finished —\n")
+        GLib.idle_add(lambda: (cb.set_label("Close"), cb.set_sensitive(True)) and False)
+        try: check_updates()   # re-check after any update/install/remove so the counter is accurate
+        except Exception: pass
+    threading.Thread(target=reader, daemon=True).start()
+
+# term() now runs the command in a live GUI window (never a terminal)
+def term(cmd):
+    cmd = re.sub(r'\s*;\s*echo\s*;\s*read[^\n]*$', '', cmd)
+    cmd = re.sub(r'\s*;\s*read[^\n]*$', '', cmd)
+    privileged = cmd.lstrip().startswith("sudo ")
+    if privileged: cmd = cmd.lstrip()[5:]
+    title = (cmd.strip().split() or ["ARXOS"])[0]
+    run_win(title, cmd, privileged=privileged)
+
+def priv(cmd):
+    run_win("ARXOS", cmd, privileged=True)
+
+_prev = [0, 0]
+def cpu_pct():
+    try:
+        with open('/proc/stat') as f: v = list(map(int, f.readline().split()[1:]))
+        idle = v[3] + (v[4] if len(v) > 4 else 0); total = sum(v)
+        di = idle - _prev[0]; dt = total - _prev[1]; _prev[0] = idle; _prev[1] = total
+        return None if dt <= 0 else max(0, min(100, round((1 - di/dt) * 100)))
+    except Exception: return None
+
+def last_mod():
+    try:
+        d = time.time() - os.path.getmtime('/var/lib/pacman/local')
+        if d < 90: return "just now"
+        if d < 3600: return "%dm ago" % (d/60)
+        if d < 86400: return "%dh ago" % (d/3600)
+        return "%dd ago" % (d/86400)
+    except Exception: return "?"
+
+UPD = "/tmp/.arxctl_updates"
+def count_tool_updates():
+    """ArxOS tool updates: manifest repos whose remote HEAD differs from what is installed."""
+    n = 0
+    manifest = os.environ.get("ARXOS_MANIFEST", "/etc/arxos/repos.list")
+    cache = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "arxos", "repos")
+    try: mlines = open(manifest).read().splitlines()
+    except Exception: return 0
+    for ln in mlines:
+        ln = ln.strip()
+        if not ln or ln.startswith("#"): continue
+        p = ln.split()
+        if len(p) < 2 or not p[1].startswith("https://"): continue
+        branch = p[2] if len(p) > 2 else "main"
+        d = os.path.join(cache, p[0])
+        if not os.path.isdir(os.path.join(d, ".git")): n += 1; continue   # not installed yet
+        # env -u neutralizes any leaked GIT_DIR; -C uses the repo's own origin remote
+        g = "env -u GIT_DIR -u GIT_WORK_TREE git -C %s " % shlex.quote(d)
+        loc = sh(g + "rev-parse HEAD 2>/dev/null")
+        rem = sh(g + "ls-remote origin %s 2>/dev/null" % shlex.quote(branch)).split()
+        if loc and rem and rem[0] != loc: n += 1
+    return n
+def check_updates():
+    def run():
+        try:
+            # Actionable updates = repo + AUR packages (minus IgnorePkg) PLUS ArxOS tool
+            # updates (manifest repos with new commits), so the counter matches the news.
+            ign = set(sh("pacman-conf IgnorePkg 2>/dev/null").split())
+            lines = sh("checkupdates 2>/dev/null").splitlines()
+            if sh("command -v yay"): lines += sh("yay -Qua 2>/dev/null").splitlines()
+            names = {p.split()[0] for p in lines if p.split()}
+            names -= ign
+            open(UPD, "w").write(str(len(names) + count_tool_updates()))
+            # also check ARXOS news (new tool commits) -> right-side popups
+            try: subprocess.Popen(["arxos-news", "--quiet"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception: pass
+        except Exception: pass
+    threading.Thread(target=run, daemon=True).start()
+def updates_count():
+    try: return int(open(UPD).read().strip())
+    except Exception: return None
+
+NET = "/tmp/.arxctl_net"
+def check_net():
+    def run():
+        import re
+        j = sh("curl -s --max-time 7 https://check.torproject.org/api/ip 2>/dev/null")
+        istor = "1" if '"IsTor":true' in j else "0"
+        m = re.search(r'"IP":"([^"]+)"', j); ip = m.group(1) if m else ""
+        if not ip: ip = sh("curl -s --max-time 7 https://api.ipify.org")
+        try: open(NET,"w").write(istor + " " + (ip or "?"))
+        except Exception: pass
+    threading.Thread(target=run, daemon=True).start()
+def net_info():
+    try:
+        a = open(NET).read().split(); return (a[0] == "1"), (a[1] if len(a) > 1 else "")
+    except Exception: return None, ""
+
+KERNELS = ["linux-arxos", "linux-arxos-zen", "linux", "linux-lts"]
+SERVICES = ["NetworkManager","sshd","bluetooth","cups","firewalld","docker","tor-anonkit","systemd-timesyncd"]
+
+class ArxCtl(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="ARXOS Control Center")
+        self.set_default_size(440, 530); self.set_resizable(False)
+        try: self.set_icon_name("preferences-system")
+        except Exception: pass
+        p = Gtk.CssProvider(); p.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), p, Gtk.STYLE_PROVIDER_PRIORITY_USER)
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        for m in ("set_margin_top","set_margin_bottom","set_margin_start","set_margin_end"): getattr(root, m)(18)
+        self.add(root)
+        ttl = Gtk.Label(); ttl.set_markup("<span font='23'>ARX<span foreground='#e8702a'>OS</span></span>")
+        ttl.set_xalign(0); ttl.get_style_context().add_class("title"); root.pack_start(ttl, False, False, 0)
+        sub = Gtk.Label(label="CONTROL CENTER  ·  v" + VERSION); sub.set_xalign(0)
+        sub.get_style_context().add_class("subtitle"); root.pack_start(sub, False, False, 0)
+        self.greet = Gtk.Label(label=greeting_text()); self.greet.set_xalign(0); self.greet.set_line_wrap(True)
+        self.greet.get_style_context().add_class("greeting"); self.greet.set_margin_top(6)
+        root.pack_start(self.greet, False, False, 0)
+        def _gw():
+            try:
+                c, t, ds = fetch_weather(); GLib.idle_add(self.greet.set_text, greeting_text(c, t, ds))
+            except Exception: pass
+        threading.Thread(target=_gw, daemon=True).start()
+        self.vals = {}
+        sg = Gtk.Grid(column_spacing=12, row_spacing=5); sg.set_margin_top(8)
+        for i, k in enumerate(("kernel","cpu","memory","tor","updated","updates")):
+            l = Gtk.Label(label=k); l.set_xalign(0); l.set_size_request(64,-1); l.get_style_context().add_class("statlabel")
+            v = Gtk.Label(label="…"); v.set_xalign(0); v.get_style_context().add_class("statvalue")
+            sg.attach(l,0,i,1,1); sg.attach(v,1,i,1,1); self.vals[k] = v
+        root.pack_start(sg, False, False, 0)
+        sep = Gtk.Box(); sep.get_style_context().add_class("sep"); sep.set_margin_top(8); sep.set_margin_bottom(2)
+        root.pack_start(sep, False, False, 0)
+        grid = Gtk.Grid(column_spacing=10, row_spacing=10, column_homogeneous=True, row_homogeneous=True)
+        root.pack_start(grid, True, True, 4)
+        cards = [
+            ("software-update-available-symbolic","Update", lambda *_: bg("setsid xfce4-terminal --title='ArxOS  ·  Update' -x bash -lc \"arx update; echo; read -rp 'done - press enter to close...'\" >/dev/null 2>&1")),
+            ("application-x-firmware-symbolic","Kernels", self.kernels),
+            ("utilities-system-monitor-symbolic","Performance", self.perf),
+            ("document-save-symbolic","Snapshots", self.snapshots),
+            ("system-run-symbolic","Services", self.services),
+            ("image-x-generic-symbolic","Wallpaper", self.wallpaper),
+            ("computer-symbolic","Virtual Machines", self.virtmachines),
+            ("help-about-symbolic","Info", self.sysinfo),
+        ]   # "Update" now runs the unified `arx update` (system packages + ARXOS tools);
+            # the old separate "Self-update" card is folded into it.
+        for i, (ic, ti, cb) in enumerate(cards):
+            b = self._card(ic, ti); b.connect("clicked", cb); grid.attach(b, i % 3, i // 3, 1, 1)
+        check_updates(); check_net(); self.refresh(); GLib.timeout_add_seconds(2, self.refresh)
+        GLib.timeout_add_seconds(120, lambda: (check_updates(), True)[1])
+        GLib.timeout_add_seconds(8, lambda: (check_net(), True)[1])
+        # Re-check the update count whenever the user returns to the window
+        # (debounced to 15s), so it never sits stale after updating elsewhere.
+        self._last_uchk = time.time()
+        def _on_focus(*a):
+            if time.time() - self._last_uchk > 15:
+                self._last_uchk = time.time(); check_updates()
+            return False
+        self.connect("focus-in-event", _on_focus)
+
+    def _card(self, icon, title):
+        b = Gtk.Button(); b.get_style_context().add_class("card")
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+        box.set_margin_top(12); box.set_margin_bottom(12)
+        img = Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.DND); img.set_pixel_size(28)
+        img.get_style_context().add_class("cardicon")
+        t = Gtk.Label(label=title); t.get_style_context().add_class("cardtitle")
+        box.pack_start(img, False, False, 0); box.pack_start(t, False, False, 0)
+        b.add(box); return b
+
+    def perf(self, *_):
+        d, a = self._dialog("Performance", 440, 480)
+        cur = sh("cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
+        model = sh("LANG=C lscpu 2>/dev/null | sed -n 's/Model name: *//p' | head -1")
+        h = Gtk.Label(); h.set_markup("<b>%s</b>" % (model or "CPU")); h.set_xalign(0); h.set_line_wrap(True); a.pack_start(h, False, False, 2)
+        mhz = sh("LANG=C lscpu 2>/dev/null|sed -n 's/CPU max MHz: *//p'|head -1")
+        sub = Gtk.Label(label="%s threads%s · governor: %s" % (sh("nproc"), ("  ·  %s MHz max" % mhz.split(".")[0]) if mhz else "", cur or "n/a"))
+        sub.set_xalign(0); sub.get_style_context().add_class("statlabel"); a.pack_start(sub, False, False, 0)
+        sep = Gtk.Box(); sep.get_style_context().add_class("sep"); sep.set_margin_top(8); sep.set_margin_bottom(6); a.pack_start(sep, False, False, 0)
+        gl = Gtk.Label(label="CPU GOVERNOR"); gl.set_xalign(0); gl.get_style_context().add_class("statlabel"); a.pack_start(gl, False, False, 0)
+        govdesc = {"performance":"max clocks always — fastest, highest power draw",
+                   "powersave":"minimum clocks — coolest, best battery life",
+                   "ondemand":"ramps up fast under load, idles back down",
+                   "schedutil":"kernel-scheduler driven — balanced modern default",
+                   "conservative":"ramps up gradually — gentler than ondemand",
+                   "userspace":"frequency set manually by userspace"}
+        govs = sh("cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors").split() or ["performance","schedutil","ondemand","conservative","powersave"]
+        grp = None
+        for g in govs:
+            rb = Gtk.RadioButton.new_with_label_from_widget(grp, g); grp = grp or rb
+            rb.set_active(g == cur)
+            rb.connect("toggled", (lambda gg: lambda b: b.get_active() and priv("command -v cpupower >/dev/null && cpupower frequency-set -g %s || for c in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo %s > \"$c\"; done" % (gg, gg)))(g))
+            a.pack_start(rb, False, False, 0)
+            dsc = govdesc.get(g)
+            if dsc:
+                dl = Gtk.Label(label=dsc); dl.set_xalign(0); dl.set_margin_start(26); dl.set_margin_bottom(5); dl.get_style_context().add_class("statlabel"); a.pack_start(dl, False, False, 0)
+        boost = "/sys/devices/system/cpu/cpufreq/boost"
+        if sh("test -f %s && echo y" % boost) == "y":
+            s2 = Gtk.Box(); s2.get_style_context().add_class("sep"); s2.set_margin_top(6); s2.set_margin_bottom(6); a.pack_start(s2, False, False, 0)
+            hb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            bl = Gtk.Label(label="Turbo boost"); bl.set_xalign(0); bl.get_style_context().add_class("krow"); hb.pack_start(bl, True, True, 0)
+            bsw = Gtk.Switch(); bsw.set_active(sh("cat " + boost) == "1"); bsw.set_valign(Gtk.Align.CENTER)
+            bsw.connect("notify::active", lambda s, _g: priv("echo %d > %s" % (1 if s.get_active() else 0, boost)))
+            hb.pack_start(bsw, False, False, 0); a.pack_start(hb, False, False, 0)
+        # ---- live kernel tuning (linux-arxos exposes BORE + vm knobs) ----
+        s3 = Gtk.Box(); s3.get_style_context().add_class("sep"); s3.set_margin_top(8); s3.set_margin_bottom(6); a.pack_start(s3, False, False, 0)
+        kl = Gtk.Label(label="KERNEL TUNING"); kl.set_xalign(0); kl.get_style_context().add_class("statlabel"); a.pack_start(kl, False, False, 0)
+        if sh("test -e /proc/sys/kernel/sched_bore && echo y") == "y":
+            hbb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            bbl = Gtk.Label(label="BORE scheduler"); bbl.set_xalign(0); bbl.get_style_context().add_class("krow"); hbb.pack_start(bbl, True, True, 0)
+            bbs = Gtk.Switch(); bbs.set_active(sh("cat /proc/sys/kernel/sched_bore") == "1"); bbs.set_valign(Gtk.Align.CENTER)
+            bbs.connect("notify::active", lambda s, _g: priv("sysctl -w kernel.sched_bore=%d" % (1 if s.get_active() else 0)))
+            hbb.pack_start(bbs, False, False, 0); a.pack_start(hbb, False, False, 0)
+            bd = Gtk.Label(label="Burst-Oriented Response Enhancer — favours interactive tasks for a snappier desktop under load."); bd.set_xalign(0); bd.set_line_wrap(True); bd.set_margin_bottom(4); bd.get_style_context().add_class("statlabel"); a.pack_start(bd, False, False, 0)
+        swv = sh("cat /proc/sys/vm/swappiness") or "60"
+        sml = Gtk.Label(label="Memory swappiness: %s" % swv); sml.set_xalign(0); sml.get_style_context().add_class("statlabel"); sml.set_margin_top(4); a.pack_start(sml, False, False, 0)
+        swd = Gtk.Label(label="How eagerly the kernel moves memory to swap. Lower keeps more in RAM (snappier); higher frees RAM sooner."); swd.set_xalign(0); swd.set_line_wrap(True); swd.set_margin_bottom(3); swd.get_style_context().add_class("statlabel"); a.pack_start(swd, False, False, 0)
+        swrow = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        for lab, val in (("Desktop 10", 10), ("Default 60", 60), ("Aggressive 100", 100)):
+            sbb = Gtk.Button(label=lab); sbb.connect("clicked", (lambda v: lambda *_: priv("sysctl -w vm.swappiness=%d" % v))(val)); swrow.pack_start(sbb, True, True, 0)
+        a.pack_start(swrow, False, False, 0)
+        pl = Gtk.Label(label="QUICK PROFILE  (governor + memory + BORE)"); pl.set_xalign(0); pl.get_style_context().add_class("statlabel"); pl.set_margin_top(8); a.pack_start(pl, False, False, 0)
+        prow = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        for name, (g, s, b) in (("Max Performance", ("performance", 10, 1)), ("Balanced", ("schedutil", 60, 1)), ("Battery", ("powersave", 100, 1))):
+            pbb = Gtk.Button(label=name)
+            pbb.connect("clicked", (lambda gg, ss, bb: lambda *_: priv(
+                "for c in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo %s > \"$c\" 2>/dev/null; done; "
+                "command -v cpupower >/dev/null && cpupower frequency-set -g %s >/dev/null 2>&1; "
+                "sysctl -w vm.swappiness=%d kernel.sched_bore=%d 2>/dev/null" % (gg, gg, ss, bb)))(g, s, b))
+            prow.pack_start(pbb, True, True, 0)
+        a.pack_start(prow, False, False, 0)
+        pd = Gtk.Label(label="Max Performance: max clocks + minimal swap. Balanced: modern default. Battery: coolest, longest runtime.")
+        pd.set_xalign(0); pd.set_line_wrap(True); pd.set_margin_top(3); pd.get_style_context().add_class("statlabel"); a.pack_start(pd, False, False, 0)
+        self._show(d)
+
+    def wallpaper(self, *_):
+        if sh("command -v arxos-wallpaper"): bg("arxos-wallpaper"); return
+        run_win("Wallpaper Manager", "cd /tmp && rm -rf wp && git clone https://github.com/thearxos/wallpimp wp && sudo install -m755 wp/arxos-wallpaper /usr/local/bin/arxos-wallpaper && setsid arxos-wallpaper")
+
+    def snapshots(self, *_):
+        if sh("command -v timeshift-gtk"): priv("timeshift-gtk")
+        elif sh("command -v btrfs-assistant"): priv("btrfs-assistant")
+        else:
+            d = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.QUESTION,
+                buttons=Gtk.ButtonsType.YES_NO, text="Snapshot manager (Timeshift) not installed.\nInstall it now?")
+            r = d.run(); d.destroy()
+            if r == Gtk.ResponseType.YES: term("arx install timeshift; echo; read -rp 'installed — enter…'")
+
+    def virtmachines(self, *_):
+        d, a = self._dialog("Virtual Machines", 530, 430)
+        intro = Gtk.Label(label="Install a full virtualization host + all drivers, no tutorial-hunting. Optional; nothing here ships preinstalled.")
+        intro.set_xalign(0); intro.set_line_wrap(True); intro.get_style_context().add_class("subtitle"); a.pack_start(intro, False, False, 4)
+        backs = [
+            ("QEMU / KVM", "libvirt", "libvirt + virt-manager + qemu-full + UEFI + spice/virtio guest tools",
+             "arx install qemu-full libvirt virt-manager virt-viewer edk2-ovmf dnsmasq iptables-nft bridge-utils openbsd-netcat swtpm spice-vdagent; "
+             "sudo systemctl enable --now libvirtd.socket libvirtd 2>/dev/null; sudo usermod -aG libvirt,kvm \"$USER\""),
+            ("VirtualBox", "virtualbox", "host + dkms modules (rebuild for the ARXOS kernel) + guest ISO",
+             "arx install virtualbox virtualbox-host-dkms virtualbox-guest-iso $(uname -r | grep -q arxos && echo linux-arxos-headers || echo linux-headers); "
+             "sudo modprobe vboxdrv 2>/dev/null; sudo usermod -aG vboxusers \"$USER\""),
+            ("VMware Workstation", "vmware-workstation", "Workstation host + vmmon/vmnet modules + services (AUR)",
+             "arx install vmware-workstation; sudo systemctl enable --now vmware-networks vmware-usbarbitrator 2>/dev/null; "
+             "sudo vmware-modconfig --console --install-all 2>/dev/null || echo 'note: vmmon/vmnet may need the community kernel patch'"),
+        ]
+        for name, pkg, desc, cmd in backs:
+            row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2); row.get_style_context().add_class("card"); row.set_margin_top(4)
+            for m in ("set_margin_start","set_margin_end","set_margin_top","set_margin_bottom"): getattr(row, m)(9)
+            top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            nl = Gtk.Label(label=name); nl.set_xalign(0); nl.get_style_context().add_class("cardtitle"); top.pack_start(nl, True, True, 0)
+            installed = sh("pacman -Qq %s 2>/dev/null" % pkg) == pkg
+            btn = Gtk.Button(label=("Reinstall" if installed else "Install"))
+            if not installed: btn.get_style_context().add_class("suggested-action")
+            btn.connect("clicked", (lambda c: lambda *_: term("%s; echo; read -rp 'done - enter...'" % c))(cmd))
+            top.pack_start(btn, False, False, 0); row.pack_start(top, False, False, 0)
+            dl = Gtk.Label(label=desc + ("   · installed" if installed else "")); dl.set_xalign(0); dl.set_line_wrap(True); dl.get_style_context().add_class("statlabel"); row.pack_start(dl, False, False, 0)
+            a.pack_start(row, False, False, 0)
+        self._show(d)
+
+    def _dialog(self, title, w=420, h=380):
+        # Non-modal: a panel that does NOT spin a blocking nested loop, so output
+        # windows (leak test, tor actions) spawned from it stay interactive and
+        # their Close button works immediately.
+        d = Gtk.Dialog(title=title, transient_for=self, modal=False); d.set_default_size(w, h)
+        d.add_button("Close", Gtk.ResponseType.CLOSE)
+        a = d.get_content_area(); a.set_spacing(6)
+        for m in ("set_margin_top","set_margin_bottom","set_margin_start","set_margin_end"): getattr(a, m)(14)
+        return d, a
+
+    def _show(self, d):
+        # Replaces the old blocking `d.show_all(); d.run(); d.destroy()`.
+        d.connect("response", lambda dd, *_: dd.destroy())
+        d.show_all()
+
+    def kernels(self, *_):
+        d, a = self._dialog("Kernels", 540, 470)
+        run = sh("uname -r")
+        h = Gtk.Label(); h.set_markup("Running:  <span foreground='#5fd17a'><b>%s</b></span>" % run); h.set_xalign(0)
+        a.pack_start(h, False, False, 4)
+        BASE = ("linux", "linux-lts")   # mainline fallbacks: DKMS + many tools depend on them, never Remove
+        # ARXOS kernels come from the GitHub build repo via `arxos-kernel`; stock kernels via arx.
+        def get(kk, tag=""):
+            if kk.startswith("linux-arxos"):
+                return lambda *_: term("arxos-kernel install %s %s; echo; read -rp 'done — enter…'" % (kk, tag))
+            return lambda *_: term("arx install %s %s-headers; echo; read -rp 'done — enter…'" % (kk, kk))
+        rem = lambda kk: lambda *_: term("sudo pacman -R --noconfirm %s %s-headers; echo; read -rp 'done — enter…'" % (kk, kk))
+        setdef = lambda kk: lambda *_: term(
+            "cfg=/boot/grub/grub.cfg; sub=$(grep -oE 'gnulinux-advanced-[0-9a-f-]+' \"$cfg\"|head -1); "
+            "ent=$(grep -oE 'gnulinux-%s-advanced-[0-9a-f-]+' \"$cfg\"|head -1); "
+            "[ -n \"$ent\" ] && sudo grub-set-default \"$sub>$ent\" && echo 'default kernel -> %s (boots into it next time)' || echo 'no GRUB entry - regenerate GRUB first'; "
+            "echo; read -rp 'enter…'" % (kk, kk))
+        def history(kk):   # rollback: list published versions, install any older one
+            def _open(*_):
+                dd, aa = self._dialog("%s — versions" % kk, 400, 380)
+                cur = sh("pacman -Q %s 2>/dev/null" % kk); cur = cur.split()[-1] if cur else ""
+                vers = [t for t in sh("arxos-kernel list %s" % kk).splitlines() if t]
+                if not vers:
+                    aa.pack_start(Gtk.Label(label="No published versions found (check your connection)."), False, False, 0)
+                for tag in vers:
+                    v = tag.split(kk + "-", 1)[-1]
+                    r = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+                    lb = Gtk.Label(label=v + ("  · installed" if v == cur else "")); lb.set_xalign(0); lb.get_style_context().add_class("krow"); r.pack_start(lb, True, True, 0)
+                    if v != cur:
+                        ib = Gtk.Button(label="Install"); ib.connect("clicked", get(kk, tag)); r.pack_start(ib, False, False, 0)
+                    aa.pack_start(r, False, False, 0)
+                self._show(dd)
+            return _open
+        # newest published version per installed ARXOS kernel, to gate the Update button
+        latest = {k: sh("arxos-kernel latest %s" % k) for k in KERNELS if k.startswith("linux-arxos") and sh("pacman -Qq %s 2>/dev/null" % k) == k}
+        for k in KERNELS:
+            installed = sh("pacman -Qq %s 2>/dev/null" % k) == k
+            ver = sh("pacman -Q %s 2>/dev/null" % k); ver = ver.split()[-1] if ver else ""
+            tag = "" if k == "linux" else k.split("-", 1)[1]
+            running = installed and ((tag and tag in run) or (k == "linux" and not any(x in run for x in ("arxos","zen","lts","hardened"))))
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+            lbl = Gtk.Label(label=k); lbl.set_xalign(0); lbl.set_size_request(120,-1); lbl.get_style_context().add_class("krow")
+            if running: lbl.get_style_context().add_class("krun")
+            row.pack_start(lbl, False, False, 0)
+            st = Gtk.Label(label=(ver + ("  · running" if running else "") if installed else "not installed")); st.set_xalign(0); st.get_style_context().add_class("statlabel")
+            row.pack_start(st, True, True, 0)
+            if not installed:
+                b = Gtk.Button(label=("Get" if k.startswith("linux-arxos") else "Install")); b.connect("clicked", get(k)); row.pack_start(b, False, False, 0)
+            else:
+                # Set default for EVERY installed kernel (running included - running != the boot default)
+                sb = Gtk.Button(label="Set default"); sb.connect("clicked", setdef(k)); row.pack_start(sb, False, False, 0)
+                # Update ONLY when a newer version is actually published
+                lt = latest.get(k, ""); ltver = lt.split(k + "-", 1)[-1] if lt else ""
+                if k.startswith("linux-arxos") and ltver and ltver != ver:
+                    ub = Gtk.Button(label="Update"); ub.get_style_context().add_class("suggested-action"); ub.connect("clicked", get(k)); row.pack_start(ub, False, False, 0)
+                if k.startswith("linux-arxos"):
+                    hb = Gtk.Button(label="History"); hb.connect("clicked", history(k)); row.pack_start(hb, False, False, 0)
+                # Remove only ARXOS kernels that are not running (never the base linux/lts - deps break)
+                if not running and k not in BASE and k.startswith("linux-arxos"):
+                    xb = Gtk.Button(label="Remove"); xb.connect("clicked", rem(k)); row.pack_start(xb, False, False, 0)
+            a.pack_start(row, False, False, 0)
+        sep = Gtk.Box(); sep.get_style_context().add_class("sep"); sep.set_margin_top(6); sep.set_margin_bottom(2); a.pack_start(sep, False, False, 0)
+        if sh("pacman -Qq linux-arxos-zen 2>/dev/null") != "linux-arxos-zen":
+            gz = Gtk.Button(label="Get linux-arxos-zen  (rolling, max-performance)"); gz.get_style_context().add_class("suggested-action"); gz.connect("clicked", get("linux-arxos-zen")); a.pack_start(gz, False, False, 0)
+        ib = Gtk.Button(label="Rebuild initramfs  (mkinitcpio -P)"); ib.connect("clicked", lambda *_: term("sudo mkinitcpio -P; echo; read -rp 'done — enter…'")); a.pack_start(ib, False, False, 0)
+        rg = Gtk.Button(label="Regenerate GRUB config"); rg.connect("clicked", lambda *_: term("sudo grub-mkconfig -o /boot/grub/grub.cfg; echo; read -rp 'done — enter…'")); a.pack_start(rg, False, False, 0)
+        note = Gtk.Label(label="linux-arxos = pinned default · linux-arxos-zen = rolling, max-performance · History rolls back to any published build."); note.set_xalign(0); note.set_line_wrap(True)
+        note.get_style_context().add_class("subtitle"); note.set_margin_top(4); a.pack_start(note, False, False, 0)
+        self._show(d)
+
+    def services(self, *_):
+        d, a = self._dialog("Services", 400, 360)
+        for s in SERVICES:
+            present = sh("systemctl list-unit-files %s.service 2>/dev/null | grep -c %s.service" % (s, s))
+            if present == "0": continue
+            en = sh("systemctl is-enabled %s 2>/dev/null" % s)
+            act = sh("systemctl is-active %s 2>/dev/null" % s)
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            lbl = Gtk.Label(label=s); lbl.set_xalign(0); lbl.get_style_context().add_class("krow")
+            if act == "active": lbl.get_style_context().add_class("krun")
+            row.pack_start(lbl, True, True, 0)
+            stt = Gtk.Label(label="%s · %s" % (en or "—", act or "—")); stt.get_style_context().add_class("statlabel")
+            row.pack_start(stt, False, False, 0)
+            sw = Gtk.Switch(); sw.set_active(en == "enabled"); sw.set_valign(Gtk.Align.CENTER)
+            sw.connect("notify::active", (lambda svc: (lambda s_, _g: priv("systemctl %s --now %s" % ("enable" if s_.get_active() else "disable", svc))))(s))
+            row.pack_start(sw, False, False, 0)
+            a.pack_start(row, False, False, 0)
+        self._show(d)
+
+    def sysinfo(self, *_):
+        d, a = self._dialog("System Information", 540, 580)
+        sc = Gtk.ScrolledWindow(); sc.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        box.set_margin_start(4); box.set_margin_end(8); sc.add(box); a.pack_start(sc, True, True, 0)
+        ld = Gtk.Label(label="gathering hardware + OS report…"); ld.set_xalign(0); ld.get_style_context().add_class("statlabel"); box.pack_start(ld, False, False, 0)
+        report = {"txt": ""}
+        def render(data):
+            report["txt"] = data
+            for c in box.get_children(): c.destroy()
+            grid = None
+            for line in data.splitlines():
+                if line.startswith("@"):
+                    h = Gtk.Label(); h.set_markup("<span foreground='#e8702a' weight='700' size='small'>%s</span>" % line[1:]); h.set_xalign(0); h.set_margin_top(13)
+                    box.pack_start(h, False, False, 0)
+                    grid = Gtk.Grid(column_spacing=14, row_spacing=4); grid.set_margin_top(3); box.pack_start(grid, False, False, 0); grid.r = 0
+                elif "|" in line and grid is not None:
+                    k, v = line.split("|", 1)
+                    kl = Gtk.Label(label=k); kl.set_xalign(0); kl.set_valign(Gtk.Align.START); kl.set_size_request(92, -1); kl.get_style_context().add_class("statlabel")
+                    vl = Gtk.Label(label=v.strip() or "—"); vl.set_xalign(0); vl.set_line_wrap(True); vl.set_selectable(True); vl.get_style_context().add_class("statvalue")
+                    grid.attach(kl, 0, grid.r, 1, 1); grid.attach(vl, 1, grid.r, 1, 1); grid.r += 1
+            box.show_all(); return False
+        def gather():
+            data = sh(r'''
+echo "@OPERATING SYSTEM"
+echo "OS|$(. /etc/os-release 2>/dev/null; echo ${PRETTY_NAME:-ARXOS}) · Arch-based"
+echo "Kernel|$(uname -sr)"
+echo "Uptime|$(uptime -p 2>/dev/null | sed 's/^up //')"
+echo "Packages|$(pacman -Qq 2>/dev/null | wc -l) native$(command -v yay>/dev/null && echo " · $(yay -Qm 2>/dev/null|wc -l) AUR")"
+echo "Shell|$(basename "${SHELL:-?}")"
+echo "Desktop|${XDG_CURRENT_DESKTOP:-XFCE}"
+echo "Display|$(xrandr 2>/dev/null | sed -n 's/.* connected[^0-9]*\([0-9]*x[0-9]*\).*/\1/p' | paste -sd ', ')"
+echo "@PROCESSOR"
+echo "Model|$(LANG=C lscpu 2>/dev/null | sed -n 's/Model name: *//p' | head -1)"
+echo "Cores|$(nproc) threads"
+echo "Max clock|$(LANG=C lscpu 2>/dev/null|sed -n 's/CPU max MHz: *//p'|head -1|cut -d. -f1) MHz"
+echo "Governor|$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null)"
+echo "@GRAPHICS & MEMORY"
+echo "GPU|$(lspci 2>/dev/null | grep -iE 'vga|3d|display' | sed 's/.*: //' | paste -sd '; ')"
+echo "Memory|$(free -h 2>/dev/null | awk '/Mem:/{print $3" / "$2}')"
+echo "Swap|$(free -h 2>/dev/null | awk '/Swap:/{print $3" / "$2}')"
+echo "@MACHINE"
+echo "Vendor|$(cat /sys/devices/virtual/dmi/id/sys_vendor 2>/dev/null) $(cat /sys/devices/virtual/dmi/id/product_name 2>/dev/null)"
+echo "Board|$(cat /sys/devices/virtual/dmi/id/board_name 2>/dev/null)"
+echo "BIOS|$(cat /sys/devices/virtual/dmi/id/bios_version 2>/dev/null)"
+echo "@STORAGE"
+lsblk -ndo NAME,SIZE,TYPE,MOUNTPOINTS 2>/dev/null | grep -vE 'loop' | awk '{m=$4; printf "%s|%s %s%s\n", $1, $2, $3, (m?" → "m:"")}'
+echo "@NETWORK"
+echo "Interface|$(ip route 2>/dev/null | awk '/default/{print $5; exit}')"
+echo "Local IP|$(ip -4 addr show $(ip route 2>/dev/null|awk '/default/{print $5;exit}') 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p')"
+echo "DNS|$(grep -m1 nameserver /etc/resolv.conf 2>/dev/null | awk '{print $2}')"
+echo "Tor|$(grep -q '^nameserver 127.0.0.1' /etc/resolv.conf 2>/dev/null && echo 'routing through Tor' || echo 'clearnet')"
+''')
+            GLib.idle_add(render, data or "could not gather system info")
+        threading.Thread(target=gather, daemon=True).start()
+        cp = Gtk.Button(label="Copy report")
+        cp.connect("clicked", lambda *_: Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(report["txt"].replace("@", "\n").replace("|", ":  "), -1))
+        a.pack_start(cp, False, False, 0)
+        self._show(d)
+
+    def refresh(self):
+        self.vals["kernel"].set_text(sh("uname -r") or "?")
+        c = cpu_pct(); gov = sh("cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
+        cv = self.vals["cpu"]; cv.set_text(("%d%%" % c if c is not None else "n/a") + ("  ·  " + gov if gov else ""))
+        cv.get_style_context().remove_class("warn")
+        if c is not None and c >= 80: cv.get_style_context().add_class("warn")
+        self.vals["memory"].set_text(sh("free -m | awk '/Mem:/{printf \"%d / %d MB\", $3, $2}'") or "?")
+        tv = self.vals["tor"]; tv.get_style_context().remove_class("on"); tv.get_style_context().remove_class("warn")
+        istor, ip = net_info()
+        proxy = sh("grep -q '^nameserver 127.0.0.1' /etc/resolv.conf 2>/dev/null && echo 1") == "1"
+        if istor:
+            tv.set_text("via Tor · %s" % (ip or "…")); tv.get_style_context().add_class("on")
+        elif proxy:
+            tv.set_text("starting · %s" % (ip or "…")); tv.get_style_context().add_class("warn")
+        elif istor is None:
+            tv.set_text("checking…")
+        else:
+            tv.set_text("off" + (" · %s" % ip if ip else ""))
+        self.vals["updated"].set_text(last_mod())
+        u = updates_count(); uv = self.vals["updates"]; uv.get_style_context().remove_class("warn"); uv.get_style_context().remove_class("on")
+        if u is None: uv.set_text("checking…")
+        elif u == 0: uv.set_text("up to date"); uv.get_style_context().add_class("on")
+        else: uv.set_text("%d available" % u); uv.get_style_context().add_class("warn")
+        return True
+
+if __name__ == "__main__":
+    import sys
+    w = ArxCtl(); w.connect("destroy", Gtk.main_quit); w.show_all()
+    if len(sys.argv) > 1 and sys.argv[1] in ("kernels", "services", "sysinfo", "perf", "snapshots", "privacy"):
+        GLib.timeout_add(700, lambda: (getattr(w, sys.argv[1])(), False)[1])
+    Gtk.main()
