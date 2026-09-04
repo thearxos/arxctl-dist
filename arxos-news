@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+# arxos-news 0.0.1 - desktop notifications for new ARXOS tool activity.
+# Polls each ARXOS repo's latest commit via the GitHub API, compares to the
+# last-seen SHA, and fires a right-side desktop notification for anything new
+# (new tools, fixes, kernel improvements) sourced straight from commit messages.
+# Idle-friendly: one tiny HTTP call per repo per run, no clones, long interval.
+import json, os, subprocess, sys, urllib.request
+
+VERSION = "0.0.1"
+OWNER = "thearxos"
+MANIFEST = os.environ.get("ARXOS_REPOS", "/etc/arxos/repos.list")
+CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "arxos")
+STATE = os.path.join(CACHE, "news-seen.json")
+COUNT = os.path.join(CACHE, "news-count")
+
+def icon(m):
+    m = m.lower()
+    if "kernel" in m or "perf" in m or "idle" in m or "speed" in m: return "cpu"
+    if "fix" in m or "bug" in m or "repair" in m or "patch" in m: return "dialog-warning"
+    if any(k in m for k in ("add", "new", "feat", "ship", "weapon", "tool", "arsenal")): return "software-update-available"
+    return "security-high"
+
+def repos():
+    # yields (name, url) from the manifest. The URL is the PUBLIC -dist mirror; the private
+    # thearxos/<name> source is unreachable without auth, so we must query the manifest URL.
+    try:
+        for ln in open(MANIFEST):
+            ln = ln.strip()
+            if ln and not ln.startswith("#"):
+                p = ln.split()
+                if len(p) >= 2 and p[1].startswith("http"):
+                    yield p[0], p[1]
+                elif p:
+                    yield p[0], "https://github.com/%s/%s-dist" % (OWNER, p[0])
+    except Exception:
+        return
+
+def _slug(url):
+    # https://github.com/thearxos/arx-dist(.git) -> thearxos/arx-dist
+    s = url.rstrip("/")
+    if s.endswith(".git"): s = s[:-4]
+    return s.split("github.com/", 1)[-1] if "github.com/" in s else s
+
+def latest(name, url):
+    slug = _slug(url)
+    # primary: GitHub API (also gives us the commit message for the notification)
+    try:
+        req = urllib.request.Request(
+            "https://api.github.com/repos/%s/commits?per_page=1" % slug,
+            headers={"User-Agent": "ARXOS-news/%s" % VERSION, "Accept": "application/vnd.github+json"})
+        d = json.load(urllib.request.urlopen(req, timeout=12))
+        if d: return d[0]["sha"], d[0]["commit"]["message"].splitlines()[0][:120]
+    except Exception:
+        pass
+    # fallback: git ls-remote has no rate limit, so detection keeps working even after
+    # the API's 60/hr unauthenticated cap is hit (we just lose the commit message).
+    try:
+        # cwd="/" so git never tries to discover a repo from the caller's directory (a broken
+        # .git there would fail the remote lookup); prompt off so a private URL fails fast.
+        out = subprocess.run(["git", "ls-remote", url, "HEAD"],
+                             capture_output=True, text=True, timeout=12, cwd="/",
+                             env={**os.environ, "GIT_TERMINAL_PROMPT": "0"}).stdout.split()
+        if out: return out[0], "new update available"
+    except Exception:
+        pass
+    return None, None
+
+def system_updates():
+    """count of available pacman repo + AUR (yay) package updates."""
+    n = 0
+    for cmd in (["checkupdates"], ["yay", "-Qua"]):
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=30).stdout
+            n += sum(1 for l in out.splitlines() if l.strip())
+        except Exception:
+            pass
+    return n
+
+def main():
+    os.makedirs(CACHE, exist_ok=True)
+    try: seen = json.load(open(STATE))
+    except Exception: seen = {}
+    first = not seen
+    force = "--notify-all" in sys.argv      # for testing: notify even on first/forced run
+    new = 0
+    for name, url in repos():
+        try: sha, msg = latest(name, url)
+        except Exception: continue
+        if not sha: continue
+        try:
+            if name not in seen:
+                # a repo newly added to the registry = a new ARXOS tool shipped
+                if not first or force:
+                    subprocess.Popen(["notify-send", "-a", "ARXOS", "-u", "normal",
+                                      "-i", "software-update-available", "ARXOS · new tool",
+                                      "%s shipped to ARXOS" % name]); new += 1
+            elif seen[name] != sha or force:
+                subprocess.Popen(["notify-send", "-a", "ARXOS", "-u", "normal",
+                                  "-i", icon(msg), "ARXOS · %s" % name, msg]); new += 1
+        except Exception: pass
+        seen[name] = sha
+    # pacman + AUR (yay) package updates — notify when a new batch appears
+    su = system_updates()
+    if su > 0 and su != seen.get("__sys") and not first:
+        try:
+            subprocess.Popen(["notify-send", "-a", "ARXOS", "-u", "normal", "-i", "system-software-update",
+                              "ARXOS · updates available",
+                              "%d package update%s ready - run arx update" % (su, "s" if su != 1 else "")])
+            new += 1
+        except Exception:
+            pass
+    seen["__sys"] = su
+    json.dump(seen, open(STATE, "w"))
+    open(COUNT, "w").write(str(new))
+    if "--quiet" not in sys.argv:
+        print("arxos-news: %d new (tracking %d repos)" % (new, len(seen)))
+
+if __name__ == "__main__":
+    if "--version" in sys.argv or "-V" in sys.argv:
+        print("arxos-news %s (ARXOS)" % VERSION); sys.exit(0)
+    main()
