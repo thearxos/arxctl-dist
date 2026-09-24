@@ -1,0 +1,3 @@
+#!/usr/bin/env sh
+# Compatibility entry for older desktop launchers.
+exec arxctl "$@"

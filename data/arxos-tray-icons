@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# arxos-tray-icons: the panel's presentation-mode indicator asks for the icon
+# "x-office-presentation-symbolic", a slideshow. ArxOS shows the coffee cup that
+# macOS keep-awake tools use. For each installed icon theme that has both icons, a
+# link under /usr/local/share/icons (searched before /usr/share) points the name at
+# the cup, so the themes themselves stay untouched. Run as root; safe to rerun.
+set -eu
+[ "$(id -u)" -eq 0 ] || { echo "arxos-tray-icons: run as root" >&2; exit 1; }
+for dir in /usr/share/icons/*/; do
+  req="$(find "$dir" -name 'x-office-presentation-symbolic.svg' -print -quit 2>/dev/null)"
+  cup="$(find "$dir" -name 'my-caffeine-on-symbolic.svg' -print -quit 2>/dev/null)"
+  [ -n "$req" ] && [ -n "$cup" ] || continue
+  rel="${req#/usr/share/icons/}"
+  install -d "/usr/local/share/icons/$(dirname "$rel")"
+  ln -sfn "$cup" "/usr/local/share/icons/$rel"
+done
