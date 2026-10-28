@@ -1,0 +1,25 @@
+{
+  "comment": "Wireless arsenal adapters: USB chipsets used for authorized wireless security testing (monitor mode + frame injection). Keyed by USB vendor:product (lowercase hex). Each entry lists every driver that drives that chipset so the toast can show them all, the in-tree one first. 'inject' means the chipset can transmit raw/management frames, which is what tools like aircrack-ng and kismet need.",
+  "adapters": {
+    "0bda:8812": {"chipset": "Realtek RTL8812AU", "band": "dual (2.4+5 GHz)", "drivers": ["rtw88_8812au", "8812au (aircrack-ng dkms)"], "monitor": true, "inject": true},
+    "0bda:8813": {"chipset": "Realtek RTL8814AU", "band": "dual (2.4+5 GHz)", "drivers": ["rtw88_8814au", "8814au (aircrack-ng dkms)"], "monitor": true, "inject": true},
+    "0bda:a81a": {"chipset": "Realtek RTL8812AU", "band": "dual (2.4+5 GHz)", "drivers": ["rtw88_8812au", "8812au (aircrack-ng dkms)"], "monitor": true, "inject": true},
+    "2357:0101": {"chipset": "Realtek RTL8812AU (TP-Link Archer T4U)", "band": "dual (2.4+5 GHz)", "drivers": ["rtw88_8812au", "8812au (aircrack-ng dkms)"], "monitor": true, "inject": true},
+    "0bda:8821": {"chipset": "Realtek RTL8821AU", "band": "dual (2.4+5 GHz)", "drivers": ["rtw88_8821au", "8821au (aircrack-ng dkms)"], "monitor": true, "inject": true},
+    "0bda:0811": {"chipset": "Realtek RTL8821AU", "band": "dual (2.4+5 GHz)", "drivers": ["rtw88_8821au", "8821au (aircrack-ng dkms)"], "monitor": true, "inject": true},
+    "0bda:818b": {"chipset": "Realtek RTL8192EU", "band": "dual (2.4+5 GHz)", "drivers": ["rtl8xxxu", "rtl8192eu (dkms)"], "monitor": true, "inject": true},
+    "0bda:8178": {"chipset": "Realtek RTL8192CU", "band": "2.4 GHz", "drivers": ["rtl8xxxu", "rtl8192cu"], "monitor": true, "inject": true},
+    "0bda:8187": {"chipset": "Realtek RTL8187", "band": "2.4 GHz", "drivers": ["rtl8187"], "monitor": true, "inject": true},
+    "0bda:f179": {"chipset": "Realtek RTL8188FTV", "band": "2.4 GHz", "drivers": ["rtl8188fu (dkms)"], "monitor": true, "inject": true},
+    "0bda:8179": {"chipset": "Realtek RTL8188EUS", "band": "2.4 GHz", "drivers": ["r8188eu", "8188eu (aircrack-ng dkms)"], "monitor": true, "inject": true},
+    "0e8d:7612": {"chipset": "MediaTek MT7612U", "band": "dual (2.4+5 GHz)", "drivers": ["mt76x2u"], "monitor": true, "inject": true},
+    "0e8d:7610": {"chipset": "MediaTek MT7610U", "band": "dual (2.4+5 GHz)", "drivers": ["mt76x0u"], "monitor": true, "inject": true},
+    "0e8d:7961": {"chipset": "MediaTek MT7921AU", "band": "dual (2.4+5 GHz + 6)", "drivers": ["mt7921u"], "monitor": true, "inject": true},
+    "0e8d:7922": {"chipset": "MediaTek MT7922", "band": "tri (2.4+5+6 GHz)", "drivers": ["mt7921u"], "monitor": true, "inject": true},
+    "0cf3:9271": {"chipset": "Atheros AR9271", "band": "2.4 GHz", "drivers": ["ath9k_htc"], "monitor": true, "inject": true},
+    "0cf3:7015": {"chipset": "Atheros AR7010", "band": "dual (2.4+5 GHz)", "drivers": ["ath9k_htc"], "monitor": true, "inject": true},
+    "148f:3070": {"chipset": "Ralink RT3070", "band": "2.4 GHz", "drivers": ["rt2800usb"], "monitor": true, "inject": true},
+    "148f:5370": {"chipset": "Ralink RT5370", "band": "2.4 GHz", "drivers": ["rt2800usb"], "monitor": true, "inject": true},
+    "148f:7601": {"chipset": "MediaTek MT7601U", "band": "2.4 GHz", "drivers": ["mt7601u"], "monitor": true, "inject": true}
+  }
+}

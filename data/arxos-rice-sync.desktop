@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=ArxOS look
+Comment=Applies the look saved for all users in the Control Center
+Exec=/usr/local/bin/arxctl --rice-sync
+OnlyShowIn=XFCE;
+NoDisplay=true

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Show Applications
+Comment=Every installed application in one searchable grid
+Exec=gdbus call --session --dest os.arx.apps --object-path /os/arx/apps --method org.freedesktop.Application.Activate {}
+Icon=arxos-apps
+NoDisplay=true
+Categories=Utility;

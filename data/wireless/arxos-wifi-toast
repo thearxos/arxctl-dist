@@ -1,0 +1,28 @@
+#!/bin/bash
+# Called by the udev rule when a wireless-arsenal adapter is plugged in. udev runs us as root with no
+# display and REAPS any process still alive when the event finishes, so the toast must be launched in
+# a transient unit that outlives the event. systemd-run --no-block does exactly that; targeting the
+# active session's uid with its DISPLAY/XDG_RUNTIME_DIR lets the GUI reach the desktop.
+# Silent and best-effort: no active session, an unknown adapter, or missing tools all just do nothing.
+ID="${1:-${ID_VENDOR_ID:-}:${ID_MODEL_ID:-}}"
+[ "${#ID}" = 9 ] || exit 0
+command -v arxpods >/dev/null 2>&1 || exit 0
+command -v systemd-run >/dev/null 2>&1 || exit 0
+
+# the active graphical session's user
+user=""
+for u in $(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $3}' | sort -u); do
+  [ "$(loginctl show-user "$u" -p State --value 2>/dev/null)" = active ] && { user="$u"; break; }
+done
+[ -n "$user" ] || exit 0
+uid="$(id -u "$user" 2>/dev/null)" || exit 0
+[ -S "/run/user/$uid/bus" ] || [ -d "/run/user/$uid" ] || exit 0
+
+# a transient scope, run as the session user, detached from the udev event so it is not reaped
+systemd-run --no-block --quiet \
+  --uid="$uid" \
+  --setenv=DISPLAY="${DISPLAY:-:0}" \
+  --setenv=XDG_RUNTIME_DIR="/run/user/$uid" \
+  --setenv=DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+  arxpods wifi-toast "$ID" 2>/dev/null
+exit 0
