@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=ArxOS app grid
+Comment=Starts the dock's Show Applications grid hidden, so it opens at once
+Exec=/usr/local/bin/arxctl --apps --preload
+OnlyShowIn=XFCE;
+NoDisplay=true

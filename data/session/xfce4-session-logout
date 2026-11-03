@@ -1,0 +1,3 @@
+#!/bin/sh
+# ARXOS: route the logout UI to our themed screen (matches the login greeter).
+exec /usr/local/bin/arxos-logout "$@"

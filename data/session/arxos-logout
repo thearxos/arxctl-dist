@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+# ARXOS logout screen: matches the login greeter (near-black + gold).
+# Replaces the default XFCE session dialog. ESC or Cancel closes.
+#
+# It also stands in for xfce4-session-logout, so it honours that command's action flags. A script
+# or an app asking for --logout, --reboot, --halt, --suspend or --switch-user gets that action at
+# once, with no dialog. It used to ignore every argument and always open the dialog, so nothing
+# could log out, restart or shut down this system from a script. Flags are read before GTK loads,
+# so they also work without a display.
+import os, subprocess, sys
+
+# --print-reply is required: sent without waiting for the answer (dbus-send's default), xfce4-session
+# accepts the call and does not log out, so the dialog's own Log out button never worked either.
+LOGOUT = ["dbus-send", "--print-reply", "--session", "--dest=org.xfce.SessionManager",
+          "/org/xfce/SessionManager", "org.xfce.Session.Manager.Logout",
+          "boolean:false", "boolean:false"]
+COMMANDS = {
+    "logout":  LOGOUT,
+    "reboot":  ["systemctl", "reboot"],
+    "halt":    ["systemctl", "poweroff"],
+    "suspend": ["systemctl", "suspend"],
+    "switch":  ["dm-tool", "switch-to-greeter"],
+}
+# xfce4-session-logout's flags (-h is halt there, not help); --fast only skips the dialog,
+# which an action flag already does
+FLAGS = {"--logout": "logout", "-l": "logout", "--reboot": "reboot", "-r": "reboot",
+         "--halt": "halt", "-h": "halt", "--suspend": "suspend", "-s": "suspend",
+         "--switch-user": "switch", "-u": "switch"}
+
+def cli(argv):
+    if any(a in ("--hibernate", "-i", "--hybrid-sleep", "-b") for a in argv):
+        print("arxos-logout: hibernation is not available on ArxOS", file=sys.stderr)
+        return 1
+    wanted = [FLAGS[a] for a in argv if a in FLAGS]
+    if not wanted:
+        return None
+    try:
+        return subprocess.run(COMMANDS[wanted[0]], stdout=subprocess.DEVNULL).returncode
+    except OSError as e:
+        print("arxos-logout: %s" % e, file=sys.stderr)
+        return 1
+
+if __name__ == "__main__":
+    rc = cli(sys.argv[1:])
+    if rc is not None:
+        sys.exit(rc)
+
+import gi
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk, Gdk
+
+def run(*cmd):
+    try: subprocess.Popen(cmd, stdout=subprocess.DEVNULL, start_new_session=True)
+    except Exception: pass
+    Gtk.main_quit()
+
+def logout():    run(*COMMANDS["logout"])
+def reboot():    run(*COMMANDS["reboot"])
+def poweroff():  run(*COMMANDS["halt"])
+def suspend():   run(*COMMANDS["suspend"])
+def switchuser():run(*COMMANDS["switch"])
+
+# ( label, svg-ish unicode, callback )
+ACTIONS = [
+    ("Log out",     "↶", logout),
+    ("Restart",     "⟳", reboot),
+    ("Shut down",   "⏻", poweroff),
+    ("Suspend",     "☾", suspend),
+    ("Switch user", "⇄", switchuser),
+]
+
+ACCENT = "#e8702a"
+
+CSS = ("""
+    window { background-color: rgba(10,10,12,0.94); }
+    .brand { color:#fff; font-family:'Playfair Display',serif; font-size:54px; font-weight:700; letter-spacing:-2px; }
+    .tag { color:rgba(255,255,255,0.5); font-size:11px; letter-spacing:6px; }
+    .pbtn { background-color: rgba(255,255,255,0.035); border:1px solid rgba(255,255,255,0.12);
+            border-radius:16px; padding:22px 14px; margin:8px; }
+    .pbtn:hover { background-color: rgba(232,112,42,0.14); border-color:%(a)s; }
+    .pbtn:focus { border-color:%(a)s; box-shadow: inset 0 0 0 1px %(a)s; outline:none; }
+    .picon { color:%(a)s; font-size:34px; }
+    .plabel { color:#fff; font-size:13px; margin-top:8px; }
+    .cancel { color:rgba(255,255,255,0.55); background:none; border:0; font-size:13px; margin-top:14px; }
+    .cancel:hover { color:%(a)s; }
+""" % {"a": ACCENT}).encode()
+
+class Logout(Gtk.Window):
+    def __init__(self):
+        super().__init__(type=Gtk.WindowType.TOPLEVEL)
+        self.set_decorated(False)
+        self.fullscreen()
+        self.set_keep_above(True)
+        sc = self.get_screen()
+        vis = sc.get_rgba_visual()
+        if vis: self.set_visual(vis)
+        self.connect("key-press-event", self.on_key)
+        self.connect("destroy", Gtk.main_quit)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        outer.set_halign(Gtk.Align.CENTER); outer.set_valign(Gtk.Align.CENTER)
+        self.add(outer)
+
+        tag = Gtk.Label(label="A CITADEL, ARMED"); tag.get_style_context().add_class("tag")
+        outer.pack_start(tag, False, False, 4)
+        brand = Gtk.Label(label="ARXOS"); brand.get_style_context().add_class("brand")
+        outer.pack_start(brand, False, False, 2)
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL); row.set_halign(Gtk.Align.CENTER)
+        row.set_margin_top(26)
+        outer.pack_start(row, False, False, 0)
+        for label, glyph, cb in ACTIONS:
+            b = Gtk.Button(); b.get_style_context().add_class("pbtn")
+            vb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            ic = Gtk.Label(label=glyph); ic.get_style_context().add_class("picon")
+            lb = Gtk.Label(label=label); lb.get_style_context().add_class("plabel")
+            vb.pack_start(ic, False, False, 0); vb.pack_start(lb, False, False, 0)
+            b.add(vb); b.connect("clicked", lambda _w, f=cb: f())
+            row.pack_start(b, False, False, 0)
+
+        cancel = Gtk.Button(label="Cancel  (Esc)"); cancel.get_style_context().add_class("cancel")
+        cancel.connect("clicked", lambda _w: Gtk.main_quit())
+        outer.pack_start(cancel, False, False, 0)
+
+    def on_key(self, _w, ev):
+        if ev.keyval == Gdk.KEY_Escape: Gtk.main_quit()
+
+prov = Gtk.CssProvider(); prov.load_from_data(CSS)
+Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), prov,
+    Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+w = Logout(); w.show_all(); Gtk.main()
