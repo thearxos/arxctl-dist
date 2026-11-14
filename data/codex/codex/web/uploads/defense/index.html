@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Defending File Uploads · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › File Upload</nav><h1>Defending File Uploads</h1><p class="cx-lede">How malicious file upload is actually prevented - store uploads where they can&#x27;t execute, validate extension and content together, randomise stored names, and harden the runtime.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1505.003</span><span class="cx-tag">D3FEND D3-EAL, D3-FA, D3-ACH</span><span class="cx-tag">OWASP A05, A06, A02</span></div><article class="cx-body"><p>Almost every attack in this cluster ends the same way: a file the attacker controls is stored somewhere it can execute or be served back dangerously. The highest-leverage fix is a design choice - put uploads where they can't run - and validation then stops the bad file ever landing. This page is ordered by effectiveness; the first control neutralises web-shell RCE even when a filter is bypassed.</p>
+<div class="cx-aside cx-note">
+<p class="cx-aside-title">Note</p>
+<p>For the operator, the absence of these is the path in: an upload that lands under the webroot with its original extension and is directly reachable is the whole game (<a href="../shells/index.html">shells</a>). Validation that checks only one of extension/content, or only on the client, is what the bypass pages defeat.</p>
+</div>
+<h2 id="1-store-uploads-so-they-cant-execute-the-design-fix">1. Store uploads so they can't execute (the design fix)</h2>
+<p>This is the control that matters most, because it removes the <em>impact</em> even if a malicious file gets through:</p>
+<ul>
+<li><strong>Store outside the webroot</strong>, or in object storage / a bucket, and serve files through a download script - never let the upload directory be a URL the server will execute.</li>
+<li>If files must live on disk under a served path, make that directory <strong>non-executable</strong>: no PHP/CGI handler, <code>php_admin_flag engine off</code> (Apache), or a location block that serves everything as a static download.</li>
+<li>Better still, keep uploads on a <strong>separate server or container</strong> from the app, so a web shell that does run compromises only the upload host.</li>
+</ul>
+<p>Get this right and an uploaded <code>shell.php</code> is an inert file, not RCE - which is why the bypass pages in this cluster all assume it's <em>missing</em>.</p>
+<h2 id="2-validate-extension-and-content-together-and-require-they-match">2. Validate extension and content together - and require they match</h2>
+<p>Neither check alone is enough; do both, and confirm they agree:</p>
+<ul>
+<li><strong>Extension:</strong> whitelist the allowed types with an <strong>end-anchored</strong> test (<code>/\.(png|jpe?g|gif)$/</code>) so <code>shell.php.png</code> is the only accepted shape, <em>and</em> blacklist dangerous extensions as a backstop (<code>.php</code>, <code>.phtml</code>, <code>.phar</code>, <code>.php5</code>, <code>.asp</code>, <code>.aspx</code>, <code>.jsp</code>) in case the whitelist is bypassed. The blacklist should match the extension <strong>anywhere</strong> in the name (<code>shell.php.png</code> still contains <code>.php</code>).</li>
+<li><strong>Content:</strong> verify the file signature (magic bytes) <em>and</em> the MIME type (<code>mime_content_type()</code> on the stored temp file, not the client-supplied <code>Content-Type</code> header), and check they match the claimed extension.</li>
+<li>Validate on the <strong>back end</strong>. Client-side checks are UX only and are <a href="../client-side-bypass/index.html">trivially bypassed</a>.</li>
+</ul>
+<div class="cx-aside cx-caution">
+<p class="cx-aside-title">Caution</p>
+<p>Content validation alone is not a cure: a valid image that also contains PHP (a polyglot) passes a magic-byte/MIME check and still executes if it lands under the webroot with a <code>.php</code>-handled extension - see <a href="../content-type-bypass/index.html">content-type bypass</a>. This is exactly why section 1 (non-executable storage) is primary, not this one.</p>
+</div>
+<h2 id="3-randomise-stored-names-and-broker-access">3. Randomise stored names and broker access</h2>
+<p>Closes <a href="../post-upload/index.html">filename injection and directory disclosure</a>:</p>
+<ul>
+<li>Generate a random stored name (e.g. a UUID) and build every filesystem path from <em>that</em> generated name, never from the user-supplied filename. Because the user's name never reaches a path, this removes <strong>path-based</strong> filename attacks (traversal, extension tricks on disk).</li>
+<li>It does <strong>not</strong>, on its own, stop SQL or command injection via the original filename - those depend on how the name is <em>used</em>, not where the file is stored. If you keep the original name (for display/download), write and read it with <strong>parameterised queries</strong> (it's untrusted data, not "sanitised"), and if any processing step takes the name, pass it to a native API or an argv vector with <a href="../../command-injection/defense/index.html">no shell</a> - never interpolate it into a query string or a command line.</li>
+<li>Serve downloads through a script that looks up the file by id, enforces authorization (so it isn't an <a href="../../idor/index.html">IDOR</a>/<a href="../../lfi/index.html">LFI</a> in its own right), and sends <code>Content-Disposition: attachment</code>, <code>X-Content-Type-Options: nosniff</code>, and an accurate <code>Content-Type</code>.</li>
+<li>Return <code>403</code> on direct access to the storage directory.</li>
+</ul>
+<h2 id="4-harden-the-runtime-limits-the-blast-radius">4. Harden the runtime (limits the blast radius)</h2>
+<ul>
+<li><strong>Least privilege:</strong> run the app as a low-privileged user so a shell that does execute isn't root and can't read unrelated secrets.</li>
+<li><strong>Disable dangerous sinks:</strong> PHP <code>disable_functions = system,exec,shell_exec,passthru,popen,proc_open,pcntl_exec</code> where unused - this is what blunts a web shell that reaches execution.</li>
+<li><strong>OS-enforced isolation:</strong> the separate upload server/container from section 1, plus seccomp/AppArmor, is what actually confines a running shell. Note PHP's <code>open_basedir</code> restricts PHP's <em>own</em> file functions only; a command spawned via <code>system()</code> runs outside its scope, so don't rely on it to contain a successful upload-to-RCE.</li>
+<li><strong>Limits and hygiene:</strong> cap file size (blunts <a href="../limited-uploads/index.html">DoS uploads</a>), keep image/parsing libraries patched, and scan uploads for known-malicious content.</li>
+</ul>
+<h2 id="5-defense-in-depth">5. Defense in depth</h2>
+<ul>
+<li><strong>WAF</strong>: catches known shell/polyglot signatures; a secondary layer, evadable, never the fix.</li>
+<li><strong>Logging and alerting:</strong> uploads of double-extensions, executable types, or files whose content and extension disagree are high-signal. Suppress verbose server errors so a failed upload doesn't leak the storage path or stack traces.</li>
+</ul>
+<h2 id="for-the-report">For the report</h2>
+<ol>
+<li><strong>Primary (design):</strong> store uploads outside the webroot / in a non-executable location or separate host, served via a brokered download script.</li>
+<li><strong>Validation:</strong> whitelist + blacklist the extension <em>and</em> validate signature/MIME, requiring all to agree, on the back end.</li>
+<li><strong>Naming/access:</strong> build disk paths from a random generated name; treat the original filename as untrusted (parameterised DB writes, no-shell processing); authorized download script with <code>nosniff</code> + <code>Content-Disposition</code>, <code>403</code> on the directory.</li>
+<li><strong>Runtime:</strong> low-privileged account, <code>disable_functions</code>, OS isolation (not <code>open_basedir</code> alone), size limits, patched libraries.</li>
+</ol>
+<p>Avoid presenting a single check - a MIME test, an extension blacklist, a WAF - as the fix; this cluster is a catalogue of how each falls on its own.</p>
+<h2 id="related">Related</h2>
+<ul>
+<li><a href="../shells/index.html">Shells</a> - the payloads non-executable storage renders inert</li>
+<li><a href="../content-type-bypass/index.html">Content-Type bypass</a> - why content validation alone isn't enough</li>
+<li><a href="../post-upload/index.html">Post-upload</a> - the filename/disclosure issues section 3 closes</li>
+</ul></article><nav class="cx-pager"><a class="cx-prev" href="../post-upload/index.html">Previous: Post-upload</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

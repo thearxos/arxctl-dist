@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shodan &amp; Third-Party OSINT · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Network › Reconnaissance</nav><h1>Shodan &amp; Third-Party OSINT</h1><p class="cx-lede">Enriching a host list with service banners, open ports, and version data - using third-party scan databases (Shodan, Censys) that have already done the active scanning so you don&#x27;t have to.</p><div class="cx-tags"><span class="cx-tag">MITRE T1596, T1596.001, T1593.002, T1595</span><span class="cx-tag">D3FEND D3-NTA</span><span class="cx-tag">IMPACT InternalAccess</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Once you have a list of IPs that belong to the target, you want banners, open ports, and version info for each - <em>without scanning them yourself</em>. Third-party services (Shodan, Censys, ZoomEye, BinaryEdge) continuously scan the public internet and let you query the results. You get scan data the target can't see you collect.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Resolve subdomains to IPs
+for i in $(cat subdomains.txt); do
+  host &quot;$i&quot; | grep &quot;has address&quot; | grep &quot;$DOMAIN&quot; | awk &#x27;{print $NF}&#x27; &gt;&gt; ips.txt
+done
+
+# Run each IP through Shodan
+for ip in $(cat ips.txt); do shodan host &quot;$ip&quot;; done</code></pre></figure>
+<p>Success indicator: per-IP open-port lists, service banners, and version strings - sourced from existing scan data, no packets sent from your address to the target.</p>
+<h2 id="why-use-third-party-scan-data">Why use third-party scan data</h2>
+<p>Three reasons:</p>
+<ol>
+<li><strong>Stealth.</strong> A passive query against Shodan never touches the target. Nmap from your attack box does. On a hardened target with IDS/IPS, your <code>nmap -sV -p-</code> will land you in the alert queue. Shodan won't.</li>
+<li><strong>Coverage.</strong> Shodan scans on a continuous rolling basis with massive infrastructure. They see things short-lived port openings you'd miss with a one-time scan.</li>
+<li><strong>History.</strong> Shodan's results include timestamps. A port that was open three weeks ago but is closed now is sometimes more revealing than a port that's currently open.</li>
+</ol>
+<p>The trade-off: third-party scans can be stale (days to weeks old), incomplete (not every port scanned), or wrong (banner parsing errors). Cross-check anything important before relying on it.</p>
+<h2 id="shodan-basics">Shodan basics</h2>
+<p><a href="https://www.shodan.io/">Shodan</a> indexes internet-connected devices by scanning common ports (HTTP/HTTPS, FTP, SSH, SNMP, Telnet, RTSP, SIP, plus thousands of less-obvious ones). Search is by IP, hostname, banner content, or arbitrary string.</p>
+<p>The web UI is good for ad-hoc exploration. The CLI is better for scripted recon.</p>
+<h3 id="cli-setup">CLI setup</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">pip install shodan
+shodan init &lt;YOUR_API_KEY&gt;</code></pre></figure>
+<p>The free tier limits queries hard; a paid Membership ($59 one-time) raises limits substantially.</p>
+<h3 id="querying-a-single-host">Querying a single host</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">shodan host 10.0.24.93</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>10.0.24.93
+City:                    Berlin
+Country:                 Germany
+Organization:            Example
+Updated:                 2021-09-01T09:02:11.370085
+Number of open ports:    2
+
+Ports:
+     80/tcp nginx
+    443/tcp nginx</code></pre></figure>
+<p>Useful fields:</p>
+<ul>
+<li><strong>Organization</strong> - confirms (or contradicts) attribution. If <code>Organization</code> says <code>Example</code>, the IP genuinely belongs to them. If it says <code>Cloudflare, Inc.</code>, the IP is a CDN front for the real origin server.</li>
+<li><strong>Open ports</strong> - what was observed open. Often more revealing than a fresh nmap because Shodan catches services that open intermittently.</li>
+<li><strong>Banners</strong> - version strings. <code>OpenSSH (7.6p1 Ubuntu-4ubuntu0.3)</code> tells you Ubuntu 18.04 with that specific OpenSSH version. Match against the <a href="https://www.cvedetails.com/">CVE database</a> for known issues.</li>
+</ul>
+<h3 id="looping-over-an-ip-list">Looping over an IP list</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># After building ips.txt from DNS resolution
+for ip in $(cat ips.txt); do
+  echo &quot;=== $ip ===&quot;
+  shodan host &quot;$ip&quot;
+  echo
+done | tee shodan-results.txt</code></pre></figure>
+<p>A medium-sized target might have 20-50 unique IPs. This loop completes in under a minute. Read the output. Note any host with unusual ports - a mail-looking IP serving 8080 might be running an admin panel.</p>
+<h3 id="sample-multi-host-pattern-from-a-real-target">Sample multi-host pattern from a real target</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>10.0.24.93        Berlin, Germany    nginx on 80/443                    → web app
+10.0.27.33        Berlin, Germany    OpenSSH 7.6p1, nginx on 80/443     → bastion or main web
+10.0.27.22        Berlin, Germany    SMTP 25, DNS 53, HTTP 80/81, POP3  → likely mail + DNS host
+10.0.95.250       AWS us-west-2      S3 static website                  → third-party (cloud)</code></pre></figure>
+<p>Immediate observations:</p>
+<ul>
+<li>The mail server (<code>10.0.27.22</code>) runs both SMTP and DNS, and exposes ports <code>80</code> and <code>81</code> (an admin panel?) and a non-standard <code>444</code>. Worth deeper investigation.</li>
+<li>The Ubuntu version visible in the SSH banner can be tracked back to specific kernel versions and out-of-band update windows.</li>
+<li>The <code>s3-website</code> IP is third-party hosted - out of scope for active testing, but worth checking for bucket misconfigurations (see <a href="../cloud-resources/index.html">Cloud Resources</a>).</li>
+</ul>
+<h3 id="shodan-search-operators">Shodan search operators</h3>
+<p>The CLI also supports search queries:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># Find hosts matching a banner string
+shodan search &#x27;nginx country:DE org:&quot;Example&quot;&#x27;
+
+# Find hosts running specific software versions
+shodan search &#x27;product:&quot;OpenSSH&quot; version:&quot;7.6&quot;&#x27;
+
+# Find hosts with specific HTTP titles (useful for admin panels)
+shodan search &#x27;http.title:&quot;Login Page&quot; org:&quot;Example&quot;&#x27;
+
+# Find hosts exposing specific services
+shodan search &#x27;port:3306 country:DE org:&quot;Example&quot;&#x27;</code></pre></figure>
+<p>Operators are documented at <a href="https://www.shodan.io/search/filters">Shodan Filters</a>. Combine <code>org:</code>, <code>country:</code>, <code>port:</code>, <code>product:</code>, <code>version:</code> to narrow searches to in-scope assets.</p>
+<h2 id="censys">Censys</h2>
+<p><a href="https://search.censys.io/">Censys</a> is the principal alternative to Shodan. Different scanner, different coverage, different scoring. Worth running both - they catch different things.</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># Web UI: https://search.censys.io/
+# CLI:
+pip install censys
+censys config  # add API ID + secret
+censys hosts 10.0.27.33</code></pre></figure>
+<p>Censys also offers certificate search - useful for finding IPs that present a TLS cert with a specific issuer/subject. Sometimes catches subdomains that crt.sh missed:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">censys search &#x27;services.tls.certificates.leaf_data.subject.organization: &quot;Example&quot;&#x27;</code></pre></figure>
+<h2 id="other-passive-intel-sources">Other passive intel sources</h2>
+<p>Quick mention of services worth knowing:</p>
+<table>
+<thead>
+<tr>
+<th>Service</th>
+<th>Strength</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="https://domain.glass/">domain.glass</a></td>
+<td>Aggregator showing DNS, TLS, CDN, security headers, and Cloudflare classification in one view. Good for quick "what's protecting this?"</td>
+</tr>
+<tr>
+<td><a href="https://securitytrails.com/">SecurityTrails</a></td>
+<td>Historical DNS records - see subdomains that <em>used to</em> exist. Great for forgotten infrastructure.</td>
+</tr>
+<tr>
+<td><a href="https://dnsdumpster.com/">DNSDumpster</a></td>
+<td>Free DNS recon with network map visualization</td>
+</tr>
+<tr>
+<td><a href="https://viewdns.info/">ViewDNS.info</a></td>
+<td>WHOIS, reverse-IP lookup, port scan, traceroute - assorted DNS utilities</td>
+</tr>
+<tr>
+<td><a href="https://www.zoomeye.org/">ZoomEye</a></td>
+<td>Chinese alternative to Shodan; better coverage on some Asia-Pacific assets</td>
+</tr>
+<tr>
+<td><a href="https://www.binaryedge.io/">BinaryEdge</a></td>
+<td>Continuous scanning + leaked credential database</td>
+</tr>
+<tr>
+<td><a href="https://hunter.io/">Hunter.io</a></td>
+<td>Email address discovery for an organization - common formats and verified addresses</td>
+</tr>
+</tbody>
+</table>
+<h2 id="cloudflare-and-other-cdns">Cloudflare and other CDNs</h2>
+<p>When you see Cloudflare IPs in DNS results, the public-facing IP is just the CDN edge. The real origin server is hidden behind it. Several techniques to find the origin:</p>
+<ol>
+<li><strong>Historical DNS</strong> - SecurityTrails or DNS history archives often show the pre-Cloudflare IP from when the org first set up DNS.</li>
+<li><strong>Certificate transparency on subdomains</strong> - many subdomains (especially mail, dev, staging) bypass Cloudflare. Their direct IPs are in crt.sh.</li>
+<li><strong>Email headers</strong> - outbound email from the target's mail server includes the originating server IP. Send a support inquiry, read the headers.</li>
+<li><strong>Misconfigured services</strong> - FTP, SSH, SMTP often aren't proxied through Cloudflare. If those services appear in DNS, their A records are the real origin.</li>
+<li><strong>Cloudflare-specific tools</strong> - <a href="https://github.com/christophetd/CloudFlair">CloudFlair</a> cross-references Censys data to find origin IPs by certificate match.</li>
+</ol>
+<p><code>domain.glass</code> will explicitly tell you "Cloudflare protected" - useful flag for layer-2 gateway notes ("WAF observed, suggests Cloudflare bypass needed on origin").</p>
+<h2 id="putting-it-together">Putting it together</h2>
+<p>A reasonable Shodan-stage workflow:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>1. Build ips.txt          → from DNS resolution + cert transparency
+2. shodan host &lt;ip&gt; loop  → per-host banner &amp; port data
+3. shodan search org:X    → catch IPs that DNS didn&#x27;t surface but Shodan attributes to org
+4. Cross-check Censys     → fills gaps in Shodan coverage
+5. Identify CDN-fronted   → note for later origin-IP discovery
+6. Save banners/versions  → input for CVE lookup and active scan prioritization</code></pre></figure>
+<p>By the end, you have a per-host inventory: IP, hostname, geo, organization attribution, observed open ports, service banners, software versions, and a CDN/WAF classification. From there, active enumeration (<a href="../../services/index.html">services cluster</a>) becomes targeted instead of speculative.</p></article><nav class="cx-pager"><a class="cx-prev" href="../domains-and-subdomains/index.html">Previous: Domains &amp; Subdomains</a><a class="cx-next" href="../cloud-resources/index.html">Next: Cloud Resources</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

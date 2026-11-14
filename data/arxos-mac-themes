@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# arxos-mac-themes: install the macOS look for the Control Center's Ricing panel,
+# system-wide: the WhiteSur GTK and window themes in every accent (dark and light)
+# and the MacTahoe icons (macOS Tahoe). Both come from pinned releases checked
+# against fixed BLAKE2 hashes. They build as the calling user in a scratch
+# directory; root only copies the finished themes into /usr/share. Kora, the ArxOS
+# icon theme, is never touched.
+set -euo pipefail
+
+WS_VER=2025-04-03
+WS_URL="https://github.com/vinceliuice/WhiteSur-gtk-theme/archive/refs/tags/$WS_VER.tar.gz"
+WS_B2=1d38b9b46a21d0f42d6ed3592ea1e57ddfbe65ac152df75b3a93b9367da1214c5430d65f04451b25a286fef540c1b23d5f81e2a273e343a7620de291d4c22a81
+MT_VER=2026-09-10
+MT_URL="https://github.com/vinceliuice/MacTahoe-icon-theme/archive/refs/tags/$MT_VER.tar.gz"
+MT_B2=a958d688cc3285ccabe433cfab236922b969b69e613bbcde38e1a023000a26f518445b940ed9cc6f54410695526a0aec13b25bdc1fdb9cade4548a8557a2f7ba
+THEMES=/usr/share/themes
+ICONS=/usr/share/icons
+
+say() { printf '  %s\n' "$*"; }
+die() { printf '  %s\n' "$*" >&2; exit 1; }
+[ "$(id -u)" -ne 0 ] || die "Run this as your normal user. It asks for the administrator password only to copy the finished themes."
+
+# Themes installed by a package belong to that package; do not overwrite them.
+for d in "$THEMES/WhiteSur-Dark" "$ICONS/MacTahoe-dark"; do
+  if owner="$(pacman -Qqo "$d" 2>/dev/null)"; then
+    die "$d belongs to the package $owner. Remove it first: arx remove $owner"
+  fi
+done
+
+if ! command -v sassc >/dev/null; then
+  say "Installing the theme compiler (sassc)..."
+  sudo arx install sassc
+fi
+command -v sassc >/dev/null || die "sassc is still missing; nothing was installed."
+
+W="$(mktemp -d)"; trap 'rm -rf "$W"' EXIT
+fetch() { # $1 url, $2 pinned b2, $3 file
+  curl -fsSL --proto '=https' --retry 3 -o "$3" "$1"
+  echo "$2  $3" | b2sum -c --quiet - || die "$(basename "$1") does not match the pinned release. Nothing was installed."
+}
+say "Downloading WhiteSur $WS_VER and MacTahoe $MT_VER..."
+fetch "$WS_URL" "$WS_B2" "$W/ws.tar.gz"
+fetch "$MT_URL" "$MT_B2" "$W/mt.tar.gz"
+tar -xzf "$W/ws.tar.gz" -C "$W"; tar -xzf "$W/mt.tar.gz" -C "$W"
+
+# Both installers write into their user's home (WhiteSur also restarts the panel and
+# edits the whisker menu). Give them a scratch HOME and a no-op panel command.
+mkdir -p "$W/home" "$W/themes" "$W/icons" "$W/shim"
+printf '#!/bin/sh\nexit 0\n' > "$W/shim/xfce4-panel"; chmod +x "$W/shim/xfce4-panel"
+run() { HOME="$W/home" PATH="$W/shim:$PATH" TERM="${TERM:-xterm}" "$@" </dev/null >>"$W/build.log" 2>&1 || true; }
+
+say "Building WhiteSur in every accent, dark and light..."
+( cd "$W/WhiteSur-gtk-theme-$WS_VER" && run ./install.sh -d "$W/themes" -t all -c dark -c light -o normal )
+say "Building the MacTahoe icons..."
+( cd "$W/MacTahoe-icon-theme-$MT_VER" && run ./install.sh -d "$W/icons" )
+
+# Judge the builds by what they produced, not by the installers' exit status.
+missing=0
+for mode in Dark Light; do
+  for accent in "" -blue -purple -pink -red -orange -yellow -green -grey; do
+    t="WhiteSur-$mode$accent"
+    [ -f "$W/themes/$t/gtk-3.0/gtk.css" ] && [ -d "$W/themes/$t/xfwm4" ] || { say "missing: $t"; missing=1; }
+  done
+done
+for t in MacTahoe MacTahoe-dark MacTahoe-light; do
+  [ -f "$W/icons/$t/index.theme" ] || { say "missing: $t"; missing=1; }
+done
+if [ "$missing" -ne 0 ]; then
+  tail -20 "$W/build.log" >&2
+  die "The build was incomplete; nothing was installed."
+fi
+
+say "Installing into $THEMES and $ICONS (administrator password required)..."
+sudo bash -c '
+  set -e
+  rm -rf "$1"/WhiteSur-Dark* "$1"/WhiteSur-Light* "$2"/MacTahoe "$2"/MacTahoe-dark "$2"/MacTahoe-light
+  cp -r --no-preserve=ownership "$3"/WhiteSur-* "$1"/
+  cp -r --no-preserve=ownership "$4"/MacTahoe "$4"/MacTahoe-dark "$4"/MacTahoe-light "$2"/
+  chmod -R a+rX "$1"/WhiteSur-* "$2"/MacTahoe*
+  for t in MacTahoe MacTahoe-dark MacTahoe-light; do gtk-update-icon-cache -qf "$2/$t" 2>/dev/null || true; done
+  if command -v arxos-tray-icons >/dev/null; then arxos-tray-icons; fi
+' _ "$THEMES" "$ICONS" "$W/themes" "$W/icons"
+say "The macOS themes are installed. Pick a look in Control Center > Ricing."

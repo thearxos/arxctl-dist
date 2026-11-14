@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Credential Hunting · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Windows › Privilege Escalation</nav><h1>Credential Hunting</h1><p class="cx-lede">Finding credentials at rest on a Windows host - cleartext config files (web.config, unattend.xml), PowerShell history and DPAPI-protected PowerShell credentials, browser dictionary files, Sticky Notes databases, and the classic file-system and share sweeps with findstr, Get-ChildItem, and Snaffler. The lowest-value, highest-effort escalation lookup - run it when token, group, and misconfiguration checks come up empty, and again after every context change.</p><div class="cx-tags"><span class="cx-tag">MITRE T1552.001, T1552, T1078</span><span class="cx-tag">D3FEND D3-FA, D3-CH</span><span class="cx-tag">IMPACT CredentialTheft, PrivEsc</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>When the privilege/token/group/ACL checks don't produce a primitive, hunt for credentials someone left on disk. A password for a local admin, a domain account, or a service sitting in a config file, a script, a history file, or a note turns "I can read files" into a higher-privileged context - or a domain foothold. This is the <strong>lowest-value, highest-effort</strong> lookup, so it comes last; but re-run it after <em>every</em> escalation, because SYSTEM can read files your foothold user couldn't.</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell"># Config files - recursive string hunt
+findstr /SIM /C:&quot;password&quot; *.txt *.ini *.cfg *.config *.xml
+Get-ChildItem C:\ -Recurse -Include *.config,*.xml,*.ini,*.rdp,*.vnc,*.cred -EA Ignore
+
+# High-value fixed locations
+gc (Get-PSReadLineOption).HistorySavePath                     # PowerShell history
+type C:\Windows\Panther\unattend.xml                          # install answer file
+gc &#x27;C:\Users\*\AppData\Local\Google\Chrome\User Data\Default\Custom Dictionary.txt&#x27;
+
+# DPAPI-protected PowerShell credential (if running AS that user)
+$c = Import-Clixml C:\scripts\pass.xml; $c.GetNetworkCredential().Password
+
+# Network shares, at scale
+.\Snaffler.exe -s -o snaffler.log                             # crawls shares for *.kdbx, *.ppk, passwords.*</code></pre></figure>
+<p>Success indicator: a recovered cleartext password (or crackable hash / private key) you can reuse for a higher-privileged local or domain account - confirm with <code>runas</code>, WinRM, or an authenticated service logon.</p>
+<h2 id="when-this-applies">When this applies</h2>
+<p>Credential hunting is the fallback, not the opener - a full file-system sweep is hours of work and the lowest hit-rate step in the loop (see the <a href="../index.html#operational-sequence">overview's operational sequence</a>). Reach for it when:</p>
+<ul>
+<li>Token privileges, group memberships, missing patches, and service/ACL audits have all come up empty.</li>
+<li>You've <em>just</em> escalated and should re-sweep: SYSTEM or a new admin context can read profile paths, registry hives, and share folders your previous user couldn't. Always recheck PowerShell history and user profiles after gaining local admin.</li>
+<li>You have a domain foothold and want to pivot: a password on a share or in a script is frequently the path from local access to a domain account.</li>
+</ul>
+<div class="cx-aside cx-note">
+<p class="cx-aside-title">Note</p>
+<p>Enumeration scripts (winPEAS, Seatbelt, LaZagne) already search most of these locations, and you should run them - but understand the manual techniques too. Scripts miss non-standard files, get blocked by AV, and can't reason about which share folder is interesting. Manual hunting also lets you target a specific user's profile once you can read it.</p>
+</div>
+<h2 id="config-files">Config files</h2>
+<p>Against best practice, applications routinely store passwords in cleartext config files. <a href="https://ss64.com/nt/findstr.html"><code>findstr</code></a> is the workhorse for searching file <em>contents</em> recursively:</p>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">findstr /SIM /C:&quot;password&quot; *.txt *.ini *.cfg *.config *.xml</code></pre></figure>
+<ul>
+<li><code>/S</code> recurse subdirectories · <code>/I</code> case-insensitive · <code>/M</code> print only the filename · <code>/C:"..."</code> literal search string.</li>
+<li>Drop <code>/M</code> to see the matching line (<code>findstr /SI "password" *.config</code>), add <code>/N</code> for line numbers, <code>/P</code> to skip binary files.</li>
+</ul>
+<p>IIS stores credentials (connection strings, app-pool identities) in <strong><code>web.config</code></strong>. The default site's is at <code>C:\inetpub\wwwroot\web.config</code>, but there are often several across sites and application directories:</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">Get-ChildItem C:\ -Recurse -Filter web.config -EA Ignore | Select FullName
+where.exe /R C:\ web.config          # where.exe, not `where` - that&#x27;s the Where-Object alias in PS</code></pre></figure>
+<p>To search for a file by <em>name</em> regardless of contents:</p>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">dir /s /b confidential.txt</code></pre></figure>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">Get-ChildItem -Path C:\ -Recurse -Filter &quot;confidential.txt&quot; -ErrorAction SilentlyContinue</code></pre></figure>
+<h2 id="file-system-and-extension-sweeps">File-system and extension sweeps</h2>
+<p>The two orthogonal sweeps - by content and by extension - between them catch most at-rest secrets. By content:</p>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">:: match + show the line
+findstr /si password *.xml *.ini *.txt *.config
+:: every file, with line numbers (/p skips binaries)
+findstr /spin &quot;password&quot; *.*</code></pre></figure>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">Select-String -Path C:\Users\*\Documents\*.txt -Pattern password</code></pre></figure>
+<p>By extension - the names that tend to hold secrets:</p>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">dir /S /B *pass*.txt == *pass*.xml == *pass*.ini == *cred* == *vnc* == *.config</code></pre></figure>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">Get-ChildItem C:\ -Recurse -Include *.rdp,*.config,*.vnc,*.cred,*.kdbx,*.ppk -ErrorAction Ignore</code></pre></figure>
+<h2 id="high-value-fixed-locations">High-value fixed locations</h2>
+<p>Some stashes are predictable enough to check directly rather than sweep for.</p>
+<h3 id="powershell-history">PowerShell history</h3>
+<p>Since PowerShell 5.0 (Windows 10+), PSReadLine logs command history to a per-user file. Commands that pass credentials on the command line (<code>net use</code>, <code>wevtutil ... /u: /p:</code>, scripted logons) end up recorded in cleartext:</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">(Get-PSReadLineOption).HistorySavePath
+# C:\Users\&lt;user&gt;\AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt
+gc (Get-PSReadLineOption).HistorySavePath</code></pre></figure>
+<p>Once you're local admin, sweep every user's history at once (assumes the default path):</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">foreach($u in (ls C:\users).fullname){
+  cat &quot;$u\AppData\Roaming\Microsoft\Windows\PowerShell\PSReadline\ConsoleHost_history.txt&quot; -EA SilentlyContinue
+}</code></pre></figure>
+<h3 id="unattended-install-answer-files">Unattended-install answer files</h3>
+<p><code>unattend.xml</code> / <code>sysprep.xml</code> / <code>autounattend.xml</code> can carry an AutoLogon password or extra-account credentials, stored plaintext or base64. They <em>should</em> be deleted after imaging, but copies linger in <code>C:\Windows\Panther\</code>, <code>C:\Windows\System32\Sysprep\</code>, and ad-hoc image-build folders:</p>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;AutoLogon&gt;
+  &lt;Password&gt;&lt;Value&gt;local_4dmin_p@ss&lt;/Value&gt;&lt;PlainText&gt;true&lt;/PlainText&gt;&lt;/Password&gt;
+  &lt;Enabled&gt;true&lt;/Enabled&gt;&lt;Username&gt;Administrator&lt;/Username&gt;
+&lt;/AutoLogon&gt;</code></pre></figure>
+<p>A <code>&lt;PlainText&gt;false&lt;/PlainText&gt;</code> value is only base64, not encryption - decode it.</p>
+<h3 id="dpapi-protected-powershell-credentials">DPAPI-protected PowerShell credentials</h3>
+<p>Admins store "encrypted" credentials for scripts with <code>Get-Credential | Export-Clixml</code>. The protection is <a href="https://en.wikipedia.org/wiki/Data_Protection_API">DPAPI</a> - the blob decrypts <strong>only as the same user on the same machine</strong>. So if you already have code execution <em>as that user</em>, reversing it is trivial:</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">$c = Import-Clixml -Path &#x27;C:\scripts\pass.xml&#x27;
+$c.GetNetworkCredential().UserName
+$c.GetNetworkCredential().Password     # Str0ng3ncryptedP@ss!</code></pre></figure>
+<p>If you find the <code>.xml</code> but aren't that user, you can't just import it - you'd need the user's DPAPI masterkey (recoverable as SYSTEM, or with the domain DPAPI backup key) via mimikatz <code>dpapi::</code> or SharpDPAPI. Treat the file as a lead even when the direct import fails.</p>
+<h3 id="browser-dictionary-files">Browser dictionary files</h3>
+<p>Users add words their spell-checker flags to a custom dictionary - and people type passwords into fields that get spell-checked. Chrome's is plaintext:</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">gc &#x27;C:\Users\&lt;user&gt;\AppData\Local\Google\Chrome\User Data\Default\Custom Dictionary.txt&#x27; | Select-String -Pattern &#x27;!|@|[0-9]&#x27;</code></pre></figure>
+<h3 id="sticky-notes">Sticky Notes</h3>
+<p>The Windows Sticky Notes app is a SQLite database, not a text file, so people treat it as a scratchpad for passwords without realizing it persists. It lives at:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>C:\Users\&lt;user&gt;\AppData\Local\Packages\Microsoft.MicrosoftStickyNotes_8wekyb3d8bbwe\LocalState\plum.sqlite</code></pre></figure>
+<p>Copy the three <code>plum.sqlite*</code> files (<code>.sqlite</code>, <code>-shm</code>, <code>-wal</code>) off and read the <code>Text</code> column of the <code>Note</code> table - the <code>-wal</code> write-ahead log often holds notes not yet merged into the main DB:</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">Import-Module .\PSSQLite.psd1
+Invoke-SqliteQuery -Database .\plum.sqlite -Query &quot;SELECT Text FROM Note&quot; | ft -wrap
+# or, quick and dirty, off the box:
+strings plum.sqlite-wal | findstr /i &quot;pass root admin&quot;</code></pre></figure>
+<h3 id="other-files-of-interest">Other files of interest</h3>
+<p>A grab-bag worth checking by hand - registry-hive copies yield local hashes (see <a href="../backup-operators/index.html">Backup Operators</a> for extracting them), logs and config dumps hold connection strings:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>%WINDIR%\repair\sam        %WINDIR%\repair\system       %WINDIR%\System32\config\*.sav
+%WINDIR%\Panther\unattend.xml      %WINDIR%\debug\NetSetup.log
+%WINDIR%\system32\CCM\logs\*.log   %USERPROFILE%\ntuser.dat
+%SYSTEMDRIVE%\pagefile.sys         C:\ProgramData\Configs\*</code></pre></figure>
+<h2 id="network-shares">Network shares</h2>
+<p>In a domain, the richest hunting ground is file shares - user home folders with loose ACLs (every Domain User can read everyone's folder), departmental shares, backup locations. <a href="https://github.com/SnaffCon/Snaffler">Snaffler</a> crawls accessible shares and flags interesting files by extension and content:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>.\Snaffler.exe -s -o snaffler.log          # -s console output, -o log file</code></pre></figure>
+<p>It surfaces <code>.kdbx</code> (KeePass), <code>.ppk</code> (PuTTY key), <code>.vmdk</code>/<code>.vhdx</code> (virtual disks you can mount for the local SAM), <code>.config</code>, SSH private keys, and files whose names or contents look credential-bearing. A single password on a forgotten share is a common initial-access-or-escalation win.</p>
+<h2 id="defense">Defense</h2>
+<ul>
+<li>Never store credentials in config files, scripts, or answer files; use a secrets manager or managed identities (gMSA) and reference secrets at runtime.</li>
+<li>Delete <code>unattend.xml</code>/<code>sysprep</code> answer files after imaging, and scrub image-build shares. Audit <code>C:\Windows\Panther\</code>.</li>
+<li>Tighten share ACLs - home folders should be readable only by their owner and admins, not all Domain Users. Run Snaffler yourself to find what an attacker would.</li>
+<li>Disable PowerShell plaintext history for privileged automation, or keep secrets out of command lines (prompt, or read from a vault) so they never reach <code>ConsoleHost_history.txt</code>.</li>
+<li>Monitor for mass file reads of profile/AppData paths and for <code>findstr</code>/<code>Select-String</code> sweeps across the file system.</li>
+</ul>
+<h2 id="related">Related</h2>
+<ul>
+<li><a href="../initial-enumeration/index.html">Initial enumeration</a> - flags installed password managers and profile paths that feed this hunt</li>
+<li><a href="../stored-credentials/index.html">Stored credentials</a> - extracting secrets held by apps and the OS (browsers, cmdkey, registry, wifi, KeePass cracking)</li>
+<li><a href="../backup-operators/index.html">Backup Operators</a> - turning a recovered SAM/SYSTEM hive copy into local hashes</li>
+<li><a href="../setakeownership/index.html">SeTakeOwnership</a> - reading a credential file whose ACL denies your user</li>
+</ul></article><nav class="cx-pager"><a class="cx-prev" href="../uac-bypass/index.html">Previous: UAC Bypass</a><a class="cx-next" href="../stored-credentials/index.html">Next: Stored Credentials</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

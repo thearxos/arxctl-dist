@@ -1,0 +1,17 @@
+[Unit]
+Description=ArxOS Bluetooth audio notifications (AirPods pill + generic headphones)
+# a graphical-session user service: it shows the pill and plays chimes, so it needs the desktop.
+PartOf=graphical-session.target
+After=graphical-session.target
+# Enabled for every account's user manager, which includes system accounts such as the login
+# screen's (lightdm): only people's accounts run it.
+ConditionUser=!@system
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/arxpods run
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target

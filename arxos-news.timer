@@ -1,0 +1,13 @@
+[Unit]
+Description=Check ARXOS news periodically
+# Enabled for every account's user manager, which includes system accounts such as the login
+# screen's (lightdm): only people's accounts run it.
+ConditionUser=!@system
+
+[Timer]
+OnStartupSec=3min
+OnUnitActiveSec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

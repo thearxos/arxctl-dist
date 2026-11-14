@@ -1,0 +1,434 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Discovery · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › Web Services &amp; APIs</nav><h1>Discovery</h1><p class="cx-lede">Finding the web service surface - WSDL location fuzzing across common paths (?wsdl, /wsdl, ?disco, .asmx), parameter-based exposure when the WSDL endpoint requires a magic query string, OpenAPI/Swagger discovery for REST, GraphQL introspection, the anatomy of a WSDL file and how to read it for operation/parameter enumeration.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1213</span><span class="cx-tag">D3FEND D3-RAPA</span><span class="cx-tag">IMPACT DataExfil</span><span class="cx-tag">OWASP A05</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Before attacking a web service you need its schema. SOAP services publish WSDL; REST APIs sometimes publish OpenAPI/Swagger; GraphQL exposes introspection. Each has known locations and a discovery process.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># 1. WSDL discovery - try the canonical paths
+curl http://target:3002/wsdl              # explicit endpoint
+curl http://target:3002/?wsdl             # query parameter on root
+curl http://target:3002/service.asmx?wsdl # .NET ASMX
+curl http://target:3002/service?wsdl      # JAX-WS Java
+dirb http://target:3002/                  # general fuzz for /wsdl, /soap, .asmx
+
+# 2. WSDL hidden behind a parameter (encountered: /wsdl returns empty)
+ffuf -w params.txt -u &#x27;http://target:3002/wsdl?FUZZ&#x27; -fs 0
+# → finds ?wsdl=... or ?disco=... triggers
+
+# 3. OpenAPI / Swagger
+curl http://target/swagger.json
+curl http://target/openapi.json
+curl http://target/api/v2/api-docs
+curl http://target/swagger-ui/
+
+# 4. GraphQL introspection
+curl -X POST http://target/graphql \
+     -H &#x27;Content-Type: application/json&#x27; \
+     -d &#x27;{&quot;query&quot;:&quot;{__schema{types{name fields{name}}}}&quot;}&#x27;
+
+# 5. Read the schema → enumerate every operation and its parameters</code></pre></figure>
+<p>Success indicator: a complete catalog of operations/endpoints the service exposes, each with its parameter list and authentication requirement (if documented).</p>
+<h2 id="wsdl-discovery">WSDL discovery</h2>
+<p>A WSDL (Web Services Description Language) file is an XML schema that describes everything a SOAP service exposes: every operation, every parameter, every data type, the endpoint location, the supported transports. From the operator's perspective, finding the WSDL is finding the attack surface.</p>
+<h3 id="canonical-wsdl-locations">Canonical WSDL locations</h3>
+<p>Most SOAP services expose their WSDL via one of these patterns. Try in order:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ curl -i http://target:3002/wsdl                # explicit path (Node.js soap, custom)
+$ curl -i http://target:3002/?wsdl               # root with query param
+$ curl -i http://target:3002/wsdl?wsdl           # nested - path and query (some frameworks)
+$ curl -i http://target:3002/service.asmx?wsdl   # ASP.NET ASMX
+$ curl -i http://target:3002/service?wsdl        # JAX-WS Java
+$ curl -i http://target:3002/services/X?wsdl     # Apache CXF
+$ curl -i http://target:3002/ws/service?wsdl     # Spring WS
+$ curl -i http://target:3002/cxf/service?wsdl    # CXF on custom path
+$ curl -i http://target:3002/Service1.svc?wsdl   # WCF
+$ curl -i http://target:3002/Service1.svc?singleWsdl   # WCF flattened
+$ curl -i http://target:3002/api/service?wsdl    # WSDL behind API gateway</code></pre></figure>
+<p>Response patterns:</p>
+<table>
+<thead>
+<tr>
+<th>Status</th>
+<th>Body</th>
+<th>Interpretation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>200</td>
+<td>XML starting <code>&lt;wsdl:definitions</code></td>
+<td>WSDL found - start reading</td>
+</tr>
+<tr>
+<td>200</td>
+<td>Empty body or <code>Content-Length: 0</code></td>
+<td>Endpoint exists but WSDL not exposed here - parameter fuzz next</td>
+</tr>
+<tr>
+<td>200</td>
+<td>HTML</td>
+<td>Wrong endpoint; this is a regular page</td>
+</tr>
+<tr>
+<td>404</td>
+<td>Anything</td>
+<td>Path not present; try next pattern</td>
+</tr>
+<tr>
+<td>401/403</td>
+<td>Anything</td>
+<td>Path exists but requires auth</td>
+</tr>
+<tr>
+<td>500</td>
+<td>Anything</td>
+<td>Endpoint exists but malformed request - try <code>?wsdl=1</code> or similar variants</td>
+</tr>
+</tbody>
+</table>
+<h3 id="directory-fuzzing-for-the-wsdl">Directory fuzzing for the WSDL</h3>
+<p>When the canonical paths fail, brute-force common service paths:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ dirb http://target:3002/
+
+-----------------
+DIRB v2.22
+-----------------
+
+START_TIME: ...
+URL_BASE: http://target:3002/
+
+---- Scanning URL: http://target:3002/ ----
++ http://target:3002/wsdl (CODE:200|SIZE:0)</code></pre></figure>
+<p>Or <code>ffuf</code> with a wordlist:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ ffuf -w /usr/share/seclists/Discovery/Web-Content/api/api-endpoints.txt \
+       -u &#x27;http://target:3002/FUZZ&#x27; \
+       -mc 200,301,302,401,403</code></pre></figure>
+<p>Useful wordlists for service discovery:</p>
+<ul>
+<li><code>SecLists/Discovery/Web-Content/common.txt</code> - generic web paths</li>
+<li><code>SecLists/Discovery/Web-Content/api/api-endpoints.txt</code> - API paths</li>
+<li><code>SecLists/Discovery/Web-Content/api/api-endpoints-mazen160.txt</code> - curated API list</li>
+<li><code>SecLists/Discovery/Web-Content/raft-medium-words.txt</code> - broader</li>
+</ul>
+<h3 id="parameter-based-wsdl-exposure">Parameter-based WSDL exposure</h3>
+<p>A common pattern: <code>/wsdl</code> exists but returns empty. The trigger is a query parameter:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ curl http://target:3002/wsdl
+(empty)
+
+# Fuzz parameter names
+$ ffuf -w SecLists/Discovery/Web-Content/burp-parameter-names.txt \
+       -u &#x27;http://target:3002/wsdl?FUZZ&#x27; \
+       -fs 0 -mc 200
+...
+wsdl                    [Status: 200, Size: 4461, Words: 967, Lines: 186]</code></pre></figure>
+<p><code>-fs 0</code> filters out empty responses (the default). When a parameter name flips the response to a non-empty body, that's the trigger.</p>
+<p>Typical magic parameters:</p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Used by</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>?wsdl</code></td>
+<td>Standard WSDL request convention</td>
+</tr>
+<tr>
+<td><code>?disco</code></td>
+<td>Microsoft DISCO (discovery file)</td>
+</tr>
+<tr>
+<td><code>?singleWsdl</code></td>
+<td>WCF flattened WSDL (single file, all imports inlined)</td>
+</tr>
+<tr>
+<td><code>?mex</code></td>
+<td>WCF metadata exchange endpoint</td>
+</tr>
+<tr>
+<td><code>?xsd=xsd0</code></td>
+<td>XML schema fragments (when WSDL imports XSDs)</td>
+</tr>
+<tr>
+<td><code>?xsd</code></td>
+<td>Schema discovery</td>
+</tr>
+<tr>
+<td><code>?help</code></td>
+<td>Some frameworks expose a help page with schema links</td>
+</tr>
+</tbody>
+</table>
+<h3 id="net-wcf-asmx-discovery">.NET / WCF / ASMX discovery</h3>
+<p>The Microsoft web service ecosystem has its own conventions:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># ASMX (ASP.NET legacy)
+$ curl http://target/Service1.asmx           # HTML help page listing operations
+$ curl http://target/Service1.asmx?wsdl      # WSDL
+$ curl http://target/Service1.asmx?disco     # DISCO (older discovery format)
+
+# WCF (modern .NET)
+$ curl http://target/Service1.svc            # text page, often
+$ curl http://target/Service1.svc?wsdl       # WSDL
+$ curl http://target/Service1.svc?singleWsdl # flattened (combines imports)
+$ curl http://target/Service1.svc/mex        # metadata exchange endpoint</code></pre></figure>
+<p>The HTML help page for ASMX is often the easiest start - visit <code>/Service1.asmx</code> in a browser and Microsoft's auto-generated documentation lists every operation, its parameters, and sample SOAP envelopes you can copy verbatim.</p>
+<h2 id="wsdl-anatomy">WSDL anatomy</h2>
+<p>A complete WSDL file looks intimidating but breaks down into six predictable sections. Walking through an example:</p>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;?xml version=&quot;1.0&quot; encoding=&quot;UTF-8&quot;?&gt;
+&lt;wsdl:definitions targetNamespace=&quot;http://tempuri.org/&quot;
+    xmlns:wsdl=&quot;http://schemas.xmlsoap.org/wsdl/&quot;
+    xmlns:s=&quot;http://www.w3.org/2001/XMLSchema&quot;
+    xmlns:soap=&quot;http://schemas.xmlsoap.org/wsdl/soap/&quot;
+    xmlns:tns=&quot;http://tempuri.org/&quot;&gt;
+
+  &lt;wsdl:types&gt;...&lt;/wsdl:types&gt;
+  &lt;wsdl:message name=&quot;LoginSoapIn&quot;&gt;...&lt;/wsdl:message&gt;
+  &lt;wsdl:portType name=&quot;ExampleSoapPort&quot;&gt;...&lt;/wsdl:portType&gt;
+  &lt;wsdl:binding name=&quot;ExampleServiceSoapBinding&quot; type=&quot;tns:ExampleSoapPort&quot;&gt;...&lt;/wsdl:binding&gt;
+  &lt;wsdl:service name=&quot;ExampleService&quot;&gt;...&lt;/wsdl:service&gt;
+
+&lt;/wsdl:definitions&gt;</code></pre></figure>
+<p>Six sections - only three matter for the operator:</p>
+<h3 id="1-wsdltypes-data-types">1. <code>&lt;wsdl:types&gt;</code> - data types</h3>
+<p>Defines the XML schema for every parameter the service accepts. Read this to know parameter names and types:</p>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;wsdl:types&gt;
+  &lt;s:schema elementFormDefault=&quot;qualified&quot; targetNamespace=&quot;http://tempuri.org/&quot;&gt;
+    &lt;s:element name=&quot;LoginRequest&quot;&gt;
+      &lt;s:complexType&gt;
+        &lt;s:sequence&gt;
+          &lt;s:element minOccurs=&quot;1&quot; maxOccurs=&quot;1&quot; name=&quot;username&quot; type=&quot;s:string&quot;/&gt;
+          &lt;s:element minOccurs=&quot;1&quot; maxOccurs=&quot;1&quot; name=&quot;password&quot; type=&quot;s:string&quot;/&gt;
+        &lt;/s:sequence&gt;
+      &lt;/s:complexType&gt;
+    &lt;/s:element&gt;
+    &lt;s:element name=&quot;ExecuteCommandRequest&quot;&gt;
+      &lt;s:complexType&gt;
+        &lt;s:sequence&gt;
+          &lt;s:element minOccurs=&quot;1&quot; maxOccurs=&quot;1&quot; name=&quot;cmd&quot; type=&quot;s:string&quot;/&gt;
+        &lt;/s:sequence&gt;
+      &lt;/s:complexType&gt;
+    &lt;/s:element&gt;
+  &lt;/s:schema&gt;
+&lt;/wsdl:types&gt;</code></pre></figure>
+<p>From this, you know:</p>
+<ul>
+<li><code>LoginRequest</code> takes <code>username</code> (string) and <code>password</code> (string)</li>
+<li><code>ExecuteCommandRequest</code> takes <code>cmd</code> (string)</li>
+</ul>
+<p>This is the parameter catalog. Each <code>&lt;s:element name="X"&gt;</code> is a request you can construct.</p>
+<h3 id="2-wsdlporttype-operation-list">2. <code>&lt;wsdl:portType&gt;</code> - operation list</h3>
+<p>Lists every operation the service exposes:</p>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;wsdl:portType name=&quot;ExampleSoapPort&quot;&gt;
+  &lt;wsdl:operation name=&quot;Login&quot;&gt;
+    &lt;wsdl:input message=&quot;tns:LoginSoapIn&quot;/&gt;
+    &lt;wsdl:output message=&quot;tns:LoginSoapOut&quot;/&gt;
+  &lt;/wsdl:operation&gt;
+  &lt;wsdl:operation name=&quot;ExecuteCommand&quot;&gt;
+    &lt;wsdl:input message=&quot;tns:ExecuteCommandSoapIn&quot;/&gt;
+    &lt;wsdl:output message=&quot;tns:ExecuteCommandSoapOut&quot;/&gt;
+  &lt;/wsdl:operation&gt;
+&lt;/wsdl:portType&gt;</code></pre></figure>
+<p>From this, two operations are available: <code>Login</code> and <code>ExecuteCommand</code>. Both have request/response message pairs. This is the <em>attack surface</em> - every operation listed is an endpoint you can probe.</p>
+<h3 id="3-wsdlservice-endpoint-location">3. <code>&lt;wsdl:service&gt;</code> - endpoint location</h3>
+<p>Tells you where the service actually lives:</p>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;wsdl:service name=&quot;ExampleService&quot;&gt;
+  &lt;wsdl:port name=&quot;ExampleServiceSoapPort&quot; binding=&quot;tns:ExampleServiceSoapBinding&quot;&gt;
+    &lt;soap:address location=&quot;http://localhost:80/wsdl&quot;/&gt;
+  &lt;/wsdl:port&gt;
+&lt;/wsdl:service&gt;</code></pre></figure>
+<p>The <code>&lt;soap:address location="..."&gt;</code> is the URL to POST requests to. Often it's the same path that served the WSDL itself - e.g., <code>/wsdl</code> here. Note: the value sometimes points to <code>localhost:80</code> even when the service is on a different port/host, which is a misconfiguration (and a hint that the WSDL was generated server-side without rewriting the URL). The actual endpoint is wherever you fetched the WSDL from.</p>
+<h3 id="sections-you-can-mostly-ignore">Sections you can mostly ignore</h3>
+<p><code>&lt;wsdl:message&gt;</code> mirrors the types section. <code>&lt;wsdl:binding&gt;</code> describes the transport encoding (almost always SOAP-over-HTTP with <code>style="document"</code> for modern services). Skip both unless you're debugging unusual transport.</p>
+<h2 id="soapaction-values">SOAPAction values</h2>
+<p>Inside <code>&lt;wsdl:binding&gt;</code>, each operation declares its expected <code>SOAPAction</code> HTTP header value:</p>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;wsdl:operation name=&quot;ExecuteCommand&quot;&gt;
+  &lt;soap:operation soapAction=&quot;ExecuteCommand&quot; style=&quot;document&quot;/&gt;
+  ...
+&lt;/wsdl:operation&gt;</code></pre></figure>
+<p>The <code>soapAction="ExecuteCommand"</code> is the string the client should send in <code>SOAPAction: "ExecuteCommand"</code>. Note the quotation marks in the HTTP header - by SOAP spec the value is a quoted URI (often just a name, sometimes a full URL like <code>http://target/Service/ExecuteCommand</code>).</p>
+<p>This duplication of operation name (body element <code>&lt;ExecuteCommand&gt;</code> + header <code>SOAPAction: "ExecuteCommand"</code>) is the structural setup for <a href="../soapaction-spoofing/index.html">SOAPAction spoofing</a>.</p>
+<h2 id="rest-openapi-discovery">REST / OpenAPI discovery</h2>
+<p>For REST APIs, the equivalent of WSDL is OpenAPI (formerly Swagger):</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># Direct schema documents
+$ curl http://target/swagger.json
+$ curl http://target/swagger.yaml
+$ curl http://target/openapi.json
+$ curl http://target/openapi.yaml
+$ curl http://target/v2/api-docs              # Swagger 2 (Springfox default)
+$ curl http://target/v3/api-docs              # Swagger 3
+$ curl http://target/api/v1/swagger.json
+$ curl http://target/api/v2/swagger.json
+
+# Swagger UI (browsable)
+$ curl http://target/swagger-ui/
+$ curl http://target/swagger-ui/index.html
+$ curl http://target/api/swagger-ui/
+$ curl http://target/swagger/
+
+# Redoc UI
+$ curl http://target/redoc/
+$ curl http://target/api/redoc/
+
+# Apidoc / other variants
+$ curl http://target/apidocs/
+$ curl http://target/api-docs/</code></pre></figure>
+<p>When you find a Swagger UI, it gives you a browsable, sortable list of every operation with try-it-out buttons. For automation:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># Generate curl commands for every endpoint
+$ swagger-codegen generate -i http://target/swagger.json -l bash</code></pre></figure>
+<h3 id="postman-collections-in-the-wild">Postman collections in the wild</h3>
+<p>Sometimes developers leave Postman collections checked into a public repo or accessible at predictable paths:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ curl http://target/postman.json
+$ curl http://target/postman_collection.json
+$ curl http://target/.postman/</code></pre></figure>
+<p>A leaked Postman collection includes example requests, authentication patterns, and sometimes hardcoded API keys. Worth probing.</p>
+<h2 id="graphql-introspection">GraphQL introspection</h2>
+<p>GraphQL APIs typically (and often unintentionally) expose their entire schema via the introspection query:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ curl -X POST http://target/graphql \
+       -H &#x27;Content-Type: application/json&#x27; \
+       -d &#x27;{&quot;query&quot;:&quot;{__schema{queryType{name}mutationType{name}types{name kind fields{name type{name kind ofType{name kind}}}}}}&quot;}&#x27; \
+       | jq</code></pre></figure>
+<p>The response is the full schema - every type, every field, every query and mutation operation, all their argument types. Once you have it:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># Tools for browsing introspected schemas
+$ npx graphql-voyager   # interactive graph visualization
+$ npx altair             # GraphQL client
+$ inql -t http://target/graphql -o /tmp/graphql-recon/  # Burp extension&#x27;s CLI form</code></pre></figure>
+<p>GraphQL also has standard discovery paths:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>/graphql      /graphiql       /api/graphql       /v1/graphql
+/playground   /__graphql      /altair</code></pre></figure>
+<p>Each may host either the GraphQL endpoint itself or an interactive UI for it.</p>
+<h3 id="when-introspection-is-disabled">When introspection is disabled</h3>
+<p>Disabled introspection blocks <code>{__schema{...}}</code> queries but the operations themselves still work - you just don't know their names. Brute-force them via wordlists:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ ffuf -w graphql-wordlist.txt \
+       -X POST -d &#x27;{&quot;query&quot;:&quot;{ FUZZ { id } }&quot;}&#x27; \
+       -H &#x27;Content-Type: application/json&#x27; \
+       -u http://target/graphql \
+       -fs 47       # filter the &quot;field FUZZ doesn&#x27;t exist&quot; response size</code></pre></figure>
+<p>Common GraphQL operation names: <code>user</code>, <code>users</code>, <code>me</code>, <code>admin</code>, <code>account</code>, <code>profile</code>, <code>query</code>, <code>viewer</code>, <code>currentUser</code>, <code>getUsers</code>, <code>listUsers</code>, <code>searchUsers</code>.</p>
+<h2 id="grpc-discovery">gRPC discovery</h2>
+<p>gRPC over HTTP/2 uses Protobuf and is harder to discover without <code>.proto</code> files:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># Server reflection (the gRPC equivalent of introspection)
+$ grpcurl -plaintext target:50051 list
+$ grpcurl -plaintext target:50051 list &lt;SERVICE&gt;
+$ grpcurl -plaintext target:50051 describe &lt;METHOD&gt;</code></pre></figure>
+<p>When reflection is enabled, <code>grpcurl list</code> returns every service name. <code>describe</code> returns the protobuf-style schema. When reflection is disabled, you need the <code>.proto</code> files (often in the project's repo or a developer's machine).</p>
+<h2 id="a-worked-wsdl-discovery-walkthrough">A worked WSDL discovery walkthrough</h2>
+<p>The typical scenario: a SOAP service at <code>http://target:3002</code> with WSDL hidden.</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># Step 1 - Probe canonical paths
+$ curl -i http://target:3002/                  # 404
+$ curl -i http://target:3002/wsdl              # 200 but empty
+$ curl -i http://target:3002/?wsdl             # 404
+$ curl -i http://target:3002/service.asmx?wsdl # 404
+
+# Step 2 - /wsdl returns empty; parameter-fuzz it
+$ ffuf -w SecLists/Discovery/Web-Content/burp-parameter-names.txt \
+       -u &#x27;http://target:3002/wsdl?FUZZ&#x27; \
+       -fs 0 -mc 200
+
+wsdl                    [Status: 200, Size: 4461, Words: 967, Lines: 186]
+
+# Step 3 - Magic parameter is &quot;wsdl&quot;
+$ curl http://target:3002/wsdl?wsdl
+
+&lt;?xml version=&quot;1.0&quot; encoding=&quot;UTF-8&quot;?&gt;
+&lt;wsdl:definitions targetNamespace=&quot;http://tempuri.org/&quot; ...&gt;
+  &lt;wsdl:types&gt;
+    &lt;s:element name=&quot;LoginRequest&quot;&gt;
+      &lt;s:element name=&quot;username&quot; type=&quot;s:string&quot;/&gt;
+      &lt;s:element name=&quot;password&quot; type=&quot;s:string&quot;/&gt;
+    &lt;/s:element&gt;
+    &lt;s:element name=&quot;ExecuteCommandRequest&quot;&gt;
+      &lt;s:element name=&quot;cmd&quot; type=&quot;s:string&quot;/&gt;
+    &lt;/s:element&gt;
+  &lt;/wsdl:types&gt;
+  ...
+&lt;/wsdl:definitions&gt;
+
+# Step 4 - Catalog
+#   Operations: Login, ExecuteCommand
+#   Endpoints:  /wsdl (per &lt;soap:address&gt;)
+#   Parameters: username, password (Login); cmd (ExecuteCommand)</code></pre></figure>
+<p>Now you have the schema. Move to <a href="../soap-basics/index.html">SOAP basics</a> for crafting requests, or directly to <a href="../soapaction-spoofing/index.html">SOAPAction spoofing</a> if the canonical attack applies.</p>
+<h2 id="quick-reference">Quick reference</h2>
+<table>
+<thead>
+<tr>
+<th>Task</th>
+<th>Pattern</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Try standard WSDL paths</td>
+<td><code>/wsdl</code>, <code>/?wsdl</code>, <code>/wsdl?wsdl</code>, <code>.asmx?wsdl</code>, <code>.svc?wsdl</code>, <code>.svc?singleWsdl</code></td>
+</tr>
+<tr>
+<td>Directory fuzz for service path</td>
+<td><code>dirb http://target:PORT/</code> or <code>ffuf -w common.txt -u http://target/FUZZ</code></td>
+</tr>
+<tr>
+<td>Parameter fuzz on a known WSDL path</td>
+<td><code>ffuf -w burp-parameter-names.txt -u 'http://target/wsdl?FUZZ' -fs 0</code></td>
+</tr>
+<tr>
+<td>Magic parameters to try</td>
+<td><code>?wsdl</code>, <code>?disco</code>, <code>?singleWsdl</code>, <code>?mex</code>, <code>?xsd=xsd0</code></td>
+</tr>
+<tr>
+<td>ASMX HTML help page</td>
+<td>Visit <code>/Service.asmx</code> in browser</td>
+</tr>
+<tr>
+<td>WCF metadata exchange</td>
+<td><code>/Service.svc/mex</code> or <code>/Service.svc?wsdl</code></td>
+</tr>
+<tr>
+<td>OpenAPI schema location</td>
+<td><code>/swagger.json</code>, <code>/openapi.json</code>, <code>/v2/api-docs</code>, <code>/v3/api-docs</code></td>
+</tr>
+<tr>
+<td>Swagger UI</td>
+<td><code>/swagger-ui/</code>, <code>/swagger/</code>, <code>/api/docs/</code></td>
+</tr>
+<tr>
+<td>Generate clients from OpenAPI</td>
+<td><code>swagger-codegen generate -i schema.json -l python</code></td>
+</tr>
+<tr>
+<td>GraphQL introspection</td>
+<td><code>POST /graphql</code> with <code>{"query":"{__schema{types{name}}}"}</code></td>
+</tr>
+<tr>
+<td>GraphQL UI paths</td>
+<td><code>/graphql</code>, <code>/graphiql</code>, <code>/playground</code>, <code>/altair</code></td>
+</tr>
+<tr>
+<td>GraphQL when introspection blocked</td>
+<td>Wordlist brute via <code>ffuf</code></td>
+</tr>
+<tr>
+<td>gRPC reflection</td>
+<td><code>grpcurl -plaintext target:port list</code></td>
+</tr>
+<tr>
+<td>Read WSDL types section</td>
+<td>Maps to parameter names and types</td>
+</tr>
+<tr>
+<td>Read WSDL portType section</td>
+<td>Maps to operation list (attack surface)</td>
+</tr>
+<tr>
+<td>Read WSDL service section</td>
+<td>Maps to endpoint URL</td>
+</tr>
+<tr>
+<td>Read WSDL binding SOAPAction</td>
+<td>The value to put in <code>SOAPAction:</code> HTTP header</td>
+</tr>
+</tbody>
+</table>
+<p>For request crafting once you have the schema, continue to <a href="../soap-basics/index.html">SOAP basics</a>.</p></article><nav class="cx-pager"><a class="cx-prev" href="../index.html">Previous: Web Services &amp; APIs</a><a class="cx-next" href="../soap-basics/index.html">Next: SOAP Basics</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

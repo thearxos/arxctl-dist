@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SSTI · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › Server-Side</nav><h1>SSTI</h1><p class="cx-lede">Server-Side Template Injection - making an application evaluate template expressions you control. Engine fingerprinting, payload catalogs per template engine, sandbox escape, and filter bypass.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1059</span><span class="cx-tag">D3FEND D3-EAL, D3-NTA</span><span class="cx-tag">IMPACT ServerSideEval, RCE</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>The application takes input that gets rendered as part of a template, not just substituted as a string. Anything the template engine can express - arithmetic, attribute access, method calls, imports - you can do. In most engines, that path leads to RCE within three or four payloads.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Probe
+{{7*7}}                        # Jinja2/Twig/Nunjucks: returns 49
+${7*7}                         # Freemarker/Velocity: returns 49
+&lt;%= 7*7 %&gt;                     # ERB: returns 49
+#{7*7}                         # Pug/Ruby/Slim: returns 49
+@(7*7)                         # Razor: returns 49
+
+# Confirm it&#x27;s the template, not a coincidence
+{{7*&#x27;7&#x27;}}                      # Jinja2: &#x27;7777777&#x27;  Twig: 49
+{{config}}                     # Jinja2/Nunjucks: dumps config object</code></pre></figure>
+<p>Success indicator: <code>7*7</code> reflects as <code>49</code> (not as the literal string). Different syntax dialects tell you which engine.</p>
+<h2 id="where-to-look">Where to look</h2>
+<p>Any reflection point where input shows up in HTML, email bodies, error messages, or PDFs - and the reflection is <em>not</em> HTML-escaped the way XSS sinks are. SSTI sinks tend to be in templated output features:</p>
+<ul>
+<li><strong>Email templates</strong> - "send invitation" / "password reset" - the customer-name field is usually templated</li>
+<li><strong>Error pages</strong> - applications that render a user-supplied error message</li>
+<li><strong>Report generators</strong> - PDF/HTML report builders that accept template fragments</li>
+<li><strong>CMS pages</strong> - any "page builder" or "snippet" feature that lets non-developers write template syntax</li>
+<li><strong>Profile / display-name fields</strong> - rendered later in admin dashboards or notification emails</li>
+<li><strong>URL slugs that become page titles</strong> - <code>/&lt;SLUG&gt;</code> where <code>&lt;SLUG&gt;</code> is echoed into a templated <code>&lt;title&gt;</code></li>
+<li><strong>Configuration values</strong> - dashboards where admins can set "welcome message" or "site name"</li>
+<li><strong>Webhook payload templates</strong> - integrations that let users format the outgoing payload</li>
+</ul>
+<p>If you can describe the feature as "the application takes my input and uses it to build something else for someone else to see," it's an SSTI candidate.</p>
+<h2 id="decision-flow">Decision flow</h2>
+<ol>
+<li><strong>Confirm template evaluation</strong> - does <code>{{7*7}}</code> / <code>${7*7}</code> / <code>&lt;%= 7*7 %&gt;</code> return <code>49</code>? → <a href="detection/index.html">Detection</a></li>
+<li><strong>Identify the engine</strong> - syntax dialect + behavior of polyglot probes narrows it down → <a href="detection/index.html">Detection</a></li>
+<li><strong>Engine = Jinja2 / Flask / Django / Ansible</strong> → <a href="jinja2/index.html">Jinja2</a></li>
+<li><strong>Engine = Tornado</strong> (Python <code>{{...}}</code> where <code>{% import os %}</code> works) → <a href="tornado/index.html">Tornado</a></li>
+<li><strong>Engine = Twig / Symfony / Craft / Drupal 8+</strong> → <a href="twig/index.html">Twig</a></li>
+<li><strong>Engine = Freemarker / Confluence / Spring</strong> → <a href="freemarker/index.html">Freemarker</a></li>
+<li><strong>Engine = Velocity / Liferay / legacy Spring</strong> → <a href="velocity/index.html">Velocity</a></li>
+<li><strong>Engine = ERB / Rails / Puppet</strong> → <a href="erb/index.html">ERB</a></li>
+<li><strong>Engine = Handlebars / Express / Ghost</strong> → <a href="handlebars/index.html">Handlebars</a></li>
+<li><strong>Engine = Razor / ASP.NET</strong> → <a href="razor/index.html">Razor</a></li>
+<li><strong>Inside a sandboxed environment</strong> - payload evaluates but <code>os</code>/<code>subprocess</code>/<code>Runtime</code> unreachable → <a href="sandbox-escape/index.html">Sandbox escape</a></li>
+<li><strong>Payload rejected / filtered</strong> - keywords like <code>system</code>, <code>__class__</code>, <code>Runtime</code> stripped → <a href="filter-bypass/index.html">Filter bypass</a></li>
+</ol>
+<h2 id="engine-fingerprint-table">Engine fingerprint table</h2>
+<p>The probes below differ between engines. Run them in order; the first one that produces a useful divergence identifies the engine.</p>
+<table>
+<thead>
+<tr>
+<th>Probe</th>
+<th>Jinja2</th>
+<th>Tornado</th>
+<th>Twig</th>
+<th>Freemarker</th>
+<th>Velocity</th>
+<th>ERB</th>
+<th>Handlebars</th>
+<th>Razor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>{{7*7}}</code></td>
+<td><code>49</code></td>
+<td><code>49</code></td>
+<td><code>49</code></td>
+<td>error</td>
+<td>error</td>
+<td>unchanged</td>
+<td><code>49</code></td>
+<td>unchanged</td>
+</tr>
+<tr>
+<td><code>${7*7}</code></td>
+<td>unchanged</td>
+<td>unchanged</td>
+<td>unchanged</td>
+<td><code>49</code></td>
+<td><code>49</code></td>
+<td>unchanged</td>
+<td>unchanged</td>
+<td>unchanged</td>
+</tr>
+<tr>
+<td><code>&lt;%= 7*7 %&gt;</code></td>
+<td>unchanged</td>
+<td>unchanged</td>
+<td>unchanged</td>
+<td>unchanged</td>
+<td>unchanged</td>
+<td><code>49</code></td>
+<td>unchanged</td>
+<td>unchanged</td>
+</tr>
+<tr>
+<td><code>@(7*7)</code></td>
+<td>unchanged</td>
+<td>unchanged</td>
+<td>unchanged</td>
+<td>unchanged</td>
+<td>unchanged</td>
+<td>unchanged</td>
+<td>unchanged</td>
+<td><code>49</code></td>
+</tr>
+<tr>
+<td><code>{{7*'7'}}</code></td>
+<td><code>7777777</code></td>
+<td><code>7777777</code></td>
+<td><code>49</code></td>
+<td>n/a</td>
+<td>n/a</td>
+<td>n/a</td>
+<td>error</td>
+<td>n/a</td>
+</tr>
+<tr>
+<td><code>{{config}}</code></td>
+<td>dumps config</td>
+<td>error</td>
+<td>dumps config</td>
+<td>n/a</td>
+<td>n/a</td>
+<td>n/a</td>
+<td>empty</td>
+<td>n/a</td>
+</tr>
+<tr>
+<td><code>{% import os %}{{os.getcwd()}}</code></td>
+<td>error</td>
+<td>path</td>
+<td>error</td>
+<td>n/a</td>
+<td>n/a</td>
+<td>n/a</td>
+<td>n/a</td>
+<td>n/a</td>
+</tr>
+</tbody>
+</table>
+<p>"unchanged" means the literal string <code>{{7*7}}</code> appears in the response - the engine doesn't recognize the syntax, so it's not that engine.</p>
+<p>The single most diagnostic probe is <code>{{7*'7'}}</code>: Jinja2 and Tornado (both Python) do string repetition (<code>'7777777'</code>), Twig does numeric coercion (<code>49</code>). That splits the PHP engine from the Python ones in one request. It does <strong>not</strong> split Jinja2 from Tornado - both are Python and both repeat the string. To separate those two, use <code>{% import os %}{{os.getcwd()}}</code>: Tornado runs it as a real Python <code>import</code> and returns a path, while Jinja2 (whose <code>{% import %}</code> is for templates, not modules) throws. See <a href="detection/index.html">Detection</a>.</p>
+<h2 id="impact-ladder">Impact ladder</h2>
+<table>
+<thead>
+<tr>
+<th>Tier</th>
+<th>What you get</th>
+<th>How</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Confirmed arithmetic eval</td>
+<td><code>{{7*7}}</code> returns <code>49</code></td>
+</tr>
+<tr>
+<td>2</td>
+<td>Object/attribute access</td>
+<td><code>{{config}}</code> dumps secrets, dump session tokens, exfil environment vars</td>
+</tr>
+<tr>
+<td>3</td>
+<td>Function calls in sandbox</td>
+<td>Use built-in filters/functions to read files or trigger SSRF</td>
+</tr>
+<tr>
+<td>4</td>
+<td>Sandbox escape</td>
+<td>Walk the object graph to reach <code>os</code>/<code>subprocess</code>/<code>Runtime</code></td>
+</tr>
+<tr>
+<td>5</td>
+<td>RCE</td>
+<td>Direct command execution as the application user</td>
+</tr>
+</tbody>
+</table>
+<p>Tiers 1-2 are nearly free on most engines. Tier 3 depends on filters available. Tiers 4-5 are the engine-specific escape sequences documented per page.</p>
+<h2 id="why-ssti-is-high-impact">Why SSTI is high-impact</h2>
+<p>The bug is misclassified by developers and frameworks alike. Most teams think "we escape HTML, so this can't be XSS" and stop there - but SSTI evaluates <em>before</em> the HTML escaping step. The template engine has already constructed a Python/Ruby/Java object graph by the time HTML escaping runs.</p>
+<p>This means:</p>
+<ul>
+<li>The same input that gets escaped on the way to the browser already gave you RCE on the server.</li>
+<li>Tools designed to catch XSS (<code>&lt;script&gt;</code> blocklists, CSP headers, sanitizers) miss SSTI entirely.</li>
+<li>Bug bounty triage frequently downgrades SSTI to XSS until you demo <code>cat /etc/passwd</code>.</li>
+</ul>
+<p>The detection page covers polyglot probes that survive most filters; the per-engine pages document the path from arithmetic eval to RCE for each common engine.</p>
+<h2 id="operating-notes">Operating notes</h2>
+<p>The single most useful habit: <strong>probe with <code>{{7*7}}</code> first, always</strong>. It works on six of the seven engines listed and produces an immediate, unambiguous signal. Save the dialect-specific probes (<code>${...}</code>, <code>&lt;%= ... %&gt;</code>, <code>@(...)</code>) for when <code>{{...}}</code> returns unchanged.</p>
+<p>The second most useful habit: <strong>try probing in fields you wouldn't expect to be templated</strong>. Display names, profile bios, location strings, "company name" in invoice generators. The high-yield SSTI bugs are in fields whose template-ness is non-obvious. Anything reflected to another user (an admin, the recipient of an email) is worth probing.</p>
+<div class="cx-aside cx-caution">
+<p class="cx-aside-title">Caution</p>
+<p>SSTI demos that execute commands change the engagement scope quickly. <code>{{ ''.__class__.__mro__[1].__subclasses__() }}</code> is a safe demonstration that prints class names. <code>os.system('id')</code> is not. Confirm scope before escalating past tier 3.</p>
+</div>
+<p>The detection page is the right starting point unless you already know the engine. The per-engine pages assume you know what you're working with and want the shortest path to RCE.</p>
+<h2 id="next-move">Next move</h2>
+<ul>
+<li><strong><code>{{7*7}}</code> returns <code>49</code></strong> → Jinja2, Tornado, Twig, or similar - run <a href="detection/index.html">detection</a> probes to disambiguate engine (<code>{{7*'7'}}</code> splits Python from PHP; <code>{% import os %}</code> splits Tornado from Jinja2)</li>
+<li><strong><code>${7*7}</code> returns <code>49</code></strong> → Freemarker, Velocity, or Spring EL - narrow with engine-specific probes</li>
+<li><strong><code>&lt;%= 7*7 %&gt;</code> returns <code>49</code></strong> → ERB (Ruby) or ASP.NET Razor - see <a href="erb/index.html">erb</a> or <a href="razor/index.html">razor</a></li>
+<li><strong><code>{{= 7*7}}</code> returns <code>49</code></strong> → underscore.js / EJS - server-side JavaScript template</li>
+<li><strong>Engine confirmed → ready to RCE</strong> → jump straight to the per-engine page (<a href="jinja2/index.html">jinja2</a>, <a href="tornado/index.html">tornado</a>, <a href="freemarker/index.html">freemarker</a>, <a href="twig/index.html">twig</a>, <a href="velocity/index.html">velocity</a>, <a href="handlebars/index.html">handlebars</a>, <a href="erb/index.html">erb</a>, <a href="razor/index.html">razor</a>)</li>
+<li><strong>Evaluation works but RCE payload is filtered</strong> → <a href="sandbox-escape/index.html">sandbox-escape</a> (engine sandboxes vary widely - Jinja2 has well-known escapes, Twig sandbox is harder)</li>
+<li><strong>Specific tokens (<code>__class__</code>, <code>os</code>, <code>exec</code>) blocked</strong> → <a href="filter-bypass/index.html">filter-bypass</a> (string concatenation, alternate object traversal, encoded payloads)</li>
+<li><strong>Got RCE inside the template</strong> → confirm the user context (<code>whoami</code>/<code>id</code>), check if app runs in container (no <code>/etc/shadow</code>, restricted commands), pivot to credential hunting if rooted</li>
+<li><strong>No mathematical evaluation but other behavior changes</strong> → blind SSTI; use OOB callback (similar to blind SSRF) to confirm execution</li>
+</ul></article><nav class="cx-pager"><a class="cx-prev" href="../ssrf/index.html">Previous: SSRF</a><a class="cx-next" href="../index.html">Next: Server-Side Attacks</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

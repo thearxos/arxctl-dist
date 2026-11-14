@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WordPress · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../index.html">Cheatsheets</a> › Web › WordPress</nav><h1>WordPress</h1><p class="cx-lede">Operator reference for attacking WordPress - version and plugin fingerprinting, user enumeration, xmlrpc abuse, brute-force, the vulnerable-plugin ecosystem, and the canonical admin-to-RCE chain via theme/plugin editor or Metasploit.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1078, T1110, T1505, T1505.003</span><span class="cx-tag">D3FEND D3-RAPA, D3-MFA, D3-AH</span><span class="cx-tag">IMPACT RCE, AuthBypass, CredentialTheft, FileRead, FileWrite</span><span class="cx-tag">OWASP A01, A05, A06, A07</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>WordPress powers a large fraction of the public web. The core platform has been hardened steadily over years and direct WordPress-core RCE is rare. What hasn't changed: every WordPress install is a <em>plugin and theme platform</em>, and the third-party plugin ecosystem is a continuous source of unauthenticated LFI, SQL injection, arbitrary file upload, and authentication bypass. The standard finding pattern is "outdated plugin X version Y on target = unauthenticated $impact" - a chain that goes from anonymous recon through a CVE-shaped plugin straight to file read, file write, or full RCE.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># 1. Fingerprint
+curl -s http://target/ | grep -E &#x27;meta name=&quot;generator&quot;|wp-content|wp-json&#x27;
+
+# 2. Plugins via passive scrape + active probe
+wpscan --url http://target --enumerate ap,at,u
+
+# 3. Users
+curl -s &#x27;http://target/wp-json/wp/v2/users&#x27; | jq -r &#x27;.[].slug&#x27;
+curl -sI &#x27;http://target/?author=1&#x27; | grep -i location
+
+# 4. Vulnerable plugin → unauth primitive (LFI / file download / SQLi / RCE)
+curl &#x27;http://target/wp-content/plugins/&lt;plugin&gt;/&lt;vuln-path&gt;?param=&lt;payload&gt;&#x27;
+
+# 5. Admin → RCE via theme/plugin editor or Metasploit
+msf &gt; use exploit/unix/webapp/wp_admin_shell_upload</code></pre></figure>
+<p>Success indicator: a chain from "I have the target URL" to "I have a webshell on the server" with intermediate findings (plugin versions, user list, file read) documented along the way.</p>
+<h2 id="why-wordpress-matters">Why WordPress matters</h2>
+<p>A few facts that explain the engagement pattern:</p>
+<ul>
+<li><strong>WordPress sites are everywhere.</strong> A high single-digit percentage of <code>Top 10M</code> domains run it. On any external engagement that includes "the company's main website," there's a real chance the target is WordPress.</li>
+<li><strong>Core is patched fast.</strong> WordPress.org pushes security releases aggressively and many hosts (Bluehost, WP Engine, Kinsta) auto-update core. Targeting WordPress core directly is rarely the right path on a current installation.</li>
+<li><strong>The plugin ecosystem isn't patched fast.</strong> There are tens of thousands of plugins. Many are abandoned. Many are maintained by single developers who don't review code with a security mindset. New plugin CVEs land every week.</li>
+<li><strong>The plugin and theme system is, by design, code execution as the web user.</strong> A plugin file is a PHP file in <code>wp-content/plugins/</code>. Once you can write one, you have code execution. Admin → RCE is therefore mechanical, not creative.</li>
+</ul>
+<p>This means three distinct attack surfaces and operator mindsets:</p>
+<table>
+<thead>
+<tr>
+<th>Surface</th>
+<th>What you exploit</th>
+<th>Auth required</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Unauthenticated plugin/theme vulnerabilities</strong></td>
+<td>A specific CVE in an installed plugin</td>
+<td>None</td>
+</tr>
+<tr>
+<td><strong>Authentication weaknesses</strong></td>
+<td>Weak passwords, default <code>admin</code> account, no 2FA, missing brute-force protection</td>
+<td>None (you're attacking auth itself)</td>
+</tr>
+<tr>
+<td><strong>Authenticated abuse</strong></td>
+<td>Theme editor, plugin upload, post-RCE looting</td>
+<td>Editor/Admin role</td>
+</tr>
+</tbody>
+</table>
+<p>The operator's job is to figure out which path the target gives up cheapest. For a target running an unpatched <code>Mail Masta 1.0</code> plugin, you'll never need to touch the login page. For a target running clean plugins but with <code>admin:Welcome2024!</code>, you go straight at login.</p>
+<h2 id="the-cluster">The cluster</h2>
+<p>This cluster covers the work end-to-end:</p>
+<table>
+<thead>
+<tr>
+<th>Page</th>
+<th>Stage</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="anatomy/index.html">Anatomy</a></td>
+<td>Mental model - file layout, key paths, user roles</td>
+</tr>
+<tr>
+<td><a href="version-fingerprinting/index.html">Version fingerprinting</a></td>
+<td>Pinpoint the WordPress core version</td>
+</tr>
+<tr>
+<td><a href="plugin-theme-enum/index.html">Plugin &amp; theme enumeration</a></td>
+<td>What's installed, what version, which are deactivated-but-present</td>
+</tr>
+<tr>
+<td><a href="user-enumeration/index.html">User enumeration</a></td>
+<td>Discover valid usernames before brute force</td>
+</tr>
+<tr>
+<td><a href="xmlrpc-abuse/index.html">XML-RPC abuse</a></td>
+<td><code>xmlrpc.php</code> as user-enum / brute-force / SSRF primitive</td>
+</tr>
+<tr>
+<td><a href="login-bruteforce/index.html">Login brute-force</a></td>
+<td>wp-login vs xmlrpc, lockout awareness, spray patterns</td>
+</tr>
+<tr>
+<td><a href="vulnerable-plugins/index.html">Vulnerable plugins</a></td>
+<td>Class-level patterns + canonical examples</td>
+</tr>
+<tr>
+<td><a href="admin-to-rce/index.html">Admin to RCE</a></td>
+<td>Theme editor webshell, plugin upload, Metasploit</td>
+</tr>
+<tr>
+<td><a href="wpscan/index.html">WPScan reference</a></td>
+<td>Comprehensive WPScan options + integration</td>
+</tr>
+<tr>
+<td><a href="defense/index.html">Defense</a></td>
+<td>Consolidated hardening - component lifecycle, auth, editor write primitive, wp-config constants</td>
+</tr>
+</tbody>
+</table>
+<h2 id="cross-cluster-references">Cross-cluster references</h2>
+<p>WordPress findings tie into other parts of the codex:</p>
+<ul>
+<li>The plugin file-upload primitives (Q5 from a typical assessment - "unauthenticated file download" in Email Subscribers, "arbitrary file upload" in WPFileManager) draw on the <a href="../uploads/index.html">File Upload cluster</a> for shell selection and webshell internals.</li>
+<li>WordPress LFI vulnerabilities (Mail Masta, Site Editor) are concrete instances of the <a href="../lfi/index.html">LFI cluster</a> patterns - same wrappers, same filters, same <code>/etc/passwd</code> baseline.</li>
+<li>Post-RCE looting of <code>wp-config.php</code> yields MySQL/MariaDB credentials, which feed into the <a href="../../network/services/mysql/index.html">MySQL service page</a> for further enumeration and lateral movement.</li>
+<li>The <code>xmlrpc.php</code> SSRF via <code>pingback.ping</code> is a real <a href="../server-side/ssrf/index.html">SSRF primitive</a> - useful for internal-network discovery from an unauthenticated external position.</li>
+</ul>
+<h2 id="a-note-on-stealth">A note on stealth</h2>
+<p>WordPress security plugins (Wordfence, iThemes Security, Sucuri) are widely deployed and they catch <em>everything noisy</em>:</p>
+<ul>
+<li>Default WPScan user-agent → blocked</li>
+<li>High-rate brute-force on <code>wp-login.php</code> → IP blacklisted in seconds</li>
+<li>Predictable plugin-path probing → flagged</li>
+<li><code>?author=1</code>, <code>?author=2</code>, <code>?author=3</code> rapid-fire → flagged</li>
+</ul>
+<p>Calibrate to the engagement. Black-box pentest typically accepts the noise. Stealth assessments mean:</p>
+<ul>
+<li>Throttle requests</li>
+<li>Randomize user agents (or impersonate a real browser)</li>
+<li>Use the <code>xmlrpc.php</code> brute-force path instead of <code>wp-login.php</code> (often less monitored)</li>
+<li>Enumerate plugins from page source first, only fall back to active probing if needed</li>
+<li>Be aware that even one failed login at xmlrpc.php can trip Wordfence's "block immediately" rule on hardened sites</li>
+</ul></article><nav class="cx-pager"><a class="cx-next" href="anatomy/index.html">Next: Anatomy</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../license.html">License</a></p></footer>
+<script src="../../../codex.js"></script></body></html>

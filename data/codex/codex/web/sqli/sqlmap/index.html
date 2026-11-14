@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQLMap · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › SQL Injection</nav><h1>SQLMap</h1><p class="cx-lede">The automated SQL injection tool - what it detects (the BEUSTQ technique set), how to point it at a target (Copy-as-cURL, request files, the injection marker, JSON/XML bodies), the workflow from detection to RCE, and how to read its log output so you know what it actually proved.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190</span><span class="cx-tag">D3FEND D3-MH, D3-NTA</span><span class="cx-tag">IMPACT DataExfil, AuthBypass, RCE</span><span class="cx-tag">OWASP A05</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>SQLMap automates detection and exploitation of SQL injection across ~35 DBMSes and all six injection classes. Point it at a request, let it fingerprint and confirm, then drive it through enumeration and (where privileges allow) file read/write and OS command execution.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Minimal - a GET parameter
+sqlmap -u &#x27;http://target/vuln.php?id=1&#x27; --batch
+
+# The usual starting point - a saved Burp request
+sqlmap -r req.txt --batch
+
+# Confirmed-and-escalate, in order
+sqlmap -r req.txt --batch --dbs                 # list databases
+sqlmap -r req.txt --batch -D prod -T users --dump   # exfiltrate
+sqlmap -r req.txt --batch --is-dba --os-shell   # post-exploit</code></pre></figure>
+<p>Success indicator: SQLMap prints <code>sqlmap identified the following injection point(s)</code> with a type/title/payload block - that block is the proof the parameter is exploitable, and the payloads are reusable for a manual report.</p>
+<p>This page is the map of the SQLMap sub-cluster. For the exhaustive flag list see <a href="cheatsheet/index.html">Cheatsheet</a>; when a run misbehaves see <a href="troubleshooting/index.html">Troubleshooting</a>.</p>
+<h2 id="when-to-reach-for-sqlmap">When to reach for SQLMap</h2>
+<p>Manual exploitation is faster for a single value and essential for understanding the bug - but SQLMap wins when the work is repetitive or blind:</p>
+<ul>
+<li>A large schema to enumerate quickly.</li>
+<li>Blind SQLi with hundreds of characters to extract bit-by-bit.</li>
+<li>Awkward request handling (cookies, custom headers, JSON/XML/multipart bodies, CSRF tokens).</li>
+<li>Post-exploitation primitives (file read/write, <code>--os-shell</code>) you'd otherwise hand-build per DBMS.</li>
+</ul>
+<p>The manual techniques behind each of SQLMap's classes live in the rest of the <a href="../index.html">SQL injection cluster</a> - read those to understand <em>what</em> SQLMap is doing on the wire.</p>
+<h2 id="the-injection-classes-sqlmap-uses-beustq">The injection classes SQLMap uses (BEUSTQ)</h2>
+<p><code>sqlmap -hh</code> lists <code>--technique=BEUSTQ</code> (the default, all six). Each letter is one class, and each maps to a manual page in this cluster:</p>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Class</th>
+<th>How it extracts</th>
+<th>Speed</th>
+<th>Manual page</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>B</code></td>
+<td>Boolean-based blind</td>
+<td>TRUE/FALSE inferred from response differences, 1 bit/request</td>
+<td>Slow</td>
+<td><a href="../blind-boolean/index.html">Boolean blind</a></td>
+</tr>
+<tr>
+<td><code>E</code></td>
+<td>Error-based</td>
+<td>Data smuggled into reflected DBMS error text, ~200 B/request</td>
+<td>Fast</td>
+<td><a href="../union-based/index.html#error-based-extraction">UNION: error-based extraction</a></td>
+</tr>
+<tr>
+<td><code>U</code></td>
+<td>UNION query</td>
+<td>Injected <code>SELECT</code> appended to the original result set</td>
+<td>Fastest</td>
+<td><a href="../union-based/index.html">UNION-based</a></td>
+</tr>
+<tr>
+<td><code>S</code></td>
+<td>Stacked queries</td>
+<td><code>; &lt;stmt&gt;</code> - runs non-<code>SELECT</code> (needed for some RCE paths)</td>
+<td>n/a</td>
+<td><a href="../detection/index.html">Detection</a></td>
+</tr>
+<tr>
+<td><code>T</code></td>
+<td>Time-based blind</td>
+<td>TRUE/FALSE inferred from <code>SLEEP</code>-anchored response delay</td>
+<td>Slowest</td>
+<td><a href="../blind-time/index.html">Time-based blind</a></td>
+</tr>
+<tr>
+<td><code>Q</code></td>
+<td>Inline query</td>
+<td>Sub-query embedded in the original query</td>
+<td>n/a</td>
+<td><a href="../detection/index.html">Detection</a></td>
+</tr>
+</tbody>
+</table>
+<p>Plus <strong>out-of-band</strong> via DNS exfiltration (<code>--dns-domain</code>, you control the domain's DNS). This is an <em>extraction channel for an injection SQLMap has already confirmed</em> - not a way to detect a silent injection after the other techniques fail detection - and it needs the DB host to be able to resolve external DNS. Reach for it to speed up extraction once a point is found but in-band/inferential retrieval is slow or blocked. The manual out-of-band <em>detection</em> technique is a separate thing - see <a href="../out-of-band/index.html">Out-of-band</a>.</p>
+<p>Narrow the set when a class is causing trouble (e.g. time-based timeouts): <code>--technique=BEU</code> skips stacked, time, and inline.</p>
+<div class="cx-aside cx-note">
+<p class="cx-aside-title">Note</p>
+<p><code>S</code> (stacked) is required for takeover methods that need a <em>second</em> statement - e.g. MSSQL's stacked <code>xp_cmdshell</code>. It is <strong>not</strong> a blanket requirement for <code>--os-shell</code>: on MySQL a <code>U</code>-only injection can still drop a web backdoor via <code>INTO OUTFILE</code> given the <code>FILE</code> privilege and a writable, PHP-serving web directory, and <code>--sql-shell</code> read queries run over <code>B</code>/<code>E</code>/<code>U</code> too. So a <code>B</code>/<code>U</code>-only target isn't out of reach - it just constrains <em>which</em> takeover path works. If <code>--os-shell</code> fails, check <code>--is-dba</code> / <code>FILE</code> privilege and the writable-webroot requirements (<a href="../file-operations/index.html">File operations</a>) before blaming the missing stacked technique.</p>
+</div>
+<h2 id="pointing-sqlmap-at-a-target">Pointing SQLMap at a target</h2>
+<p>The single most common cause of a "not injectable" result is a mis-specified request, not a patched target. Get the request right first.</p>
+<h3 id="copy-as-curl">Copy as cURL</h3>
+<p>The reliable way to reproduce exactly what the browser sends: in Chrome/Edge/Firefox DevTools → Network panel, right-click the request → <strong>Copy → Copy as cURL</strong>. Paste it on the command line and change <code>curl</code> to <code>sqlmap</code>:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">sqlmap &#x27;http://target/?id=1&#x27; \
+  -H &#x27;User-Agent: Mozilla/5.0 ...&#x27; -H &#x27;Accept: ...&#x27; --compressed</code></pre></figure>
+<p>Every header, cookie, and body the app expects comes along for free.</p>
+<h3 id="the-three-ways-to-supply-parameters">The three ways to supply parameters</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">sqlmap -u &#x27;http://target/vuln.php?id=1&#x27;          # GET params inline
+sqlmap &#x27;http://target/&#x27; --data &#x27;uid=1&amp;name=test&#x27; # POST body (-p uid to narrow)
+sqlmap -r req.txt                                 # full Burp-saved request</code></pre></figure>
+<ul>
+<li><code>-r req.txt</code> is the default choice for anything non-trivial - it carries the method, headers, cookies, and body verbatim.</li>
+<li>Restrict testing to one parameter with <code>-p uid</code>, or mark the exact spot with a <code>*</code> injection marker: <code>--data 'uid=1*&amp;name=test'</code> or <code>/?id=*</code> inside a request file.</li>
+<li>Test a non-standard spot (a header, a cookie) by putting the marker there: <code>--cookie='id=1*'</code>.</li>
+</ul>
+<h3 id="bodies-and-methods">Bodies and methods</h3>
+<p>SQLMap parses form-encoded, <strong>JSON</strong> (<code>{"id":1}</code>), and <strong>XML</strong> (<code>&lt;id&gt;1&lt;/id&gt;</code>) bodies - mark the value with <code>*</code> or let it auto-detect. Set <code>Content-Type</code> to match (<code>-H 'Content-Type: application/json'</code>), and override the verb with <code>--method PUT</code> when needed.</p>
+<h3 id="the-flag-that-prevents-most-blocks">The flag that prevents most blocks</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">--random-agent      # swap SQLMap&#x27;s giveaway default User-Agent for a real browser one</code></pre></figure>
+<p>Protection solutions routinely drop traffic carrying <code>User-Agent: sqlmap/1.x</code>. Reach for <code>--random-agent</code> the moment a run returns 5xx from the start. The full target-spec flag list is in the <a href="cheatsheet/index.html#target-specification">Cheatsheet</a>.</p>
+<h2 id="the-workflow">The workflow</h2>
+<figure class="cx-code"><figcaption></figcaption><pre><code>1. Detect     sqlmap -r req.txt --batch
+                 → &quot;sqlmap identified the following injection point(s)&quot;
+2. Recon      --banner --current-user --current-db --is-dba
+3. Enumerate  --dbs → --tables -D &lt;db&gt; → --dump -T &lt;table&gt; -D &lt;db&gt;
+4. Escalate   --is-dba → --file-read / --file-write / --os-shell</code></pre></figure>
+<p><code>--batch</code> auto-accepts every prompt with its default - the right choice for unattended runs. SQLMap caches detection per-target under <code>~/.sqlmap/output/&lt;host&gt;/</code> (newer Linux: <code>~/.local/share/sqlmap/output/</code>), so step 2 onward skips re-detection and resumes from the session file. Full enumeration detail: <a href="../enumeration/index.html">Enumeration</a>; post-exploitation: <a href="../file-operations/index.html">File operations</a>.</p>
+<h3 id="tuning-the-detection-when-the-defaults-miss">Tuning the detection (when the defaults miss)</h3>
+<p>SQLMap defaults to the ~72 highest-yield payloads. Two dials widen the net:</p>
+<ul>
+<li><code>--level=1..5</code> (default 1) adds more boundaries <em>and</em> places to inject (headers, cookies). Level 5 tries the full ~7,800-payload matrix.</li>
+<li><code>--risk=1..3</code> (default 1) adds riskier vectors - notably <code>OR</code>-based payloads, which can modify data on <code>UPDATE</code>/<code>DELETE</code> statements, so they're off by default. Raise <code>--risk</code> for login forms where <code>OR</code> is often the only thing that works.</li>
+</ul>
+<p>When you know the exact context, skip the guessing and force the boundary with <code>--prefix</code>/<code>--suffix</code> (e.g. <code>--prefix="')" --suffix="-- -"</code>), and force the engine with <code>--dbms=MySQL</code> to skip other-DBMS payloads. See the full detection flag set in the <a href="cheatsheet/index.html#detection">Cheatsheet</a>.</p>
+<h2 id="reading-sqlmaps-output">Reading SQLMap's output</h2>
+<p>The scrolling log is a running commentary on what SQLMap proved. The messages worth recognizing:</p>
+<table>
+<thead>
+<tr>
+<th>Log message</th>
+<th>What it means for you</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>target URL content is stable</code></td>
+<td>Responses to identical requests don't drift - clean baseline, differential detection will be reliable.</td>
+</tr>
+<tr>
+<td><code>GET parameter 'id' appears to be dynamic</code></td>
+<td>Changing the value changes the response - the parameter likely reaches a query. "Not dynamic" is a red flag the param isn't processed (wrong name, stripped by a redirect).</td>
+</tr>
+<tr>
+<td><code>heuristic (basic) test shows that ... might be injectable (possible DBMS: 'MySQL')</code></td>
+<td>An intentionally broken value triggered a DBMS error. An <em>indication</em>, not proof - and a free DBMS fingerprint.</td>
+</tr>
+<tr>
+<td><code>might be vulnerable to cross-site scripting (XSS)</code></td>
+<td>A bonus heuristic - SQLMap noticed a reflected value. Not its job, but note it.</td>
+</tr>
+<tr>
+<td><code>it looks like the back-end DBMS is 'MySQL'. ... skip test payloads specific for other DBMSes?</code></td>
+<td>Say yes (or <code>--batch</code>) to cut testing time once the DBMS is clear; <code>--dbms=MySQL</code> sets it upfront.</td>
+</tr>
+<tr>
+<td><code>reflective value(s) found and filtering out</code></td>
+<td>Your payload is echoed in the response; SQLMap strips that noise before comparing. Harmless.</td>
+</tr>
+<tr>
+<td><code>parameter 'id' appears to be '...injectable' (with --string="luther")</code></td>
+<td>Likely a hit - and SQLMap found a constant string that cleanly separates TRUE from FALSE, so it's not relying on fuzzy comparison. Strong signal.</td>
+</tr>
+<tr>
+<td><code>time-based comparison requires a larger statistical model, please wait...</code></td>
+<td>Gathering baseline response times so it can tell a real <code>SLEEP</code> delay from network jitter. Let it finish.</td>
+</tr>
+<tr>
+<td><code>'ORDER BY' technique appears to be usable</code></td>
+<td>A fast path to the UNION column count via binary search - good news for UNION extraction.</td>
+</tr>
+<tr>
+<td><code>GET parameter 'id' is vulnerable. Do you want to keep testing the others?</code></td>
+<td>Confirmed exploitable. Say no to stop at the first point, yes to map every injectable parameter for a report.</td>
+</tr>
+<tr>
+<td><code>sqlmap identified the following injection point(s) ...</code></td>
+<td><strong>The proof.</strong> Lists every confirmed point with type, title, and payload - reusable for manual verification and the report.</td>
+</tr>
+<tr>
+<td><code>fetched data logged to text files under '...'</code></td>
+<td>Where the session, logs, and dumps live. Include this directory in deliverables.</td>
+</tr>
+</tbody>
+</table>
+<p>When a run <em>doesn't</em> behave - no injection found, enumeration hangs, errors suppressed - every diagnostic move (<code>--parse-errors</code>, <code>-t</code>, <code>-v 6</code>, <code>--proxy</code>, <code>--flush-session</code>) is in <a href="troubleshooting/index.html">Troubleshooting</a>.</p>
+<h2 id="bypassing-protections">Bypassing protections</h2>
+<p>When a WAF/IPS sits in front, SQLMap has the tooling to get payloads through: <code>--tamper=&lt;script&gt;[,...]</code> rewrites payloads (the <code>between</code> and <code>space2comment</code> scripts are the usual first try), <code>--chunked</code> and <code>--hpp</code> split keywords across the wire, and <code>--csrf-token</code>/<code>--randomize</code>/<code>--eval</code> satisfy anti-automation parameters. The full tamper catalog and bypass flags are in the <a href="cheatsheet/index.html#waf--ips-bypass">Cheatsheet</a>; the manual filter/WAF-evasion concepts are in <a href="../bypasses/index.html">Filter &amp; WAF bypasses</a>.</p>
+<h2 id="next-move">Next move</h2>
+<ul>
+<li><strong>Have a Burp request, want a first pass</strong> → <code>sqlmap -r req.txt --batch</code>, then read the log per the table above</li>
+<li><strong>Confirmed injection, need the data</strong> → <a href="cheatsheet/index.html#enumeration">Cheatsheet: enumeration</a> and <a href="../enumeration/index.html">Enumeration</a></li>
+<li><strong>DBA and want files or a shell</strong> → <a href="../file-operations/index.html">File operations</a> for the per-DBMS privilege requirements; <code>--file-read</code> / <code>--os-shell</code> flags in the <a href="cheatsheet/index.html#os-command-execution">Cheatsheet</a></li>
+<li><strong>Getting blocked or filtered</strong> → <a href="../bypasses/index.html">Filter &amp; WAF bypasses</a> and <code>--tamper</code> / <code>--random-agent</code></li>
+<li><strong>Run isn't behaving</strong> → <a href="troubleshooting/index.html">Troubleshooting</a></li>
+<li><strong>Every flag in one place</strong> → <a href="cheatsheet/index.html">Cheatsheet</a></li>
+</ul></article><nav class="cx-pager"><a class="cx-prev" href="../index.html">Previous: SQL Injection</a><a class="cx-next" href="../detection/index.html">Next: SQLi Detection</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

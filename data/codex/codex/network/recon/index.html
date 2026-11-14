@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reconnaissance · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../index.html">Cheatsheets</a> › Network › Reconnaissance</nav><h1>Reconnaissance</h1><p class="cx-lede">Operator methodology for infrastructure-based reconnaissance - the systematic approach to mapping an organization&#x27;s internet presence, network perimeter, and accessible services before active enumeration begins.</p><div class="cx-tags"><span class="cx-tag">MITRE T1589, T1590, T1591, T1592, T1593, T1595, T1596</span><span class="cx-tag">D3FEND D3-NTA, D3-RAPA</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Reconnaissance is the work that happens <em>before</em> you have a target list - or the work that fills out a target list when scope says "the company." The goal is to enumerate everything the organization exposes to the internet, identify which of those assets you're authorized to test, and build a mental model of the infrastructure deep enough to spot misconfigurations and unguarded edges.</p>
+<p>This is the <strong>passive/external</strong> half of the engagement. Active per-service enumeration (FTP, SMB, DNS as a target, etc.) lives in the <a href="../services/index.html">services cluster</a> - different mindset, different tooling, different risk profile.</p>
+<p>Recon is invisible to the target when done correctly. Every tool here either queries third-party services (crt.sh, Shodan, GrayHatWarfare, Google), reads public records (DNS, WHOIS, SSL certs), or scrapes public profiles (LinkedIn, GitHub). Nothing touches the target's infrastructure directly - that's the entire point.</p>
+<h2 id="the-three-principles">The three principles</h2>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Principle</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>There is more than meets the eye. Consider all points of view.</td>
+</tr>
+<tr>
+<td>2</td>
+<td>Distinguish between what we see and what we do not see.</td>
+</tr>
+<tr>
+<td>3</td>
+<td>There are always ways to gain more information. Understand the target.</td>
+</tr>
+</tbody>
+</table>
+<p>These read like fortune cookies until you've worked an engagement where they bite. Concretely:</p>
+<ul>
+<li><strong>Principle 1</strong> is anti-tunnel-vision. You found <code>www.target.com</code>. So has every other tester for the last decade. The interesting attack surface is the SaaS that engineering forgot to inventory, the staging environment in a <code>.dev</code> subdomain, the legacy app on <code>:8443</code> that's behind no WAF.</li>
+<li><strong>Principle 2</strong> is about <em>inferring infrastructure from artifacts</em>. A <code>TXT</code> record naming <code>google-site-verification</code> tells you they use Google. A <code>MAIL FROM</code> header with <code>mailgun.org</code> tells you about their email pipeline. You don't see the AD domain controller, but you can see the SMB share that probably auths against it.</li>
+<li><strong>Principle 3</strong> is the antidote to "I've enumerated this target." You haven't. Someone who studies one company for a year will always know more than someone who tested it for a week. Methodology exists so the work you <em>do</em> finish is the right work.</li>
+</ul>
+<h2 id="the-6-layer-model">The 6-layer model</h2>
+<p>Visualize a target as nested obstacles. Each layer is a wall; reconnaissance is finding the gaps that let you reach the next layer.</p>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>What it covers</th>
+<th>What you're collecting</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>1. Internet Presence</strong></td>
+<td>External assets reachable from the public internet</td>
+<td>Domains, subdomains, vHosts, ASN, netblocks, IPs, cloud instances</td>
+</tr>
+<tr>
+<td><strong>2. Gateway</strong></td>
+<td>Perimeter security - what stands between the internet and the internal services</td>
+<td>Firewalls, DMZ design, IPS/IDS, EDR, WAF, CDN, VPN</td>
+</tr>
+<tr>
+<td><strong>3. Accessible Services</strong></td>
+<td>Services exposed on identified hosts</td>
+<td>Service type, version, configuration, port</td>
+</tr>
+<tr>
+<td><strong>4. Processes</strong></td>
+<td>What runs behind each service - process tree, data flows, source/destination relationships</td>
+<td>PIDs, data processed, task dependencies</td>
+</tr>
+<tr>
+<td><strong>5. Privileges</strong></td>
+<td>Account model on each service - who runs what, what they can do</td>
+<td>Groups, users, permissions, environment</td>
+</tr>
+<tr>
+<td><strong>6. OS Setup</strong></td>
+<td>The host operating system once internal access is achieved</td>
+<td>OS, patch level, network config, sensitive files</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Reconnaissance covers layers 1 and 2.</strong> Layer 3 starts the per-service work (see <a href="../services/index.html">services/</a>). Layers 4-6 are post-exploitation and live in other modules.</p>
+<p>Note that layers 1 and 2 don't really apply to <em>internal</em> engagements - once you're inside (or assumed-inside as in an AD assessment), you skip directly to layer 3. The labyrinth metaphor only makes sense from the outside.</p>
+<h2 id="the-labyrinth">The labyrinth</h2>
+<p>Penetration tests are time-boxed. Every engagement has dozens of potential gaps, only some of which lead anywhere useful, and a four-week assessment can never claim "no vulnerabilities remain" - someone studying the target for six months will know it better than someone testing it for four weeks. The <a href="https://www.rpc.senate.gov/policy-papers/the-solarwinds-cyberattack">SolarWinds compromise</a> is the canonical reminder: methodology exists not to find <em>every</em> gap, but to find the right gaps in the time available.</p>
+<p>The practical implication: prioritize ruthlessly. A finding on a forgotten staging environment with no production data is less valuable than a finding on the customer-facing app, even if the staging finding is "cooler." Methodology keeps the work proportional to the goal.</p>
+<h2 id="what-goes-where-in-this-cluster">What goes where in this cluster</h2>
+<table>
+<thead>
+<tr>
+<th>Page</th>
+<th>Stage</th>
+<th>What you're doing</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="domains-and-subdomains/index.html">Domains &amp; Subdomains</a></td>
+<td>Earliest</td>
+<td>Resolve the scope from a company name to a list of internet-facing hosts</td>
+</tr>
+<tr>
+<td><a href="shodan-and-osint/index.html">Shodan &amp; OSINT</a></td>
+<td>After hosts</td>
+<td>Enrich each host with open ports, banners, geolocation - without touching it</td>
+</tr>
+<tr>
+<td><a href="cloud-resources/index.html">Cloud Resources</a></td>
+<td>Parallel</td>
+<td>Find S3 buckets, Azure blobs, GCS storage that wasn't in the DNS zone</td>
+</tr>
+<tr>
+<td><a href="people/index.html">People &amp; Tech Stack</a></td>
+<td>Anytime</td>
+<td>LinkedIn, job posts, GitHub - what tech do the engineers actually work with</td>
+</tr>
+</tbody>
+</table>
+<p>The order isn't strict. People-recon can happen first if you have a name and no IPs. Cloud and DNS reinforce each other. The point is the <em>coverage</em>, not the sequence.</p>
+<h2 id="when-recon-ends">When recon ends</h2>
+<p>Recon ends when you have:</p>
+<ol>
+<li>A scope-validated list of hosts you can touch</li>
+<li>Per-host context - service banners, software versions, defensive products</li>
+<li>Enough organizational intel to recognize what's normal traffic and what isn't</li>
+<li>A working hypothesis about the most exposed attack surface</li>
+</ol>
+<p>At that point, switch to active enumeration. The <a href="../services/index.html">services cluster</a> covers per-service work - that's where DNS becomes "AXFR this nameserver," SMB becomes "enumerate shares anonymously," and so on.</p>
+<h2 id="a-note-on-scope">A note on scope</h2>
+<p>Everything in this cluster <em>can</em> be done without authorization (it queries third-party data sources, not the target). That doesn't mean every <em>result</em> is in-scope to test. A subdomain might point to a SaaS the target uses but doesn't own - testing that SaaS would target a third party. An S3 bucket might belong to a contractor with a different scope of work. Recon expands the <em>visible</em> attack surface; the engagement contract narrows it back down to what you're allowed to act on.</p>
+<p>When in doubt, ask the client. Every result on this cluster should be cross-referenced against the rules of engagement before any traffic touches it.</p></article><nav class="cx-pager"><a class="cx-next" href="domains-and-subdomains/index.html">Next: Domains &amp; Subdomains</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../license.html">License</a></p></footer>
+<script src="../../../codex.js"></script></body></html>
