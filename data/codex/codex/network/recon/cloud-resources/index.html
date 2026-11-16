@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cloud Resources · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Network › Reconnaissance</nav><h1>Cloud Resources</h1><p class="cx-lede">Discovering S3 buckets, Azure blobs, and GCS storage that the organization owns - through DNS records, Google dorks, source-code references, and third-party bucket indexes.</p><div class="cx-tags"><span class="cx-tag">MITRE T1593, T1593.002, T1596, T1552, T1552.001</span><span class="cx-tag">D3FEND D3-NTA, D3-FA</span><span class="cx-tag">IMPACT DataExfil, CredentialTheft, FileRead</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Cloud storage misconfigurations are one of the easiest wins in modern engagements. Companies create S3 buckets / Azure blobs / GCS buckets for legitimate reasons, then mis-set the access policy and put production data in something the entire internet can read. The goal of this stage: find the buckets the organization owns, before touching them, so you can hand the customer a clean "your bucket X is publicly readable" finding.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># 1. DNS-resident clues - cloud storage hostnames in the organization&#x27;s DNS
+grep -E &#x27;(amazonaws|blob.core.windows|storage.googleapis)&#x27; subdomains.txt
+
+# 2. Google dorks - find indexed bucket URLs
+&quot;site:s3.amazonaws.com example&quot;
+&quot;site:blob.core.windows.net example&quot;
+
+# 3. Source-code crawl - buckets referenced in JS/CSS/HTML of the main site
+curl -s https://target.com | grep -Eo &#x27;https?://[^&quot;]*\.(amazonaws\.com|blob\.core\.windows\.net|storage\.googleapis\.com)[^&quot;]*&#x27;
+
+# 4. Third-party indexes - public buckets indexed by GrayHatWarfare and friends
+# https://buckets.grayhatwarfare.com/  (search by company name or abbreviation)</code></pre></figure>
+<p>Success indicator: a list of bucket URLs owned by the target, classified by access level (public, partial, restricted) and content category (static assets, backups, customer data, credentials).</p>
+<h2 id="why-cloud-storage-matters">Why cloud storage matters</h2>
+<p>Every major cloud provider exposes object storage that defaults to private but can be made public with a single config flag. The flag exists for a reason - static websites, public downloads, file sharing - but it gets set incorrectly all the time. A non-exhaustive list of what's been found in public buckets across real engagements:</p>
+<ul>
+<li>Customer PII (names, emails, addresses, SSNs)</li>
+<li>Backups of production databases</li>
+<li>API keys and cloud credentials (which compound the breach)</li>
+<li>Private SSH keys (immediate lateral movement onto everything those keys authorize)</li>
+<li>Source code with hardcoded secrets</li>
+<li>Internal documents, contracts, sales pipelines</li>
+<li>CI/CD artifacts including private container images</li>
+</ul>
+<p>A single publicly readable backup bucket is often the entire engagement.</p>
+<h2 id="identifying-cloud-storage-from-dns">Identifying cloud storage from DNS</h2>
+<p>Cloud storage gets named via DNS for the same reason any other service does - humans need to find it. Look at your subdomain list from <a href="../domains-and-subdomains/index.html">Domains &amp; Subdomains</a> for cloud-provider hostnames:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># After resolving subdomains to IPs (or to CNAMEs):
+host -t cname assets.example.com</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>assets.example.com is an alias for s3-website-us-west-2.amazonaws.com.</code></pre></figure>
+<p>Or check the resolved IPs against known cloud ranges:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># AWS publishes its IP ranges as JSON
+curl -s https://ip-ranges.amazonaws.com/ip-ranges.json | jq .</code></pre></figure>
+<p>When you find a <code>*.amazonaws.com</code> alias, the actual bucket name often follows a predictable pattern. <code>s3-website-us-west-2.amazonaws.com</code> is the regional endpoint; the bucket is usually accessed at one of:</p>
+<ul>
+<li><code>&lt;bucket&gt;.s3.amazonaws.com</code></li>
+<li><code>&lt;bucket&gt;.s3-us-west-2.amazonaws.com</code></li>
+<li><code>&lt;bucket&gt;.s3-website-us-west-2.amazonaws.com</code></li>
+</ul>
+<p>If <code>assets.example.com</code> aliases to the S3 website endpoint, the bucket is very likely named <code>assets.example.com</code> (the alias works because the bucket name matches the host header).</p>
+<h2 id="provider-naming-conventions">Provider naming conventions</h2>
+<table>
+<thead>
+<tr>
+<th>Provider</th>
+<th>Storage type</th>
+<th>Hostname pattern</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>AWS</td>
+<td>S3</td>
+<td><code>&lt;bucket&gt;.s3.amazonaws.com</code>, <code>&lt;bucket&gt;.s3-&lt;region&gt;.amazonaws.com</code></td>
+</tr>
+<tr>
+<td>AWS</td>
+<td>S3 website</td>
+<td><code>&lt;bucket&gt;.s3-website-&lt;region&gt;.amazonaws.com</code></td>
+</tr>
+<tr>
+<td>Azure</td>
+<td>Blob storage</td>
+<td><code>&lt;account&gt;.blob.core.windows.net/&lt;container&gt;/</code></td>
+</tr>
+<tr>
+<td>Azure</td>
+<td>File storage</td>
+<td><code>&lt;account&gt;.file.core.windows.net/&lt;share&gt;/</code></td>
+</tr>
+<tr>
+<td>GCP</td>
+<td>Cloud Storage</td>
+<td><code>storage.googleapis.com/&lt;bucket&gt;/</code>, <code>&lt;bucket&gt;.storage.googleapis.com</code></td>
+</tr>
+<tr>
+<td>DigitalOcean</td>
+<td>Spaces</td>
+<td><code>&lt;space&gt;.&lt;region&gt;.digitaloceanspaces.com</code></td>
+</tr>
+<tr>
+<td>Backblaze</td>
+<td>B2</td>
+<td><code>&lt;bucket&gt;.s3.&lt;region&gt;.backblazeb2.com</code> (S3-compatible)</td>
+</tr>
+<tr>
+<td>Linode</td>
+<td>Object Storage</td>
+<td><code>&lt;bucket&gt;.&lt;region&gt;.linodeobjects.com</code></td>
+</tr>
+</tbody>
+</table>
+<p>Useful pattern: companies tend to name buckets after either the application, the environment, or the data. So you might see:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>example-assets
+example-backups
+example-prod
+example-staging
+example-prod
+ilf-data</code></pre></figure>
+<p>Wordlist bucket discovery is covered later in this page.</p>
+<h2 id="google-dorks">Google dorks</h2>
+<p>Google has indexed massive amounts of bucket content. Cloud provider URLs follow recognizable patterns; you can search for them with <code>site:</code> operators and narrow by content keywords.</p>
+<h3 id="aws-s3">AWS S3</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>site:s3.amazonaws.com example
+site:s3-us-west-2.amazonaws.com &quot;example&quot; filetype:pdf
+inurl:s3.amazonaws.com &quot;example&quot; intext:&quot;confidential&quot;</code></pre></figure>
+<h3 id="azure-blob">Azure Blob</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>site:blob.core.windows.net &quot;example&quot;
+inurl:blob.core.windows.net filetype:xlsx &quot;example&quot;</code></pre></figure>
+<h3 id="gcp">GCP</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>site:storage.googleapis.com &quot;example&quot;
+inurl:storage.googleapis.com &quot;example&quot; filetype:json</code></pre></figure>
+<h3 id="general-cloud-bucket-dorking">General cloud bucket dorking</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&quot;AKIA&quot; filetype:txt              # AWS access key prefix in text files
+&quot;AccountKey=&quot; filetype:config    # Azure storage account keys
+&quot;google_application_credentials&quot; filetype:json</code></pre></figure>
+<p>Real engagements turn up PDFs (contracts, proposals), spreadsheets (customer lists, invoices), text dumps, JSON configs, presentations, and source code in indexed buckets. The PII surface is often immediate and severe.</p>
+<h2 id="source-code-references">Source-code references</h2>
+<p>Cloud storage URLs appear in HTML, CSS, and JavaScript of the company's primary website. Images, fonts, scripts, and downloadable assets are loaded from buckets - that's <em>why</em> the bucket exists in the first place.</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># Pull the main page and extract cloud storage references
+curl -sL https://target.com \
+  | grep -Eo &#x27;https?://[^&quot;]*\.(amazonaws\.com|blob\.core\.windows\.net|storage\.googleapis\.com|digitaloceanspaces\.com)[^&quot;]*&#x27; \
+  | sort -u</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>https://cdn-images.example.com.s3.amazonaws.com/banner.png
+https://example-static.s3-us-west-2.amazonaws.com/main.css
+https://example-docs.blob.core.windows.net/public/whitepaper.pdf</code></pre></figure>
+<p>Each unique hostname is a bucket worth investigating. The full URL is what's referenced; the bucket itself often has <em>additional</em> content beyond what's linked in HTML.</p>
+<p>For comprehensive crawling, use a tool like <a href="https://github.com/tomnomnom/waybackurls"><code>waybackurls</code></a> or <a href="https://github.com/lc/gau"><code>gau</code></a> to pull URLs the Wayback Machine has archived for the domain - historical references often include staging buckets that aren't linked anymore.</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">waybackurls example.com | grep -E &#x27;amazonaws|blob|googleapis&#x27; | sort -u</code></pre></figure>
+<h2 id="grayhatwarfare">GrayHatWarfare</h2>
+<p><a href="https://buckets.grayhatwarfare.com/">GrayHatWarfare</a> maintains a continuously updated index of <em>public</em> S3, Azure Blob, and GCS buckets along with their file contents. Search by:</p>
+<ul>
+<li>Bucket name (partial match)</li>
+<li>Filename / extension</li>
+<li>Content type</li>
+</ul>
+<p>This service has cataloged hundreds of thousands of misconfigured buckets. Search for the company name, then for common abbreviations (companies often abbreviate in internal naming - <code>Example</code> → <code>ilf</code> → <code>if</code>). Search for likely file types:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>example        → matches bucket names
+ilf                  → matches abbreviations  
+example .sql   → backup dumps
+example .pem   → private keys
+example id_rsa → SSH keys
+example .env   → environment configs</code></pre></figure>
+<p>Common high-value finds:</p>
+<table>
+<thead>
+<tr>
+<th>Search</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>.sql.gz</code> <code>.sql.bz2</code> <code>.dump</code></td>
+<td>Database backups</td>
+</tr>
+<tr>
+<td><code>id_rsa</code> <code>*.pem</code> <code>*.ppk</code></td>
+<td>Private keys</td>
+</tr>
+<tr>
+<td><code>.env</code> <code>config.json</code> <code>credentials.json</code></td>
+<td>App credentials</td>
+</tr>
+<tr>
+<td><code>*.bak</code> <code>backup.tar.gz</code></td>
+<td>Generic backups</td>
+</tr>
+<tr>
+<td><code>*.kdbx</code> <code>secrets.txt</code></td>
+<td>Password managers / secret stores</td>
+</tr>
+</tbody>
+</table>
+<p>A single SSH key in a public bucket can mean instant root on production servers. Verify the bucket truly belongs to the target before reporting - bucket names sometimes collide.</p>
+<h2 id="bucket-name-brute-force">Bucket-name brute-force</h2>
+<p>Even when no DNS pointer or source-code link reveals a bucket, you can guess names by enumerating common patterns. Tools that automate this:</p>
+<ul>
+<li><a href="https://github.com/sa7mon/S3Scanner">s3scanner</a> - checks bucket existence + access level for a wordlist of names</li>
+<li><a href="https://github.com/initstring/cloud_enum">cloud_enum</a> - covers AWS, Azure, and GCP with one wordlist</li>
+<li><a href="https://github.com/eth0izzle/bucket-stream">Bucket Stream</a> - passive discovery via certificate transparency monitoring</li>
+</ul>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># cloud_enum example
+python cloud_enum.py -k example -k example -k ilf -k if</code></pre></figure>
+<p>The tool generates permutations: <code>example-prod</code>, <code>prod-example</code>, <code>example-backup</code>, <code>example.us-west-2</code>, etc. - and checks each against AWS, Azure, and GCP simultaneously.</p>
+<h3 id="wordlist-patterns-that-work">Wordlist patterns that work</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>{company}-prod        {company}-staging      {company}-dev
+{company}-backup      {company}-backups      {company}-bak
+{company}-data        {company}-public       {company}-assets
+{company}-uploads     {company}-files        {company}-images
+{company}-logs        {company}-archive      {company}-temp
+{company}.{env}       {env}.{company}        {company}{env}</code></pre></figure>
+<p>Append regions for AWS: <code>-us-east-1</code>, <code>-us-west-2</code>, <code>-eu-west-1</code>, etc.</p>
+<h2 id="domainglass">domain.glass</h2>
+<p><a href="https://domain.glass/">domain.glass</a> is a quick infrastructure aggregator. Useful for spotting cloud usage at a glance - it shows DNS, TLS, hosting, CDN classification, and a Cloudflare "Safe" / "Suspicious" rating in one view. The Cloudflare verdict is a good cue for layer-2 gateway notes: if Cloudflare protects the main site, you need to think about WAF bypass on later stages.</p>
+<h2 id="what-to-do-with-a-bucket-you-find">What to do with a bucket you find</h2>
+<p>For each bucket you discover that belongs to the target:</p>
+<ol>
+<li><strong>List contents</strong> - <code>aws s3 ls s3://bucket --no-sign-request</code> for AWS; <code>az storage blob list --account-name X --container-name Y --auth-mode login</code> for Azure (or browser navigation to the public URL).</li>
+<li><strong>Classify access</strong> - public read, public read+write, requester-pays, fully private. The access policy is the finding.</li>
+<li><strong>Sample content</strong> - what <em>type</em> of data is in there? Static website assets? Customer files? Backups?</li>
+<li><strong>Note credentials within content</strong> - config files, <code>.env</code>, scripts often contain hardcoded keys.</li>
+<li><strong>Don't exfiltrate</strong> - confirm the bucket is open, document the access level, take screenshots, don't pull gigabytes of customer data unless explicitly authorized.</li>
+</ol>
+<p>The finding writes itself: "Bucket <code>example-backups</code> is publicly readable and contains [N] database backup files spanning [date range]. Recommended remediation: set bucket ACL to private, audit access logs."</p>
+<h2 id="ssh-keys-and-credentials-in-cloud-buckets">SSH keys and credentials in cloud buckets</h2>
+<p>A specific high-value finding worth calling out: SSH private keys in public buckets is a recurring pattern. Engineers under pressure store <code>id_rsa</code> somewhere "temporary" for a quick transfer; the bucket gets made public for a different file; the key sits there indefinitely.</p>
+<p>If you find an SSH private key in a bucket:</p>
+<ol>
+<li>Identify what host it authorizes - try <code>ssh -i found_key user@target_host</code></li>
+<li>Document the public key fingerprint and which hosts accept it</li>
+<li>Report immediately - this is a high-severity finding regardless of what else you do</li>
+</ol>
+<p>Similarly for cloud credentials (<code>AKIA...</code> access keys, Azure storage account keys, GCP service account JSONs). Don't <em>use</em> the credentials - verify they're valid via <code>aws sts get-caller-identity</code> or equivalent, then report.</p>
+<h2 id="putting-it-together">Putting it together</h2>
+<p>A clean cloud-recon workflow:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>1. Filter subdomain list   → identify cloud-hosted hostnames from DNS data
+2. Crawl primary site      → extract bucket URLs from HTML/JS/CSS
+3. Wayback archive         → historical bucket references
+4. Google dorks            → indexed bucket content
+5. GrayHatWarfare          → public bucket index, by company name + abbreviations
+6. cloud_enum brute        → wordlist-based bucket discovery
+7. Per bucket: access test → public/restricted classification
+8. Per bucket: content sample → categorize, identify high-value content
+9. Per bucket: secret scan → keys, credentials, PII within bucket contents</code></pre></figure>
+<p>The output: a per-bucket inventory with access level, content category, and any embedded credentials. Buckets with credentials or PII become immediate findings; buckets that just host static assets get noted for completeness.</p></article><nav class="cx-pager"><a class="cx-prev" href="../shodan-and-osint/index.html">Previous: Shodan &amp; Third-Party OSINT</a><a class="cx-next" href="../people/index.html">Next: People &amp; Tech Stack</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

