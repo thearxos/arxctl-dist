@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQL Injection · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../index.html">Cheatsheets</a> › Web › SQL Injection</nav><h1>SQL Injection</h1><p class="cx-lede">Identifying and exploiting SQL injection across major database engines.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190</span><span class="cx-tag">D3FEND D3-MH, D3-MA, D3-NTA</span><span class="cx-tag">IMPACT DataExfil, AuthBypass, RCE</span><span class="cx-tag">OWASP A05</span></div><article class="cx-body"><p>SQL injection occurs when user input is concatenated into a SQL query without proper parameterisation, allowing the attacker to alter the query's structure. Impact ranges from authentication bypass to full database extraction, file read/write on the database host, and remote code execution.</p>
+<p>This section is operational reference. Use the page that matches your situation:</p>
+<table>
+<thead>
+<tr>
+<th>You are...</th>
+<th>Go to</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Looking for the first injection in an unknown app</td>
+<td><a href="detection/index.html">Detection</a></td>
+</tr>
+<tr>
+<td>Trying to log in without credentials</td>
+<td><a href="auth-bypass/index.html">Authentication bypass</a></td>
+</tr>
+<tr>
+<td>Seeing query output reflected in the response</td>
+<td><a href="union-based/index.html">UNION-based</a></td>
+</tr>
+<tr>
+<td>Confirmed injection, need to dump the database</td>
+<td><a href="enumeration/index.html">Enumeration</a></td>
+</tr>
+<tr>
+<td>Output not visible, but page behaviour changes</td>
+<td><a href="blind-boolean/index.html">Boolean-based blind</a></td>
+</tr>
+<tr>
+<td>Output not visible, but a condition can trigger a DB error</td>
+<td><a href="blind-error/index.html">Error-based blind</a></td>
+</tr>
+<tr>
+<td>Output not visible, no behavioural difference</td>
+<td><a href="blind-time/index.html">Time-based blind</a></td>
+</tr>
+<tr>
+<td>No response feedback at all</td>
+<td><a href="out-of-band/index.html">Out-of-band</a></td>
+</tr>
+<tr>
+<td>User input appears in a query, but only after later use</td>
+<td><a href="second-order/index.html">Second-order</a></td>
+</tr>
+<tr>
+<td>Injecting against MongoDB / NoSQL</td>
+<td><a href="nosql/index.html">NoSQL injection</a></td>
+</tr>
+<tr>
+<td>Need to read or write files via the DB</td>
+<td><a href="file-operations/index.html">File operations</a></td>
+</tr>
+<tr>
+<td>Payload is being filtered or blocked</td>
+<td><a href="bypasses/index.html">Filter bypasses</a></td>
+</tr>
+<tr>
+<td>Need syntax for a specific DBMS</td>
+<td><a href="dbms-cheatsheet/index.html">DBMS cheatsheet</a></td>
+</tr>
+<tr>
+<td>Need to fix it, or writing the remediation</td>
+<td><a href="defense/index.html">Defense</a></td>
+</tr>
+</tbody>
+</table>
+<h2 id="standard-methodology">Standard methodology</h2>
+<div class="cx-steps">
+<ol>
+<li><strong>Identify</strong> every parameter that may influence a query - URL parameters, form fields, headers (<code>User-Agent</code>, <code>Cookie</code>, <code>X-Forwarded-For</code>), JSON body fields.</li>
+<li><strong>Detect</strong> by injecting a syntax-breaking character (<code>'</code>, <code>"</code>, <code>)</code>, <code>--</code>) and observing for errors, behavioural change, or timing change.</li>
+<li><strong>Fingerprint</strong> the DBMS using version-specific payloads (see <a href="dbms-cheatsheet/index.html">DBMS cheatsheet</a>).</li>
+<li><strong>Determine the injection class</strong> - in-band (UNION/error), inferential (boolean/time blind), or out-of-band.</li>
+<li><strong>Enumerate</strong> schema → tables → columns → data.</li>
+<li><strong>Escalate</strong> where possible: file read/write, command execution, lateral movement.</li>
+</ol>
+</div>
+<h2 id="conventions-used-in-this-section">Conventions used in this section</h2>
+<p>Placeholders follow the same scheme everywhere:</p>
+<ul>
+<li><code>&lt;TARGET&gt;</code> - target host or URL</li>
+<li><code>&lt;PARAM&gt;</code> - vulnerable parameter name</li>
+<li><code>&lt;TABLE&gt;</code>, <code>&lt;COL&gt;</code>, <code>&lt;DB&gt;</code> - table, column, database name</li>
+<li><code>&lt;USER&gt;</code> - target username (e.g. <code>administrator</code>)</li>
+<li><code>&lt;N&gt;</code> - column count</li>
+<li><code>&lt;ATTACKER&gt;</code> - your listener / collaborator host</li>
+</ul>
+<p>When a page shows a payload, assume it is what gets injected into <code>&lt;PARAM&gt;</code> - URL-encoding, prefix, and suffix depend on context.</p>
+<h2 id="when-to-reach-for-sqlmap">When to reach for <code>sqlmap</code></h2>
+<p>Manual exploitation is faster for simple cases and essential for understanding what's happening. <code>sqlmap</code> is the right tool when:</p>
+<ul>
+<li>You need to enumerate a large schema quickly.</li>
+<li>You're chasing blind SQLi with hundreds of characters to extract.</li>
+<li>The target needs unusual handling (cookies, custom headers, JSON, multipart).</li>
+</ul>
+<p>Minimal invocation:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">sqlmap -u &quot;https://&lt;TARGET&gt;/path?&lt;PARAM&gt;=test&quot; --batch --dbs</code></pre></figure>
+<p>For complex requests, save the request from Burp to a file and use <code>-r request.txt</code>. See <a href="dbms-cheatsheet/index.html">DBMS cheatsheet</a> for <code>--dbms</code>, <code>--technique</code>, and other flags worth knowing.</p>
+<div class="cx-aside cx-caution">
+<p class="cx-aside-title">Caution</p>
+<p>SQL injection on a system you don't own or have written authorisation to test is illegal in most jurisdictions. The techniques in this section are for authorised security testing, CTFs, and lab environments only.</p>
+</div>
+<h2 id="next-move">Next move</h2>
+<ul>
+<li><strong>Suspect SQLi on a login form</strong> → <a href="auth-bypass/index.html">Auth bypass</a> (one-payload check before deep enumeration)</li>
+<li><strong>Confirmed injection, results reflected in response</strong> → <a href="union-based/index.html">UNION-based extraction</a> for fast data dump</li>
+<li><strong>Confirmed injection, no reflected output</strong> → <a href="blind-boolean/index.html">Boolean blind</a> (fast) or <a href="blind-time/index.html">Time-based blind</a> (slow but works through WAFs that strip booleans)</li>
+<li><strong>DBMS is unknown</strong> → use <a href="detection/index.html">detection probes</a> to fingerprint MySQL / PostgreSQL / MSSQL / Oracle before picking a payload syntax</li>
+<li><strong>Stored XSS-style injection that fires later (admin panel)</strong> → <a href="second-order/index.html">Second-order</a></li>
+<li><strong>Got admin via injection, want files / shell</strong> → <a href="file-operations/index.html">File operations</a> for <code>LOAD_FILE</code> / <code>INTO OUTFILE</code>; on MSSQL pivot to <a href="../../network/services/mssql/index.html">xp_cmdshell</a></li>
+<li><strong>WAF blocking obvious payloads</strong> → <a href="bypasses/index.html">Bypasses</a> (encoding, comments, case, whitespace variations)</li>
+<li><strong>Need to automate after manual confirmation</strong> → <a href="sqlmap/index.html">sqlmap</a> with <code>--dbms</code>, <code>--technique</code>, and <code>-r request.txt</code></li>
+</ul></article><nav class="cx-pager"><a class="cx-next" href="sqlmap/index.html">Next: SQLMap</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../license.html">License</a></p></footer>
+<script src="../../../codex.js"></script></body></html>
