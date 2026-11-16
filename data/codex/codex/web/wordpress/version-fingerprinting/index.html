@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Version Fingerprinting · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › WordPress</nav><h1>Version Fingerprinting</h1><p class="cx-lede">Identifying the exact WordPress core version through meta-generator, asset query strings, readme.html, REST API roots, and login-page tells - the first step before searching for version-specific CVEs.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1083</span><span class="cx-tag">D3FEND D3-RAPA</span><span class="cx-tag">IMPACT Reconnaissance</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Before searching CVE databases or picking exploits, identify the WordPress core version. Five sources, ordered by reliability and stealth:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># 1. The meta generator tag in HTML &lt;head&gt;
+curl -s http://target/ | grep -i &#x27;meta name=&quot;generator&quot;&#x27;
+
+# 2. Asset query strings - every loaded CSS/JS includes ?ver=&lt;core-version&gt;
+curl -s http://target/ | grep -oE &#x27;ver=[0-9]+\.[0-9]+(\.[0-9]+)?&#x27; | sort -u
+
+# 3. The readme.html banner (older installs)
+curl -s http://target/readme.html | grep -i version
+
+# 4. The RSS feed generator tag
+curl -s http://target/feed/ | grep -i &#x27;generator&#x27;
+
+# 5. The REST API root
+curl -s http://target/wp-json/ | jq &#x27;.namespaces, .authentication&#x27;</code></pre></figure>
+<p>Success indicator: a confirmed version string like <code>5.3.2</code> that you can cross-reference against the <a href="https://wordpress.org/news/category/security/">WordPress security archive</a> and CVE databases.</p>
+<h2 id="why-this-matters">Why this matters</h2>
+<p>WordPress core is patched aggressively. The current release line gets security fixes within days of a vulnerability being disclosed, and many hosts auto-update minor versions. Finding a target on <code>WordPress 5.3.2</code> in 2024 isn't just "it's slightly behind" - it's "it's behind by years and skipped a dozen security releases." Version-pinned CVE checks against current major versions usually return nothing; against versions more than two minor releases behind, the pickings are good.</p>
+<p>A precise version also lets you predict the behavior of specific features:
+- REST API <code>/wp-json/wp/v2/users</code> returned all users (not just published authors) in 4.7.0 and 4.7.1 - fixed in 4.7.2. If the target is exactly in that window, anonymous user enum is trivial.
+- Many plugins ship as "tested with WP X.Y" - the WP core version constrains which plugin versions could plausibly be installed.</p>
+<h2 id="source-1-meta-generator">Source 1 - meta generator</h2>
+<p>WordPress writes a <code>&lt;meta name="generator"&gt;</code> tag into every page's <code>&lt;head&gt;</code> by default:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;head&gt;
+  ...
+  &lt;meta name=&quot;generator&quot; content=&quot;WordPress 5.3.3&quot; /&gt;
+  ...
+&lt;/head&gt;</code></pre></figure>
+<p>Curl + grep extracts it:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">curl -s http://blog.example.com/ | grep -i &#x27;meta name=&quot;generator&quot;&#x27;</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&lt;meta name=&quot;generator&quot; content=&quot;WordPress 5.3.3&quot; /&gt;</code></pre></figure>
+<p>Many security plugins (Wordfence, Hide My WP, Sucuri) remove this tag. When <code>meta generator</code> is absent, move to the next source - don't conclude the target isn't WordPress.</p>
+<h2 id="source-2-asset-query-strings">Source 2 - asset query strings</h2>
+<p>This is the most reliable source because admins almost never remove it. Every CSS and JS file WordPress enqueues is loaded with a version query parameter:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;link rel=&#x27;stylesheet&#x27; id=&#x27;wp-block-library-css&#x27;
+      href=&#x27;http://target/wp-includes/css/dist/block-library/style.min.css?ver=5.3.3&#x27;
+      type=&#x27;text/css&#x27; media=&#x27;all&#x27; /&gt;
+&lt;script src=&#x27;http://target/wp-includes/js/wp-emoji-release.min.js?ver=5.3.3&#x27;&gt;&lt;/script&gt;</code></pre></figure>
+<p>The <code>?ver=</code> on assets loaded from <code>/wp-includes/</code> is the core version. Assets from <code>/wp-content/plugins/&lt;plugin&gt;/</code> use <em>that plugin's</em> version. So filter for the right path:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">curl -s http://target/ \
+  | grep -oE &#x27;wp-includes/[^&quot;]+\?ver=[0-9.]+&#x27; \
+  | grep -oE &#x27;ver=[0-9.]+&#x27; \
+  | sort -u</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>ver=5.3.3</code></pre></figure>
+<p>If you see multiple versions in <code>wp-includes</code> assets, the target is mid-upgrade or has a caching plugin generating stale URLs - take the highest version as the live core.</p>
+<p>This source is hard for security plugins to remove because the version query parameter has a real function: it's the cache-buster that tells browsers to refetch CSS/JS after an update. Removing it breaks updates. Some plugins replace it with a hash of the file content, which obscures the version but is itself a distinctive fingerprint of those plugins.</p>
+<h2 id="source-3-readmehtml">Source 3 - readme.html</h2>
+<p>The default WordPress installation ships with <code>/readme.html</code> in the webroot:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">curl -s http://target/readme.html | head -20</code></pre></figure>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;!DOCTYPE html&gt;
+&lt;html lang=&quot;en-US&quot;&gt;
+&lt;head&gt;
+&lt;meta charset=&quot;UTF-8&quot; /&gt;
+&lt;title&gt;WordPress &amp;rsaquo; ReadMe&lt;/title&gt;
+...
+&lt;h1 id=&quot;logo&quot;&gt;
+    &lt;a href=&quot;https://wordpress.org/&quot;&gt;&lt;img alt=&quot;WordPress&quot; src=&quot;wp-admin/images/wordpress-logo.png&quot; width=&quot;250&quot; height=&quot;68&quot; /&gt;&lt;/a&gt;
+    &lt;br /&gt;
+    Version 5.3.3
+&lt;/h1&gt;</code></pre></figure>
+<p>The <code>Version X.Y.Z</code> line in the H1 is unambiguous.</p>
+<p><strong>Most hardening guides recommend deleting <code>readme.html</code></strong>, so on hardened installs you'll get a 404. Try also:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>/readme.txt
+/license.txt          # less reliable but sometimes versioned
+/wp-admin/install.php # if WP isn&#x27;t fully configured, this page shows version</code></pre></figure>
+<h2 id="source-4-rss-feed">Source 4 - RSS feed</h2>
+<p>WordPress generates an RSS feed at <code>/feed/</code>, which includes its own generator tag:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">curl -s http://target/feed/ | grep -i &#x27;generator&#x27;</code></pre></figure>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;generator&gt;https://wordpress.org/?v=5.3.2&lt;/generator&gt;</code></pre></figure>
+<p>The <code>?v=</code> value is the WP version. Useful when:
+- <code>meta generator</code> has been stripped from HTML
+- <code>readme.html</code> is deleted
+- The site has a blog and at least one published post (without which <code>/feed/</code> may be empty)</p>
+<p>Also try:
+- <code>/feed/atom/</code> - same data, Atom format
+- <code>/wp-feed.php</code> - alternative endpoint, same data</p>
+<h2 id="source-5-rest-api">Source 5 - REST API</h2>
+<p>Every modern WordPress install exposes the REST API at <code>/wp-json/</code>. The root endpoint returns metadata:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">curl -s http://target/wp-json/ | jq &#x27;.&#x27;</code></pre></figure>
+<figure class="cx-code"><figcaption>json</figcaption><pre><code class="language-json">{
+  &quot;name&quot;: &quot;Example Blog&quot;,
+  &quot;description&quot;: &quot;Just another WordPress site&quot;,
+  &quot;url&quot;: &quot;http://blog.example.com&quot;,
+  &quot;home&quot;: &quot;http://blog.example.com&quot;,
+  &quot;gmt_offset&quot;: &quot;0&quot;,
+  &quot;timezone_string&quot;: &quot;&quot;,
+  &quot;namespaces&quot;: [
+    &quot;oembed/1.0&quot;,
+    &quot;wp/v2&quot;,
+    &quot;wp-site-health/v1&quot;,
+    &quot;wp-block-editor/v1&quot;
+  ],
+  &quot;authentication&quot;: [],
+  ...
+}</code></pre></figure>
+<p>The <code>namespaces</code> list is a strong fingerprint:</p>
+<table>
+<thead>
+<tr>
+<th>Namespace</th>
+<th>Introduced in</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>oembed/1.0</code></td>
+<td>4.4</td>
+</tr>
+<tr>
+<td><code>wp/v2</code></td>
+<td>4.7</td>
+</tr>
+<tr>
+<td><code>wp-site-health/v1</code></td>
+<td>5.2</td>
+</tr>
+<tr>
+<td><code>wp-block-editor/v1</code></td>
+<td>5.5</td>
+</tr>
+</tbody>
+</table>
+<p>So a target showing <code>wp-block-editor/v1</code> but not (say) <code>wp-account/v1</code> (a hypothetical 6.x namespace) is somewhere in the 5.5–5.x range. The presence/absence of specific namespaces narrows version ranges when no explicit version is exposed.</p>
+<h2 id="source-6-login-page-tells">Source 6 - login-page tells</h2>
+<p>The login form itself can be version-fingerprinted:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">curl -s http://target/wp-login.php | grep -E &#x27;ver=|generator|wp-includes/css&#x27;</code></pre></figure>
+<p>The login page loads CSS/JS just like the front-end, so the same <code>?ver=</code> cache-buster pattern applies. Login pages also include version-conditional features (e.g., the password-strength meter, language picker) whose presence/absence tells you a rough version range.</p>
+<h2 id="when-all-signals-are-stripped">When all signals are stripped</h2>
+<p>A site can be <em>very</em> well-hardened - <code>meta generator</code> stripped, <code>readme.html</code> deleted, <code>?ver=</code> overwritten with hashes, REST API namespaces filtered, login page customized. At that point, fingerprinting falls back to behavioral tests:</p>
+<ul>
+<li>Send malformed login attempts and read the error response. Specific error strings change between versions.</li>
+<li>Send REST API requests for endpoints that didn't exist in older versions; 404 vs 200 narrows the version.</li>
+<li>Send XML-RPC <code>system.listMethods</code> and count the methods. The count changes slightly across versions because of internal plugins like <code>metaWeblog</code>.</li>
+</ul>
+<p>In practice, hardening this thorough is rare. Most engagements catch the version from source 1 or 2 immediately.</p>
+<h2 id="from-version-to-vulnerability">From version to vulnerability</h2>
+<p>Once you have a version, the workflow:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>1. WordPress core CVE lookup
+   https://wpscan.com/wordpresses
+   https://www.cvedetails.com/product/4096/Wordpress-Wordpress.html
+
+2. Specific feature CVEs by version range
+   E.g., &quot;WordPress 4.7.0–4.7.1 unauthenticated REST API content modification&quot;
+
+3. Cross-reference with installed plugin versions (see plugin-theme-enum/)
+   A vulnerable plugin × this core version × the CVE&#x27;s preconditions = an exploit path
+
+4. WPScan with API token automates much of this
+   wpscan --url http://target --enumerate --api-token &lt;token&gt;</code></pre></figure>
+<p>The WPScan API (<a href="https://wpscan.com">wpscan.com</a>) maintains a vulnerability database for WordPress core, plugins, and themes. With an API token, WPScan checks each detected component's version against that database in one pass - the equivalent of doing the lookups manually but instant.</p>
+<h2 id="defensive-note">Defensive note</h2>
+<p>A few patterns indicate the target has thought about WordPress security:</p>
+<ul>
+<li>All five sources stripped/blocked</li>
+<li><code>wp-login.php</code> returns 404 (renamed via plugin like WPS Hide Login)</li>
+<li>Aggressive rate limiting on <code>wp-login.php</code> and <code>xmlrpc.php</code></li>
+<li><code>wp-admin/</code> accessible only from specific IPs</li>
+</ul>
+<p>When you see these together, expect Wordfence, iThemes Security, Sucuri, or similar - and expect that anything noisier than careful single requests will get your IP blocked.</p>
+<h2 id="quick-reference">Quick reference</h2>
+<table>
+<thead>
+<tr>
+<th>Source</th>
+<th>Stealth</th>
+<th>Reliability</th>
+<th>Strip-resistance</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>meta generator</code> in HTML</td>
+<td>High</td>
+<td>Highest when present</td>
+<td>Easy to strip</td>
+</tr>
+<tr>
+<td>Asset <code>?ver=</code> query strings</td>
+<td>High</td>
+<td>Very high</td>
+<td>Hard to strip (breaks caching)</td>
+</tr>
+<tr>
+<td><code>/readme.html</code></td>
+<td>High</td>
+<td>High when present</td>
+<td>Easy to delete</td>
+</tr>
+<tr>
+<td>RSS <code>/feed/</code> generator tag</td>
+<td>High</td>
+<td>High when site has posts</td>
+<td>Possible but uncommon</td>
+</tr>
+<tr>
+<td>REST API <code>/wp-json/</code> namespaces</td>
+<td>High</td>
+<td>Medium (version range, not exact)</td>
+<td>Possible to filter</td>
+</tr>
+<tr>
+<td>Login page asset versions</td>
+<td>High</td>
+<td>High</td>
+<td>Same as front-end asset versions</td>
+</tr>
+</tbody>
+</table></article><nav class="cx-pager"><a class="cx-prev" href="../anatomy/index.html">Previous: Anatomy</a><a class="cx-next" href="../plugin-theme-enum/index.html">Next: Plugin &amp; Theme Enumeration</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

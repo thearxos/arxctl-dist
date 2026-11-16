@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DOM-based XSS · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › XSS</nav><h1>DOM-based XSS</h1><p class="cx-lede">Client-side XSS where a JavaScript source flows to a dangerous sink without the payload ever reaching the server - source-to-sink analysis, common sources and sinks, and postMessage attacks.</p><div class="cx-tags"><span class="cx-tag">MITRE T1059.007, T1185</span><span class="cx-tag">D3FEND D3-AH</span><span class="cx-tag">IMPACT SessionTakeover, AccountTakeover</span><span class="cx-tag">OWASP A05</span></div><article class="cx-body"><p>The vulnerability is entirely in client-side JavaScript: a <strong>source</strong> reads attacker-controllable input and passes it, unsanitized, to a <strong>sink</strong> that writes it into the page or executes it. The server may never see the payload at all - in the classic <code>location.hash</code> case it sits after the <code>#</code>, which browsers don't send in the request. That makes DOM XSS quiet (nothing in server logs) and invisible to tools that only diff server responses.</p>
+<h2 id="tldr">TL;DR</h2>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Payload rides in a client-only source - fragment, often never sent to the server
+http://&lt;TARGET&gt;/#&lt;img src=x onerror=alert(document.domain)&gt;
+
+# Vulnerable when a source flows to a sink with no sanitization, e.g.:
+document.getElementById(&#x27;out&#x27;).innerHTML = decodeURIComponent(location.hash.slice(1));</code></pre></figure>
+<p>The <code>decodeURIComponent</code> matters: browsers percent-encode <code>&lt;</code>, <code>&gt;</code>, and spaces in the fragment, so a sink that assigns <code>location.hash</code> <em>raw</em> to <code>innerHTML</code> inserts the text <code>%3Cimg...%3E</code>, not an element. Real-world DOM sinks almost always decode first (as above) - that decode step is what makes the payload fire.</p>
+<p>Success indicator: the payload executes, but the raw HTTP response does <strong>not</strong> contain it in a form the client reads from the body - it is assembled into the live DOM by JavaScript (visible under Inspect / DevTools, not necessarily in View Source). That source→sink assembly, not mere absence from the response, is the signature of DOM XSS.</p>
+<h2 id="sources-and-sinks">Sources and sinks</h2>
+<p>A DOM XSS exists only when a <strong>source</strong> reaches a <strong>sink</strong>. Learn to spot both.</p>
+<p><strong>Sources</strong> (attacker-influenceable inputs read by JS):</p>
+<table>
+<thead>
+<tr>
+<th>Source</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>location</code> / <code>location.hash</code> / <code>.search</code> / <code>.href</code></td>
+<td>The fragment (<code>#…</code>) is the classic one - not sent to the server</td>
+</tr>
+<tr>
+<td><code>document.URL</code>, <code>document.documentURI</code>, <code>document.referrer</code></td>
+<td>URL-derived strings</td>
+</tr>
+<tr>
+<td><code>window.name</code></td>
+<td>Survives cross-origin navigation - a cross-domain delivery vector</td>
+</tr>
+<tr>
+<td><code>postMessage</code> data</td>
+<td>Cross-window messages (see below)</td>
+</tr>
+<tr>
+<td><code>localStorage</code> / <code>sessionStorage</code> / cookies</td>
+<td>Persisted client-side values</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Sinks</strong> (functions that turn a string into markup or code):</p>
+<table>
+<thead>
+<tr>
+<th>Sink</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>innerHTML</code>, <code>outerHTML</code>, <code>insertAdjacentHTML</code></td>
+<td>Parses the string as HTML</td>
+</tr>
+<tr>
+<td><code>document.write()</code>, <code>document.writeln()</code></td>
+<td>Writes HTML into the document</td>
+</tr>
+<tr>
+<td><code>eval()</code>, <code>Function()</code>, <code>setTimeout</code>/<code>setInterval</code> with a string</td>
+<td>Executes the string as JS</td>
+</tr>
+<tr>
+<td><code>element.src</code> / <code>.href</code> set to <code>javascript:</code></td>
+<td>Executes on activation</td>
+</tr>
+<tr>
+<td>jQuery <code>.html()</code>, <code>$()</code> selector with markup, <code>.append()</code></td>
+<td>Parses HTML</td>
+</tr>
+</tbody>
+</table>
+<div class="cx-aside cx-note">
+<p class="cx-aside-title">Note</p>
+<p><code>innerHTML</code> will <strong>not</strong> run a bare <code>&lt;script&gt;</code> tag inserted after load, which is why DOM XSS so often uses <code>&lt;img src=x onerror=…&gt;</code> or <code>&lt;svg onload=…&gt;</code> - the handler fires without a <code>&lt;script&gt;</code> element. Treat <code>&lt;script&gt;alert(1)&lt;/script&gt;</code> as a false negative here.</p>
+</div>
+<h2 id="step-1-trace-source-to-sink">Step 1 - Trace source to sink</h2>
+<div class="cx-steps">
+<ol>
+<li>Open DevTools and search the page's JavaScript for sink names (<code>innerHTML</code>, <code>document.write</code>, <code>eval</code>, <code>.html(</code>).</li>
+<li>For each sink, work backwards: does its argument derive from a source (<code>location</code>, <code>document.referrer</code>, <code>postMessage</code>, storage)?</li>
+<li>If a source reaches a sink with no encoding/sanitization in between, you have a candidate. Burp's <strong>DOM Invader</strong> automates this trace and flags source→sink flows.</li>
+<li>Confirm by putting a canary in the source (e.g. in <code>#…</code>) and watching JavaScript assemble it into the live DOM via Inspect. Seeing it appear in the DOM but not View Source is a strong signal; but the reverse is not proof of safety (see the failure modes).</li>
+</ol>
+</div>
+<h2 id="step-2-match-the-payload-to-the-sink">Step 2 - Match the payload to the sink</h2>
+<p>The sink dictates the payload, independent of any server-side context:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># innerHTML / document.write (HTML sink) - no &lt;script&gt;; use a handler
+#&lt;img src=x onerror=alert(document.domain)&gt;
+#&lt;svg onload=alert(document.domain)&gt;
+
+# eval / setTimeout(&quot;…&quot;) (JS sink) - inject JS directly, close any wrapper
+&#x27;;alert(document.domain);//
+
+# href/src set from a source (URL sink)
+javascript:alert(document.domain)</code></pre></figure>
+<p>See <a href="../payload-construction/index.html">Payload construction</a> for the full catalog and <a href="../filter-bypasses/index.html">Filter bypasses</a> when client-side code tries to strip or encode the value.</p>
+<h2 id="postmessage-attacks">postMessage attacks</h2>
+<p>A frequent modern DOM XSS: a page registers a <code>message</code> listener and feeds the message into a sink without checking the sender.</p>
+<figure class="cx-code"><figcaption>javascript</figcaption><pre><code class="language-javascript">// Vulnerable listener - no origin check, data flows to innerHTML
+window.addEventListener(&#x27;message&#x27;, (e) =&gt; {
+  document.getElementById(&#x27;out&#x27;).innerHTML = e.data;
+});</code></pre></figure>
+<p>If the handler does not validate <code>e.origin</code> (and sometimes <code>e.source</code>), any page that can open or frame the target can post a payload to it:</p>
+<figure class="cx-code"><figcaption>javascript</figcaption><pre><code class="language-javascript">// Attacker page
+const w = window.open(&#x27;https://&lt;TARGET&gt;/&#x27;);
+setTimeout(() =&gt; w.postMessage(&#x27;&lt;img src=x onerror=alert(document.domain)&gt;&#x27;, &#x27;*&#x27;), 2000);</code></pre></figure>
+<p>Check every <code>addEventListener('message', …)</code> for a missing or weak origin check (e.g. <code>indexOf</code>/<code>startsWith</code> tests that a lookalike domain satisfies).</p>
+<h2 id="why-dom-xss-evades-detection">Why DOM XSS evades detection</h2>
+<ul>
+<li>The payload need never appear in the HTTP response, so response-diffing scanners and WAFs that inspect requests/responses miss it.</li>
+<li><code>location.hash</code> content is not sent to the server, so there is nothing in server logs - this is reflected in the <code>stealth</code> noise rating.</li>
+<li>It can be purely reflected (fragment) or stored (a tainted value read from <code>localStorage</code> on every load) - the source decides, not the server.</li>
+</ul>
+<h2 id="common-failure-modes">Common failure modes</h2>
+<ul>
+<li><strong>Canary appears in View Source</strong> → this does <em>not</em> rule out DOM XSS. A value can be server-rendered into the response (a JSON blob, a <code>data-</code> attribute, a hidden field) and <em>then</em> read by client JS that passes it to an unsafe sink. Classify by the client-side source→sink flow, not by presence in the response. Absence from View Source but presence in the live DOM is a strong positive signal; presence in View Source is simply inconclusive.</li>
+<li><strong><code>&lt;script&gt;</code> doesn't run via <code>innerHTML</code></strong> → expected; use <code>onerror</code>/<code>onload</code> handler payloads.</li>
+<li><strong>Framework auto-escapes</strong> (React/Angular/Vue) → default bindings encode output; look for the escape hatches (<code>dangerouslySetInnerHTML</code>, <code>[innerHTML]</code>, <code>v-html</code>, <code>bypassSecurityTrust*</code>) or template-injection sinks.</li>
+<li><strong>Value is URL-decoded twice / re-encoded</strong> → trace the exact transformations in the JS; the working payload matches what survives to the sink.</li>
+</ul>
+<h2 id="quick-reference">Quick reference</h2>
+<table>
+<thead>
+<tr>
+<th>Step</th>
+<th>Action</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Find sinks</td>
+<td>Grep JS for <code>innerHTML</code>, <code>document.write</code>, <code>eval</code>, <code>.html(</code></td>
+</tr>
+<tr>
+<td>Trace back</td>
+<td>Does the sink argument come from a source?</td>
+</tr>
+<tr>
+<td>Automate</td>
+<td>Burp DOM Invader for source→sink flows</td>
+</tr>
+<tr>
+<td>Confirm</td>
+<td>Canary in source → appears in live DOM, not View Source</td>
+</tr>
+<tr>
+<td>Payload</td>
+<td>Match the sink (HTML sink → handler payload; JS sink → raw JS)</td>
+</tr>
+<tr>
+<td>postMessage</td>
+<td>Check listeners for missing <code>e.origin</code> validation</td>
+</tr>
+</tbody>
+</table>
+<h2 id="next-move">Next move</h2>
+<ul>
+<li><strong>Source→sink confirmed in HTML sink</strong> → <code>&lt;img src=x onerror=…&gt;</code> / <code>&lt;svg onload=…&gt;</code>; escalate via <a href="../../sessions/xss-to-session/index.html">XSS to session</a></li>
+<li><strong>Sink is <code>eval</code>/<code>setTimeout</code></strong> → inject JS directly with <code>';…//</code></li>
+<li><strong>Vulnerable <code>postMessage</code> listener</strong> → host an attacker page that opens/frames the target and posts the payload</li>
+<li><strong>Payload sanitized client-side</strong> → <a href="../filter-bypasses/index.html">Filter bypasses</a></li>
+<li><strong>Executes only in an admin/other view you can't see</strong> → <a href="../blind-xss/index.html">Blind XSS</a></li>
+<li><strong>Strict CSP blocks inline handlers</strong> → look for CSP bypasses in <a href="../filter-bypasses/index.html#csp-bypass">Filter bypasses</a></li>
+</ul></article><nav class="cx-pager"><a class="cx-prev" href="../stored/index.html">Previous: Stored XSS</a><a class="cx-next" href="../defacement/index.html">Next: Defacement</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

