@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Command Injection · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../index.html">Cheatsheets</a> › Web › Command Injection</nav><h1>Command Injection</h1><p class="cx-lede">Operator reference for OS command injection - detection, execution, blind techniques, filter bypass, argument injection, and shells.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1059</span><span class="cx-tag">D3FEND D3-MH, D3-PSA, D3-EI</span><span class="cx-tag">IMPACT RCE</span><span class="cx-tag">OWASP A05</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Command injection is when user input lands in a function that spawns a shell or process, letting you append your own commands. You confirm it with a separator (<code>;</code>, <code>\n</code>, <code>&amp;</code>, <code>|</code>, <code>&amp;&amp;</code>, <code>||</code>, <code>`</code>, <code>$()</code>), then escalate to enumeration, blind exfiltration, or a reverse shell.</p>
+<p>Three vulnerability classes get confused - they need different exploitation:</p>
+<ul>
+<li><strong>Command injection</strong> - input concatenated into a shell invocation. You inject <em>commands</em>. Sinks: PHP <code>system</code>/<code>exec</code>/<code>passthru</code>/<code>shell_exec</code>/<code>popen</code>, Node <code>child_process.exec</code>/<code>spawn</code> (with shell), Python <code>os.system</code>/<code>subprocess.run(..., shell=True)</code>, Ruby <code>` `</code>/<code>Kernel#system</code>, Java <code>Runtime.exec(String)</code> with shell wrapper.</li>
+<li><strong>Argument injection</strong> - input concatenated into a <em>fixed</em> binary's argv. The binary is locked, but flags and arguments are yours. See <a href="argument-injection/index.html">Argument injection</a>.</li>
+<li><strong>Code injection</strong> - input passed to a language <code>eval</code>/<code>exec</code> (PHP <code>eval</code>, Python <code>exec</code>, Node <code>Function()</code>). You inject <em>code in the host language</em>, not shell. Out of scope for this section.</li>
+</ul>
+<h2 id="decision-flow">Decision flow</h2>
+<ol>
+<li><strong>Suspect a sink?</strong> Any feature that pings, converts, archives, resolves DNS, generates PDFs, processes images, runs <code>git</code>, or invokes external tools is a candidate. → <a href="detection/index.html">Detection</a></li>
+<li><strong>Output reflected?</strong> Use a separator and read the result. → <a href="execution/index.html">Execution</a></li>
+<li><strong>No output?</strong> Confirm blind via timing or out-of-band callback. → <a href="blind/index.html">Blind &amp; OOB</a></li>
+<li><strong>Filters in the way?</strong> Spaces, slashes, command names, or operators blocked. → <a href="filter-bypass/index.html">Filter bypass</a></li>
+<li><strong>Binary fixed but args controlled?</strong> Different bug class, same root cause. → <a href="argument-injection/index.html">Argument injection</a></li>
+<li><strong>Confirmed RCE, want a shell?</strong> → <a href="shells/index.html">Reverse shells</a></li>
+<li><strong>In an exam, need a single page?</strong> → <a href="cheatsheet/index.html">Cheatsheet</a></li>
+<li><strong>Reporting it, or hardening against it?</strong> → <a href="defense/index.html">Defense</a></li>
+</ol>
+<h2 id="placeholder-legend">Placeholder legend</h2>
+<p>Used throughout this section.</p>
+<table>
+<thead>
+<tr>
+<th>Placeholder</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code class="cx-ph" title="Replace with your target value">&lt;TARGET&gt;</code></td>
+<td>Target host or URL</td>
+</tr>
+<tr>
+<td><code class="cx-ph" title="Replace with your param value">&lt;PARAM&gt;</code></td>
+<td>Vulnerable parameter name</td>
+</tr>
+<tr>
+<td><code class="cx-ph" title="Replace with your attacker value">&lt;ATTACKER&gt;</code></td>
+<td>Your host for HTTP/DNS exfil and OOB callbacks (no port - protocol-default)</td>
+</tr>
+<tr>
+<td><code class="cx-ph" title="Listener host - your reverse-shell IP">&lt;LHOST&gt;</code></td>
+<td>Your listener host for reverse shells</td>
+</tr>
+<tr>
+<td><code class="cx-ph" title="Listener port - your reverse-shell port">&lt;LPORT&gt;</code></td>
+<td>Your listener port for reverse shells</td>
+</tr>
+<tr>
+<td><code class="cx-ph" title="Replace with your cmd value">&lt;CMD&gt;</code></td>
+<td>Arbitrary command being injected</td>
+</tr>
+</tbody>
+</table>
+<h2 id="operating-notes">Operating notes</h2>
+<div class="cx-aside cx-caution">
+<p class="cx-aside-title">Caution</p>
+<p>Command injection executes on production infrastructure. Destructive payloads (<code>rm</code>, <code>shutdown</code>, <code>Format-Volume</code>) and noisy ones (<code>find /</code> on a large filesystem, unbounded <code>ping</code>) cause real outages and trigger alerts. Test with <code>id</code>, <code>whoami</code>, <code>hostname</code> first; only escalate after confirming the injection works.</p>
+</div>
+<div class="cx-aside cx-note">
+<p class="cx-aside-title">Note</p>
+<p>Defenders block this with input validation (allowlist regex on the back-end, not just front-end), avoiding shell-spawning APIs in favor of language-native equivalents (<code>fsockopen</code> instead of <code>system("ping")</code>), and runtime restrictions (<code>disable_functions</code>, <code>open_basedir</code>, low-privilege service accounts, WAFs). Knowing the defenses tells you what your payload has to slip past.</p>
+</div></article><nav class="cx-pager"><a class="cx-next" href="detection/index.html">Next: Detection</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../license.html">License</a></p></footer>
+<script src="../../../codex.js"></script></body></html>

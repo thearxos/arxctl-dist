@@ -1,0 +1,544 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WPScan Reference · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › WordPress</nav><h1>WPScan Reference</h1><p class="cx-lede">Comprehensive WPScan reference - the --enumerate matrix (vp/ap/t/vt/at/u/m/cb/dbe), --password-attack modes, API-token vulnerability lookups, output formats, stealth and rate-limit flags, and Burp integration.</p><div class="cx-tags"><span class="cx-tag">MITRE T1595.002, T1190</span><span class="cx-tag">D3FEND D3-RAPA</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>WPScan is the dedicated WordPress vulnerability scanner. It combines plugin/theme/user enumeration, vulnerability database lookups, and brute-force in one tool. Three operator-relevant invocation patterns:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># 1. Fingerprint + vulnerability lookup (most common opening scan)
+wpscan --url http://target --enumerate ap,at,u --api-token YOUR_TOKEN
+
+# 2. Brute-force a known user list
+wpscan --url http://target --password-attack xmlrpc \
+       -U users.txt -P /usr/share/wordlists/rockyou.txt -t 20
+
+# 3. Stealthy reconnaissance (single-thread, random UA, slow)
+wpscan --url http://target --random-user-agent --throttle 1000 \
+       --max-scan-duration 600 --enumerate vp</code></pre></figure>
+<p>Success indicator: a CLI report with detected core version, plugin/theme list, user list, and (with API token) annotated CVE references for each component.</p>
+<h2 id="installation-and-setup">Installation and setup</h2>
+<p>WPScan ships as a Ruby gem. Install:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">gem install wpscan</code></pre></figure>
+<p>On Kali / Parrot OS it's preinstalled. Update the local vulnerability DB cache:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">wpscan --update</code></pre></figure>
+<h3 id="api-token-setup">API token setup</h3>
+<p>Free tier: 25 API requests per day. Register at <a href="https://wpscan.com">wpscan.com</a>, grab the token from your account page. Either pass per-command via <code>--api-token</code> or store it permanently:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">mkdir -p ~/.wpscan
+echo &#x27;cli_options:
+  api_token: YOUR_TOKEN_HERE&#x27; &gt; ~/.wpscan/scan.yml</code></pre></figure>
+<p>After this, every <code>wpscan</code> invocation uses the token automatically. Without a token, WPScan still enumerates plugins/themes/users but won't cross-reference them against the vulnerability database - you'll see component versions but no CVE annotations.</p>
+<h2 id="the-enumerate-matrix">The <code>--enumerate</code> matrix</h2>
+<p>The <code>--enumerate</code> (or <code>-e</code>) flag controls what WPScan attempts to identify. Multiple options can be combined comma-separated.</p>
+<table>
+<thead>
+<tr>
+<th>Code</th>
+<th>Target</th>
+<th>What it does</th>
+<th>Detection mode</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>vp</code></td>
+<td>Vulnerable plugins</td>
+<td>Passive detection from page source; only flags plugins with known CVEs</td>
+<td>Passive only</td>
+</tr>
+<tr>
+<td><code>ap</code></td>
+<td>All plugins</td>
+<td>Brute-force the full plugin wordlist (~28k entries)</td>
+<td>Aggressive</td>
+</tr>
+<tr>
+<td><code>p</code></td>
+<td>Popular plugins</td>
+<td>Subset of <code>ap</code> - common plugins only</td>
+<td>Mixed</td>
+</tr>
+<tr>
+<td><code>vt</code></td>
+<td>Vulnerable themes</td>
+<td>Passive theme detection; flags themes with known CVEs</td>
+<td>Passive only</td>
+</tr>
+<tr>
+<td><code>at</code></td>
+<td>All themes</td>
+<td>Brute-force theme wordlist</td>
+<td>Aggressive</td>
+</tr>
+<tr>
+<td><code>t</code></td>
+<td>Popular themes</td>
+<td>Subset of <code>at</code></td>
+<td>Mixed</td>
+</tr>
+<tr>
+<td><code>u</code></td>
+<td>Users</td>
+<td><code>?author=</code> brute-force + <code>wp-json/wp/v2/users</code> + login-error differential</td>
+<td>Mixed</td>
+</tr>
+<tr>
+<td><code>u[1-10]</code></td>
+<td>Users (range)</td>
+<td>Same, restricted to ID range - e.g. <code>u1-50</code></td>
+<td>Mixed</td>
+</tr>
+<tr>
+<td><code>m</code></td>
+<td>Media</td>
+<td>Enumerate uploaded media by ID via <code>?attachment_id=</code></td>
+<td>Aggressive</td>
+</tr>
+<tr>
+<td><code>cb</code></td>
+<td>Config backups</td>
+<td>Probe for <code>wp-config.php.bak</code>, <code>wp-config.php~</code>, etc.</td>
+<td>Aggressive</td>
+</tr>
+<tr>
+<td><code>dbe</code></td>
+<td>DB exports</td>
+<td>Probe for SQL dumps in common paths</td>
+<td>Aggressive</td>
+</tr>
+</tbody>
+</table>
+<h3 id="common-combinations">Common combinations</h3>
+<table>
+<thead>
+<tr>
+<th>Goal</th>
+<th>Command</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Quick fingerprint, only known-vulnerable components</td>
+<td><code>--enumerate vp,vt,u</code></td>
+</tr>
+<tr>
+<td>Full sweep including deactivated plugins</td>
+<td><code>--enumerate ap,at,u,cb,dbe</code></td>
+</tr>
+<tr>
+<td>Just users (for brute-force prep)</td>
+<td><code>--enumerate u</code></td>
+</tr>
+<tr>
+<td>User range from 1 to 100</td>
+<td><code>--enumerate u1-100</code></td>
+</tr>
+<tr>
+<td>Hunt for forgotten config backups</td>
+<td><code>--enumerate cb,dbe</code></td>
+</tr>
+</tbody>
+</table>
+<p>The default (no <code>--enumerate</code> specified) is roughly equivalent to <code>vp,vt,u,cb,dbe</code> - vulnerable components, users, and config/DB backups. Fast but misses deactivated-but-on-disk plugins. The first deep scan on a target should usually use <code>ap,at</code> to catch those.</p>
+<h3 id="aggressive-vs-passive-detection">Aggressive vs passive detection</h3>
+<p>WPScan distinguishes between "Passive" detection (only reads what's on the homepage and other crawled pages) and "Aggressive" detection (sends extra requests to specific paths). Some <code>--enumerate</code> codes force one or the other:</p>
+<ul>
+<li><code>vp</code>, <code>vt</code> - passive only (won't detect deactivated plugins/themes)</li>
+<li><code>ap</code>, <code>at</code>, <code>m</code>, <code>cb</code>, <code>dbe</code> - always aggressive</li>
+<li><code>u</code> - mixed (passive from page source first, then aggressive <code>?author=</code> brute-force)</li>
+</ul>
+<p>The <code>--detection-mode</code> flag overrides this:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">wpscan --url http://target --enumerate u --detection-mode passive   # passive only
+wpscan --url http://target --enumerate u --detection-mode aggressive   # force aggressive
+wpscan --url http://target --enumerate u --detection-mode mixed   # default</code></pre></figure>
+<p>For stealth assessments: <code>--detection-mode passive</code> keeps WPScan from sending the noisy brute-force probes.</p>
+<h2 id="password-attack-mode">Password-attack mode</h2>
+<p>The <code>--password-attack</code> flag enables brute-force. Two modes:</p>
+<table>
+<thead>
+<tr>
+<th>Mode</th>
+<th>Path</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>wp-login</code></td>
+<td><code>wp-login.php</code> form POST</td>
+<td>Slower; often rate-limited</td>
+</tr>
+<tr>
+<td><code>xmlrpc</code></td>
+<td><code>xmlrpc.php</code> XML-RPC API</td>
+<td>Faster; uses <code>system.multicall</code> for amplification when threads are high</td>
+</tr>
+<tr>
+<td><code>xmlrpc-multicall</code></td>
+<td><code>xmlrpc.php</code> with explicit multicall</td>
+<td>Highest throughput; older WP only</td>
+</tr>
+</tbody>
+</table>
+<h3 id="invocation">Invocation</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">wpscan --url http://target --password-attack xmlrpc \
+       -U user1,user2,user3 \
+       -P /usr/share/wordlists/rockyou.txt \
+       -t 20</code></pre></figure>
+<p>Flags:</p>
+<ul>
+<li><code>-U</code> - usernames. Comma-separated (<code>-U admin,david</code>) or file (<code>-U @users.txt</code>)</li>
+<li><code>-P</code> - password wordlist file (one password per line)</li>
+<li><code>-t</code> - threads (default 5; up to 30 reasonable; &gt;30 risks server-side rate limit)</li>
+<li><code>--password-attack</code> - explicit method choice (otherwise WPScan auto-picks)</li>
+</ul>
+<p>Stop conditions:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">--stop-on-find    # stop after the first valid credential (default)
+--no-stop-on-find # try every user, even after a hit</code></pre></figure>
+<h3 id="output-during-a-brute-force">Output during a brute-force</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>[+] Performing password attack on Xmlrpc against 3 user/s
+
+[SUCCESS] - admin / sunshine1
+Trying david / Spring2016  Time: 00:00:01 &lt;==========&gt; (474 / 474) 100.00%
+
+[i] Valid Combinations Found:
+ | Username: admin, Password: sunshine1</code></pre></figure>
+<p>For passwords spanning multiple words / spaces / special chars, the wordlist's encoding matters - UTF-8 with one password per line works.</p>
+<h3 id="spray-pattern">Spray pattern</h3>
+<p>Instead of running a wordlist against many users (per-user lockout risk), run one password across many users:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">echo &#x27;Spring2024!&#x27; &gt; one_password.txt
+wpscan --url http://target --password-attack xmlrpc \
+       -U users.txt -P one_password.txt</code></pre></figure>
+<p>See <a href="../login-bruteforce/index.html">Login brute-force</a> for spray-pattern selection.</p>
+<h2 id="api-token-flags">API token flags</h2>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">--api-token TOKEN              # WPScan API token (or use ~/.wpscan/scan.yml)</code></pre></figure>
+<p>With token configured, WPScan automatically queries <a href="https://wpscan.com/api">wpscan.com/api</a> for each detected component. Annotated output:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>[+] mail-masta
+ | Location: http://target/wp-content/plugins/mail-masta/
+ | Latest Version: 1.0 (up to date)
+ | Found By: Urls In Homepage (Passive Detection)
+ |
+ | [!] 2 vulnerabilities identified:
+ |
+ | [!] Title: Mail Masta 1.0 - Unauthenticated Local File Inclusion (LFI)
+ |     Fixed in: &lt;unfixed&gt;
+ |     References:
+ |      - https://www.exploit-db.com/exploits/40290/
+ |     CVE: CVE-2016-1000142
+ |
+ | [!] Title: Mail Masta 1.0 - Multiple SQL Injection
+ |     Fixed in: &lt;unfixed&gt;
+ |     References:
+ |      - https://wpscan.com/vulnerabilities/8740</code></pre></figure>
+<p>The <code>Fixed in: &lt;unfixed&gt;</code> line is operator-relevant. When no fix exists, the target is exposed regardless of how recent its WP install is.</p>
+<h2 id="output-formats">Output formats</h2>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">-f, --format FORMAT     # cli, cli-no-colour, cli-no-color, json
+-o, --output FILE       # write to file instead of stdout</code></pre></figure>
+<p>For automation:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">wpscan --url http://target --enumerate ap,at,u \
+       --api-token TOKEN \
+       --format json --output scan.json</code></pre></figure>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># Then parse with jq
+jq &#x27;.plugins | to_entries[] | select(.value.vulnerabilities | length &gt; 0) |
+    {name: .key, vulns: .value.vulnerabilities[].title}&#x27; scan.json</code></pre></figure>
+<p>Useful JSON paths:</p>
+<table>
+<thead>
+<tr>
+<th>jq path</th>
+<th>What it gives</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>.version</code></td>
+<td>WordPress core version</td>
+</tr>
+<tr>
+<td><code>.plugins</code></td>
+<td>Object keyed by plugin name</td>
+</tr>
+<tr>
+<td><code>.plugins.PLUGIN.version.number</code></td>
+<td>Detected version</td>
+</tr>
+<tr>
+<td><code>.plugins.PLUGIN.vulnerabilities</code></td>
+<td>Array of CVE entries</td>
+</tr>
+<tr>
+<td><code>.themes</code></td>
+<td>Same shape as plugins</td>
+</tr>
+<tr>
+<td><code>.users</code></td>
+<td>Object keyed by username</td>
+</tr>
+<tr>
+<td><code>.config_backups</code></td>
+<td>Found config backup URLs</td>
+</tr>
+</tbody>
+</table>
+<h2 id="stealth-and-rate-limit-flags">Stealth and rate-limit flags</h2>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">--random-user-agent              # rotate UA from a built-in list per-request
+--user-agent &quot;STRING&quot;            # set a fixed UA
+--throttle MILLISECONDS          # delay between requests (default 0)
+--request-timeout SECONDS        # per-request timeout (default 60)
+--connect-timeout SECONDS        # connection timeout (default 30)
+--disable-tls-checks             # ignore TLS errors (self-signed certs)
+--max-threads N                  # cap thread count (overrides -t)
+--max-scan-duration SECONDS      # abort the entire scan after N seconds</code></pre></figure>
+<h3 id="stealth-profile">Stealth profile</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">wpscan --url http://target \
+       --random-user-agent \
+       --throttle 2000 \
+       --max-threads 1 \
+       --detection-mode passive \
+       --enumerate vp,vt</code></pre></figure>
+<p>What this does: one thread, one request every 2 seconds, randomized UA per request, only passive detection (no path brute-forcing), only vulnerable-component identification. From the target's perspective, looks like a slow scrape rather than a scan.</p>
+<h3 id="when-the-target-uses-cloudflare-or-a-waf">When the target uses Cloudflare or a WAF</h3>
+<p>WPScan's default user-agent (<code>WPScan v3.X (https://wpscan.org)</code>) is matched by most WAF rules. Always set a real-browser UA:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">wpscan --url http://target \
+       --user-agent &quot;Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36&quot;</code></pre></figure>
+<h3 id="plugin-detection-mode">Plugin-detection-mode</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">--plugins-detection MODE         # passive, aggressive, mixed (default)
+--plugins-version-detection MODE # same options, for version-specifically
+--plugins-list FILE              # custom plugin wordlist</code></pre></figure>
+<p>For targeted brute-force when you suspect a specific set of plugins:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">echo &quot;mail-masta
+site-editor
+contact-form-7&quot; &gt; custom_plugins.txt
+
+wpscan --url http://target --enumerate ap --plugins-list custom_plugins.txt</code></pre></figure>
+<h2 id="proxy-burp-integration">Proxy / Burp integration</h2>
+<p>Run WPScan through Burp for inspection or rewriting:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">wpscan --url http://target --proxy http://127.0.0.1:8080</code></pre></figure>
+<p>Burp's HTTP history will show every request WPScan issues - useful for understanding what specific finding got flagged, or for replaying a specific request with a tweaked payload.</p>
+<p>For SOCKS:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">wpscan --url http://target --proxy socks5://127.0.0.1:9050   # via Tor</code></pre></figure>
+<p>Authentication for the proxy:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">wpscan --url http://target --proxy http://127.0.0.1:8080 \
+       --proxy-auth user:pass</code></pre></figure>
+<h2 id="cookies-and-headers">Cookies and headers</h2>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">--cookie-string &quot;name=value; name2=value2&quot;   # send cookies
+--cookie-jar FILE                            # persist cookies across requests
+--headers &quot;Header: value&quot;                    # extra headers (repeatable)
+--http-auth user:pass                        # HTTP basic auth</code></pre></figure>
+<p>If part of the WordPress site is behind HTTP basic auth:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">wpscan --url http://target --http-auth admin:basicpass --enumerate ap</code></pre></figure>
+<p>If the target requires a session cookie:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">wpscan --url http://target \
+       --cookie-string &quot;wordpress_logged_in_HASH=admin|...|sig&quot; \
+       --enumerate ap</code></pre></figure>
+<p>(Authenticated scanning lets WPScan see admin-area routes; rarely needed for offensive recon but sometimes valuable.)</p>
+<h2 id="common-gotchas">Common gotchas</h2>
+<table>
+<thead>
+<tr>
+<th>Symptom</th>
+<th>Cause</th>
+<th>Fix</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Scan Aborted: The target seems to be down</code></td>
+<td>Target uses Cloudflare with browser challenge</td>
+<td>Use <code>--user-agent</code> real-browser; sometimes need to disable Cloudflare-blocked features</td>
+</tr>
+<tr>
+<td><code>[ERROR] The url supplied 'http://target' seems to be down</code></td>
+<td>Target redirects to HTTPS</td>
+<td>Use <code>--url https://target</code> directly</td>
+</tr>
+<tr>
+<td>Plugin enumeration takes forever</td>
+<td><code>ap</code> mode walks ~28k plugins</td>
+<td>Limit with <code>--plugins-list</code> to a focused subset</td>
+</tr>
+<tr>
+<td>No CVE annotations</td>
+<td>Missing API token</td>
+<td>Add <code>--api-token</code> or configure in <code>~/.wpscan/scan.yml</code></td>
+</tr>
+<tr>
+<td><code>Scan Aborted: 429 Too Many Requests</code></td>
+<td>Server rate-limiting</td>
+<td>Lower <code>-t</code>, add <code>--throttle 2000</code>, or rotate IPs</td>
+</tr>
+<tr>
+<td>Brute-force is locked out after a few attempts</td>
+<td>Per-user lockout</td>
+<td>Switch to spray pattern (one pass, many users)</td>
+</tr>
+<tr>
+<td><code>Random user-agent</code> still gets WAF-blocked</td>
+<td>UA list known to defender</td>
+<td>Use a fixed real-browser <code>--user-agent</code></td>
+</tr>
+<tr>
+<td>Output file is huge</td>
+<td><code>ap,at,u,m,cb,dbe</code> produces verbose CLI report</td>
+<td>Use <code>--format json</code> for machine-readable, smaller-on-disk results</td>
+</tr>
+</tbody>
+</table>
+<h2 id="putting-it-together-operator-workflow">Putting it together - operator workflow</h2>
+<p>The end-to-end workflow combining everything in this cluster:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># 1. Initial fingerprint + vuln lookup (passive-leaning)
+wpscan --url http://target \
+       --random-user-agent \
+       --enumerate vp,vt,u \
+       --api-token $WPSCAN_TOKEN \
+       --format json --output stage1.json
+
+# 2. Read the report; identify the vulnerable plugins worth chasing
+jq &#x27;.plugins | to_entries[] | select(.value.vulnerabilities | length &gt; 0)&#x27; stage1.json
+
+# 3. If no easy CVE hits, do a deep plugin sweep
+wpscan --url http://target \
+       --random-user-agent \
+       --enumerate ap,at,cb,dbe \
+       --api-token $WPSCAN_TOKEN \
+       --format json --output stage2.json
+
+# 4. With user list from step 1, brute-force
+wpscan --url http://target \
+       --password-attack xmlrpc \
+       -U admin,david,roger \
+       -P /usr/share/wordlists/rockyou.txt \
+       -t 20
+
+# 5. Once admin creds are found, drop to manual:
+#    log into wp-admin, use theme editor → 404.php webshell
+#    OR: msfconsole &gt; use exploit/unix/webapp/wp_admin_shell_upload</code></pre></figure>
+<p>Each stage's output feeds the next. WPScan is the recon backbone; the <a href="../vulnerable-plugins/index.html">vulnerable plugins</a> and <a href="../admin-to-rce/index.html">admin-to-RCE</a> pages cover what to do with each kind of finding.</p>
+<h2 id="quick-reference">Quick reference</h2>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--url URL</code></td>
+<td>Target WordPress URL (required)</td>
+</tr>
+<tr>
+<td><code>--enumerate vp,ap,t,vt,at,u,m,cb,dbe</code></td>
+<td>What to enumerate (see matrix above)</td>
+</tr>
+<tr>
+<td><code>-e CODES</code></td>
+<td>Short form of <code>--enumerate</code></td>
+</tr>
+<tr>
+<td><code>--api-token TOKEN</code></td>
+<td>WPScan vulnerability-DB token</td>
+</tr>
+<tr>
+<td><code>--detection-mode {passive\|aggressive\|mixed}</code></td>
+<td>Force detection style</td>
+</tr>
+<tr>
+<td><code>--password-attack {wp-login\|xmlrpc\|xmlrpc-multicall}</code></td>
+<td>Brute-force method</td>
+</tr>
+<tr>
+<td><code>-U USERS</code></td>
+<td>Username list (comma-separated or <code>@file</code>)</td>
+</tr>
+<tr>
+<td><code>-P PASSWORDS</code></td>
+<td>Password wordlist file</td>
+</tr>
+<tr>
+<td><code>-t N</code></td>
+<td>Threads (default 5)</td>
+</tr>
+<tr>
+<td><code>--max-threads N</code></td>
+<td>Hard cap on threads</td>
+</tr>
+<tr>
+<td><code>--throttle MS</code></td>
+<td>Delay between requests in ms</td>
+</tr>
+<tr>
+<td><code>--max-scan-duration SEC</code></td>
+<td>Abort whole scan after N seconds</td>
+</tr>
+<tr>
+<td><code>--user-agent STRING</code></td>
+<td>Set User-Agent</td>
+</tr>
+<tr>
+<td><code>--random-user-agent</code></td>
+<td>Rotate UA from built-in list</td>
+</tr>
+<tr>
+<td><code>--proxy URL</code></td>
+<td>HTTP/SOCKS proxy</td>
+</tr>
+<tr>
+<td><code>--proxy-auth user:pass</code></td>
+<td>Auth for the proxy</td>
+</tr>
+<tr>
+<td><code>--cookie-string STRING</code></td>
+<td>Send cookies</td>
+</tr>
+<tr>
+<td><code>--http-auth user:pass</code></td>
+<td>HTTP Basic Auth</td>
+</tr>
+<tr>
+<td><code>--headers "K: V"</code></td>
+<td>Add header (repeatable)</td>
+</tr>
+<tr>
+<td><code>--disable-tls-checks</code></td>
+<td>Ignore TLS errors</td>
+</tr>
+<tr>
+<td><code>-f, --format {cli\|cli-no-colour\|json}</code></td>
+<td>Output format</td>
+</tr>
+<tr>
+<td><code>-o, --output FILE</code></td>
+<td>Write to file</td>
+</tr>
+<tr>
+<td><code>--update</code></td>
+<td>Update local vuln DB cache</td>
+</tr>
+<tr>
+<td><code>--stop-on-find</code></td>
+<td>Stop brute-force on first hit (default)</td>
+</tr>
+<tr>
+<td><code>--plugins-list FILE</code></td>
+<td>Custom plugin wordlist for <code>ap</code></td>
+</tr>
+<tr>
+<td><code>--plugins-detection MODE</code></td>
+<td>Detection mode for plugins specifically</td>
+</tr>
+<tr>
+<td><code>-v, --verbose</code></td>
+<td>Verbose output</td>
+</tr>
+<tr>
+<td><code>--banner / --no-banner</code></td>
+<td>Toggle ASCII banner</td>
+</tr>
+<tr>
+<td><code>-h, --help</code> / <code>--hh</code></td>
+<td>Short / full help</td>
+</tr>
+</tbody>
+</table></article><nav class="cx-pager"><a class="cx-prev" href="../admin-to-rce/index.html">Previous: Admin to RCE</a><a class="cx-next" href="../defense/index.html">Next: Defending WordPress</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Domains &amp; Subdomains · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Network › Reconnaissance</nav><h1>Domains &amp; Subdomains</h1><p class="cx-lede">Passive enumeration of an organization&#x27;s domain footprint via certificate transparency logs, DNS records, and third-party services - building a target list without touching the target.</p><div class="cx-tags"><span class="cx-tag">MITRE T1590.001, T1590.002, T1596.001, T1596.003, T1593</span><span class="cx-tag">D3FEND D3-NTA</span><span class="cx-tag">IMPACT InternalAccess</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Start with a primary domain. End with a list of every subdomain, vHost, mail server, name server, and IP address the organization exposes. Three primary sources, all queryable without touching the target's infrastructure:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># 1. Certificate Transparency - every TLS cert ever issued, public log
+curl -s &#x27;https://crt.sh/?q=target.com&amp;output=json&#x27; | jq -r &#x27;.[].name_value&#x27; | sort -u
+
+# 2. DNS - A/AAAA/MX/NS/TXT/SOA records, queried via a public resolver
+dig any target.com @8.8.8.8
+
+# 3. Hostname brute-force - for subdomains that have no public cert
+dnsenum --dnsserver 1.1.1.1 -f /usr/share/seclists/Discovery/DNS/subdomains-top1million-110000.txt target.com</code></pre></figure>
+<p>Success indicator: a deduplicated list of FQDNs, each resolved to an IP, each IP classified as "company-owned" or "third-party hosted."</p>
+<h2 id="ssl-certificate-inspection">SSL certificate inspection</h2>
+<p>Every TLS cert tells you which hostnames it covers. The browser's lock icon is your first recon tool - click it, view the certificate, read the <strong>Subject Alternative Name</strong> field. A single cert often covers multiple subdomains because operations teams provision wildcards or SAN lists for convenience.</p>
+<p>This is free intel and the target can't tell you looked. Same for the issuer field (which CA do they use - Let's Encrypt suggests automation; DigiCert/Sectigo suggests a procurement process; an internal CA suggests an internal PKI).</p>
+<h2 id="certificate-transparency-logs">Certificate Transparency logs</h2>
+<p><a href="https://en.wikipedia.org/wiki/Certificate_Transparency">Certificate Transparency</a> (<a href="https://tools.ietf.org/html/rfc6962">RFC 6962</a>) requires CAs to log every certificate they issue to public audit logs. The intent was detection of misissued certs. The side effect: a searchable database of every hostname any CA has ever issued a cert for.</p>
+<p><a href="https://crt.sh/">crt.sh</a> is the public web frontend over the logs. Search by domain, get every cert ever issued for it.</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># Web UI: https://crt.sh/?q=example.com
+# JSON output for scripting:
+curl -s &#x27;https://crt.sh/?q=example.com&amp;output=json&#x27; | jq .</code></pre></figure>
+<p>Sample output (truncated):</p>
+<figure class="cx-code"><figcaption>json</figcaption><pre><code class="language-json">[
+  {
+    &quot;issuer_name&quot;: &quot;C=US, O=Let&#x27;s Encrypt, CN=R3&quot;,
+    &quot;common_name&quot;: &quot;matomo.example.com&quot;,
+    &quot;name_value&quot;: &quot;matomo.example.com&quot;,
+    &quot;not_before&quot;: &quot;2021-08-21T05:00:16&quot;,
+    &quot;not_after&quot;: &quot;2021-11-19T05:00:15&quot;
+  },
+  {
+    &quot;issuer_name&quot;: &quot;C=US, O=Let&#x27;s Encrypt, CN=R3&quot;,
+    &quot;common_name&quot;: &quot;smartfactory.example.com&quot;,
+    &quot;name_value&quot;: &quot;smartfactory.example.com&quot;,
+    &quot;not_before&quot;: &quot;2021-07-26T23:32:47&quot;
+  }
+]</code></pre></figure>
+<p>For a clean list of unique subdomains:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">curl -s &#x27;https://crt.sh/?q=example.com&amp;output=json&#x27; \
+  | jq -r &#x27;.[].name_value&#x27; \
+  | sed &#x27;s/^\*\.//&#x27; \
+  | sort -u</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>account.ttn.example.com
+blog.example.com
+bots.example.com
+console.ttn.example.com
+ct.example.com
+example.com
+iot.example.com
+mail.example.com
+marina.example.com
+matomo.example.com
+shop.example.com
+smartfactory.example.com
+www.example.com</code></pre></figure>
+<p>What this <em>doesn't</em> show:</p>
+<ul>
+<li>Subdomains that never had a public cert (internal-only services using a private CA, or HTTP-only services)</li>
+<li>Subdomains where the cert is on a wildcard (<code>*.example.com</code> is one entry that covers many real hostnames)</li>
+<li>Subdomains with very short-lived certs that have expired and aged out of some log aggregators</li>
+</ul>
+<p>Treat crt.sh as a strong starting point, not a complete inventory.</p>
+<h2 id="resolving-to-ips">Resolving to IPs</h2>
+<p>Once you have a hostname list, resolve each to an IP and filter for hosts the organization actually controls (rather than third-party hosted assets you can't test).</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># Resolve each subdomain, print &quot;hostname IP&quot; pairs
+for sub in $(cat subdomains.txt); do
+  host &quot;$sub&quot; | grep &quot;has address&quot; | grep &quot;$DOMAIN&quot; | awk &#x27;{print $1, $NF}&#x27;
+done</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>blog.example.com 10.0.24.93
+example.com 10.0.27.33
+matomo.example.com 10.0.127.22
+www.example.com 10.0.127.33
+s3-website-us-west-2.amazonaws.com 10.0.95.250</code></pre></figure>
+<p>The last entry - <code>s3-website-us-west-2.amazonaws.com</code> - is hosted on AWS. Testing that bucket directly is testing AWS infrastructure, which is out of scope unless explicitly authorized. Note it, move on. (See <a href="../cloud-resources/index.html">Cloud Resources</a> for how to legitimately enumerate cloud buckets the org <em>owns</em>.)</p>
+<h2 id="dns-records-the-dig-any-query">DNS records - the <code>dig any</code> query</h2>
+<p>After hostnames, query the DNS server itself for everything it'll disclose. The <code>ANY</code> query type asks for all record types in one shot:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">dig any example.com</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>;; ANSWER SECTION:
+example.com.      300     IN      A       10.0.27.33
+example.com.      3600    IN      MX      1 aspmx.l.google.com.
+example.com.      3600    IN      MX      5 alt1.aspmx.l.google.com.
+example.com.      21600   IN      NS      ns.inwx.net.
+example.com.      21600   IN      NS      ns2.inwx.net.
+example.com.      3600    IN      TXT     &quot;MS=ms92346782372&quot;
+example.com.      21600   IN      TXT     &quot;atlassian-domain-verification=IJdXMt1rKCy68JFszSdCKVpwPN&quot;
+example.com.      3600    IN      TXT     &quot;google-site-verification=O7zV5-xFh_jn7JQ31&quot;
+example.com.      3600    IN      TXT     &quot;logmein-verification-code=87123gff5...&quot;
+example.com.      300     IN      TXT     &quot;v=spf1 include:mailgun.org include:_spf.google.com include:spf.protection.outlook.com include:_spf.atlassian.net ip4:10.0.24.8 ip4:10.0.27.2 ~all&quot;
+example.com.      21600   IN      SOA     ns.inwx.net. hostmaster.inwx.net. ...</code></pre></figure>
+<h3 id="what-each-record-type-tells-you">What each record type tells you</h3>
+<table>
+<thead>
+<tr>
+<th>Record</th>
+<th>What it reveals</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>A / AAAA</strong></td>
+<td>IPv4 / IPv6 addresses for the hostname. Cross-check against your subdomain list - DNS may show hosts that crt.sh missed.</td>
+</tr>
+<tr>
+<td><strong>MX</strong></td>
+<td>Mail servers. <code>google.com</code> MX = Google Workspace. <code>outlook.com</code> = Microsoft 365. Self-hosted MX = internal mail server worth investigating.</td>
+</tr>
+<tr>
+<td><strong>NS</strong></td>
+<td>Authoritative name servers. The hosting provider is often inferrable from the NS suffix.</td>
+</tr>
+<tr>
+<td><strong>TXT</strong></td>
+<td>The kitchen sink. Domain verification tokens for SaaS products (Atlassian, Google, Microsoft), SPF, DMARC, DKIM records. Each token reveals a SaaS the org uses.</td>
+</tr>
+<tr>
+<td><strong>CNAME</strong></td>
+<td>Aliases. Often point to SaaS-hosted services (<code>support.target.com</code> → <code>target.zendesk.com</code> reveals Zendesk).</td>
+</tr>
+<tr>
+<td><strong>SOA</strong></td>
+<td>Authoritative server + admin email. The admin email is sometimes a real person's mailbox.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="reading-the-txt-field-for-infrastructure">Reading the TXT field for infrastructure</h3>
+<p>The TXT records in the example above tell you the company uses:</p>
+<ul>
+<li><strong>Atlassian</strong> (Jira/Confluence/Bitbucket) - software development &amp; collaboration. Inventory their public Jira/Confluence instances; check for unauthenticated access to projects or pages.</li>
+<li><strong>Google Workspace</strong> (Gmail + GDrive) - credential phishing pretexts, and any link-shared Drive files are publicly accessible.</li>
+<li><strong>LogMeIn</strong> - centralized remote-access management. Compromising one admin account here gets you full systems control.</li>
+<li><strong>Mailgun</strong> - transactional email API. Worth checking for exposed Mailgun API keys in code/configs (IDOR/SSRF on the API).</li>
+<li><strong>Outlook / Office 365</strong> - Azure AD likely, OneDrive likely, Azure Files (SMB-over-cloud) likely.</li>
+<li><strong>INWX</strong> - domain registrar; the <code>MS=</code> token is a verification ID similar to a username.</li>
+</ul>
+<p>The IP addresses inside the SPF record (<code>ip4:10.0.24.8 ip4:10.0.27.2 ip4:10.72.82.106</code>) are mail servers authorized to send mail for the domain. Each is a host the company controls. Add them to your target list.</p>
+<h2 id="querying-a-specific-dns-server">Querying a specific DNS server</h2>
+<p>If you've identified the target's own authoritative name server (from the <code>NS</code> records), you can query it directly. Useful for:</p>
+<ul>
+<li>Picking up records that public resolvers cache differently</li>
+<li>Testing whether the server allows zone transfers (see the <a href="../../services/dns/index.html">DNS service page</a>)</li>
+<li>Bypassing query restrictions on resolvers that filter "noisy" record types</li>
+</ul>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">dig any example.com @ns.example.local</code></pre></figure>
+<h2 id="brute-forcing-subdomains">Brute-forcing subdomains</h2>
+<p>Subdomains that never had a public certificate won't appear in crt.sh. To find them, brute-force using a wordlist.</p>
+<h3 id="bash-one-liner-transparent-no-extra-tools">Bash one-liner (transparent, no extra tools)</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">for sub in $(cat /usr/share/seclists/Discovery/DNS/subdomains-top1million-110000.txt); do
+  dig +short &quot;${sub}.target.com&quot; @ns.target.com 2&gt;/dev/null \
+    | grep -E &#x27;^[0-9]&#x27; &amp;&amp; echo &quot;  → ${sub}.target.com&quot;
+done</code></pre></figure>
+<h3 id="dnsenum"><code>dnsenum</code></h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">dnsenum --dnsserver 10.0.14.128 --enum \
+  -p 0 -s 0 \
+  -o subdomains.txt \
+  -f /usr/share/seclists/Discovery/DNS/subdomains-top1million-110000.txt \
+  example.local</code></pre></figure>
+<p>Output:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>Brute forcing with subdomains-top1million-110000.txt:
+ns.example.local.       604800   IN    A    10.0.34.136
+mail1.example.local.    604800   IN    A    10.0.18.201
+app.example.local.      604800   IN    A    10.0.18.15
+dev.example.local.      604800   IN    A    10.0.42.5</code></pre></figure>
+<h3 id="recursive-brute-force-on-discovered-subdomains">Recursive brute-force on discovered subdomains</h3>
+<p>If <code>dnsenum</code> finds <code>dev.example.local</code>, immediately re-run against the new level - there are often dev/staging hostnames underneath:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">dnsenum --dnsserver 10.0.14.128 -p 0 -s 0 \
+  -f /usr/share/seclists/Discovery/DNS/fierce-hostlist.txt \
+  dev.example.local</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>dev1.dev.example.local.     604800   IN    A   10.12.3.6
+ns.dev.example.local.       604800   IN    A   127.0.0.1
+win2k.dev.example.local.    604800   IN    A   10.12.3.203</code></pre></figure>
+<p>A subdomain pointing to <code>127.0.0.1</code> is a leak - the org provisioned a public DNS record for a host they only intended to access internally. A subdomain called <code>win2k</code> suggests a legacy Windows 2000 host that's almost certainly unpatched.</p>
+<h2 id="dns-version-probe">DNS version probe</h2>
+<p>The DNS server may disclose its own version via a <code>CHAOS</code> class <code>TXT</code> query. Works on misconfigured BIND9 instances:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">dig CH TXT version.bind @ns.target.com</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>;; ANSWER SECTION:
+version.bind.       0       CH      TXT     &quot;9.10.6-P1&quot;
+;; ADDITIONAL SECTION:
+version.bind.       0       CH      TXT     &quot;9.10.6-P1-Debian&quot;</code></pre></figure>
+<p>Version data feeds into CVE lookup. Useful if the next stage is "is this BIND instance vulnerable to anything?"</p>
+<h2 id="putting-it-together">Putting it together</h2>
+<p>A clean recon-of-DNS workflow:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>1. crt.sh           → starter subdomain list from cert transparency
+2. dig any DOMAIN   → MX/NS/TXT records reveal mail provider, SaaS, additional IPs
+3. host lookup loop → resolve subdomains to IPs, separate company-owned vs third-party
+4. dnsenum on root  → brute-force subdomains that lack public certs
+5. dnsenum on each  → recursive brute-force on every discovered subdomain
+6. dig CH TXT       → opportunistic version probe on the authoritative NS</code></pre></figure>
+<p>Persist everything. The artifact you produce here is the input to every active enumeration step that follows.</p></article><nav class="cx-pager"><a class="cx-prev" href="../index.html">Previous: Reconnaissance</a><a class="cx-next" href="../shodan-and-osint/index.html">Next: Shodan &amp; Third-Party OSINT</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

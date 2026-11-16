@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Defending Against XXE · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › XXE</nav><h1>Defending Against XXE</h1><p class="cx-lede">How XXE is actually prevented - disable DTDs and external entities in the parser, keep XML libraries current, and don&#x27;t leak parser errors.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1083</span><span class="cx-tag">D3FEND D3-AH, D3-ACH</span><span class="cx-tag">OWASP A05, A02</span></div><article class="cx-body"><p>XXE is almost always a parser-configuration problem, not a coding one: the application hands attacker-controlled XML to a library whose external-entity and DTD processing is switched on. That makes it one of the easier classes to shut cleanly - turn those features off in the parser (ideally disable DTDs entirely), keep the library current, and the file-read/SSRF/DoS primitives in this cluster simply stop resolving.</p>
+<div class="cx-aside cx-note">
+<p class="cx-aside-title">Note</p>
+<p>For the operator, the signal is in <a href="../identifying/index.html">identifying</a>: an XML sink where a defined entity reflects, or an external entity reaches your listener, means entity processing is on. Everything below is what turns it off.</p>
+</div>
+<h2 id="1-disable-dtds-and-external-entities-in-the-parser">1. Disable DTDs and external entities in the parser</h2>
+<p>The complete fix. Configure the XML parser to reject document type definitions; if the app legitimately needs DTDs, you must then disable external general entities, external parameter entities, <strong>and external DTD loading</strong> - the last one matters, because an allowed DOCTYPE can still pull in an external DTD (an outbound fetch / SSRF, and the carrier for blind parameter-entity exfil) even with the entity flags off. The exact switch is per-library - use the official setting, don't hand-roll:</p>
+<figure class="cx-code"><figcaption>java</figcaption><pre><code class="language-java">// Java - the strongest single switch: forbid DOCTYPE entirely
+DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
+dbf.setFeature(&quot;http://apache.org/xml/features/disallow-doctype-decl&quot;, true);
+
+// If DOCTYPE MUST be allowed, drop the line above and instead disable all three:
+dbf.setFeature(&quot;http://xml.org/sax/features/external-general-entities&quot;, false);
+dbf.setFeature(&quot;http://xml.org/sax/features/external-parameter-entities&quot;, false);
+dbf.setFeature(&quot;http://apache.org/xml/features/nonvalidating/load-external-dtd&quot;, false); // external DTD fetch (SSRF)
+dbf.setXIncludeAware(false);
+dbf.setExpandEntityReferences(false);
+// JAXP belt-and-braces: forbid any external access
+dbf.setAttribute(javax.xml.XMLConstants.ACCESS_EXTERNAL_DTD, &quot;&quot;);
+dbf.setAttribute(javax.xml.XMLConstants.ACCESS_EXTERNAL_SCHEMA, &quot;&quot;);</code></pre></figure>
+<p>Equivalents:</p>
+<ul>
+<li><strong>Python:</strong> parse with <strong><code>defusedxml</code></strong> instead of the stdlib (<code>xml.etree</code>, <code>lxml</code> with resolvers) - it disables entities and DTDs by default.</li>
+<li><strong>.NET:</strong> on <code>XmlReaderSettings</code>, set <code>DtdProcessing = DtdProcessing.Prohibit</code> (the default on modern framework versions); don't set an <code>XmlResolver</code>.</li>
+<li><strong>PHP (libxml):</strong> avoid the deprecated <code>libxml_disable_entity_loader()</code> dance - on modern libxml (2.9+) external entities are off by default; don't re-enable them with <code>LIBXML_NOENT</code>.</li>
+<li><strong>libxml2 generally:</strong> don't pass <code>XML_PARSE_NOENT</code> / <code>XML_PARSE_DTDLOAD</code>.</li>
+</ul>
+<p>Harden all of: custom DTDs, external general <strong>and</strong> parameter entities, <strong>external DTD loading</strong> (the SSRF/blind-exfil carrier when DOCTYPE is permitted), <code>XInclude</code>, and entity-reference expansion (the last blocks billion-laughs entity-expansion DoS).</p>
+<div class="cx-aside cx-caution">
+<p class="cx-aside-title">Caution</p>
+<p>Watch the hidden XML parsers. SVG image processors, DOCX/XLSX/ODF openers, PDF generators, and SOAP/XML API layers all parse XML and are all XXE-able - the <a href="../../uploads/limited-uploads/index.html">uploads limited-uploads</a> page attacks exactly these. Apply the same parser hardening wherever any of them run, not just the obvious <code>/api</code> endpoint.</p>
+</div>
+<h2 id="2-keep-xml-libraries-and-components-current">2. Keep XML libraries and components current</h2>
+<p>Because XXE is a library-behaviour issue, patching is unusually effective here:</p>
+<ul>
+<li>Modern parsers increasingly disable external entities <strong>by default</strong> (libxml 2.9+, recent .NET); an out-of-date library is often the whole reason a target is vulnerable.</li>
+<li>This extends to everything that parses XML downstream: SOAP stacks, SVG/image and document processors, and transitive dependencies. Keep them patched alongside the core parser.</li>
+</ul>
+<h2 id="3-dont-leak-parser-errors">3. Don't leak parser errors</h2>
+<p>Error-based XXE (<a href="../blind-exfil/index.html">blind exfil</a>) exfiltrates file contents through parser error messages. Disable runtime/verbose error display in production and return generic errors, so a forced parse failure can't carry data back.</p>
+<h2 id="4-reduce-the-attack-surface-and-add-depth">4. Reduce the attack surface and add depth</h2>
+<ul>
+<li><strong>Prefer JSON</strong> where a format choice exists; dropping XML (and XML-based APIs like SOAP) removes the class outright for that endpoint.</li>
+<li><strong>WAF</strong> can block classic <code>&lt;!DOCTYPE ... &lt;!ENTITY</code> patterns - a secondary layer that is evadable, never the fix.</li>
+<li><strong>Egress controls:</strong> blocking outbound traffic from the app server limits blind/OOB exfil and SSRF even if a parser is misconfigured.</li>
+</ul>
+<h2 id="for-the-report">For the report</h2>
+<ol>
+<li><strong>Primary:</strong> disable DTD processing (or, if DOCTYPE must stay, external general + parameter entities, <strong>external DTD loading</strong>, and XInclude) in every XML parser the app uses, via the library's official setting; prefer a hardened wrapper like <code>defusedxml</code>.</li>
+<li><strong>Coverage:</strong> apply it to every XML sink - SOAP, SVG/image, document, and PDF processors included, not just the obvious endpoint.</li>
+<li><strong>Patch:</strong> update XML libraries and XML-consuming components to current versions.</li>
+<li><strong>Containment:</strong> suppress verbose parser errors; restrict the app server's outbound network access; WAF as a secondary layer.</li>
+</ol>
+<p>Avoid presenting a WAF rule as the fix - the parser configuration is the fix; the WAF only buys time.</p>
+<h2 id="related">Related</h2>
+<ul>
+<li><a href="../identifying/index.html">Identifying</a> - the entity-processing signals this configuration removes</li>
+<li><a href="../blind-exfil/index.html">Blind exfil</a> - why suppressing parser errors matters</li>
+<li><a href="../../uploads/limited-uploads/index.html">Uploads: limited uploads</a> - the SVG/document parsers that also need hardening</li>
+</ul></article><nav class="cx-pager"><a class="cx-prev" href="../capstone-chain/index.html">Previous: Capstone chain</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>
