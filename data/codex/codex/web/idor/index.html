@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IDOR · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../index.html">Cheatsheets</a> › Web › IDOR</nav><h1>IDOR</h1><p class="cx-lede">Operator reference for Insecure Direct Object Reference attacks - when the app exposes a controllable handle to a resource (file ID, user ID, document hash) and lacks server-side access control to verify that the caller is permitted to use that handle.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1213</span><span class="cx-tag">D3FEND D3-IAA</span><span class="cx-tag">IMPACT DataExfil, AuthBypass, AccountTakeover</span><span class="cx-tag">OWASP A01</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>IDOR is one bug masquerading as two: <strong>the app exposes a direct handle to a resource</strong> (<code>?file_id=123</code>, <code>/api/profile/74</code>, <code>?contract=&lt;md5&gt;</code>), and <strong>the back-end doesn't check whether the caller is authorized to use that handle.</strong> Substitute someone else's identifier and you get their data - or perform actions in their name.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Identify a direct reference in a URL, body, or header
+?file_id=123     /api/profile/74    Cookie: uid=1     contract=cdd9...
+
+# Substitute and observe
+curl &#x27;http://target/download.php?file_id=124&#x27;    # someone else&#x27;s file?
+curl &#x27;http://target/api/profile/75&#x27;              # someone else&#x27;s profile?
+
+# Mass-enumerate when the pattern is sequential
+for i in $(seq 1 1000); do
+    curl -s &quot;http://target/api/profile/$i&quot; &gt;&gt; all-profiles.json
+done
+
+# When the handle is hashed or encoded, find the algorithm
+echo -n &#x27;1&#x27; | base64 | md5sum    # often the answer is in the front-end JS</code></pre></figure>
+<p>Success indicator: a resource (file, record, action result) you should not have access to comes back as if it were yours.</p>
+<h2 id="what-idor-actually-is">What IDOR actually is</h2>
+<p>Two ingredients, both required:</p>
+<ol>
+<li><strong>Direct object reference</strong> - a handle in a request that names a specific resource (file, record, account, action). The handle is in client-controlled space: URL parameter, path segment, header, cookie, body field.</li>
+<li><strong>Missing access control</strong> - the server treats the handle as authoritative, looking up the resource without first checking "is the <em>caller</em> allowed to touch this resource?"</li>
+</ol>
+<p>The "Insecure" in IDOR modifies the access control, not the reference. Direct object references are normal and necessary - the bug is the missing authorization layer. A perfectly secure app can use sequential integer IDs in its URLs, provided every request hits an access-control check that compares the caller's identity to the resource's ACL.</p>
+<p>Apps fail this in three common ways:</p>
+<table>
+<thead>
+<tr>
+<th>Failure</th>
+<th>Example</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>No access control at all</td>
+<td><code>/api/profile/74</code> returns user 74's data to <em>anyone</em> who asks</td>
+</tr>
+<tr>
+<td>Access control only in the UI</td>
+<td>The UI hides the "edit other users" button; the back-end happily processes the request if you send it</td>
+</tr>
+<tr>
+<td>Access control only on some verbs</td>
+<td>GET <code>/api/profile/74</code> checks; PUT <code>/api/profile/74</code> doesn't - see <a href="../auth/verb-tampering/index.html">Verb tampering</a></td>
+</tr>
+</tbody>
+</table>
+<h2 id="two-flavors-of-idor">Two flavors of IDOR</h2>
+<p>The operator should distinguish these because the impact and the exploitation workflow are different:</p>
+<table>
+<thead>
+<tr>
+<th>Flavor</th>
+<th>What it does</th>
+<th>Operator workflow</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Information disclosure</strong></td>
+<td>Read resources you shouldn't see - files, records, profile fields, internal state</td>
+<td>Substitute the reference, dump the response, iterate to enumerate everything</td>
+</tr>
+<tr>
+<td><strong>Insecure function call</strong></td>
+<td>Perform actions you shouldn't be able to - change someone else's password, delete records, escalate role</td>
+<td>Substitute the reference <em>and</em> construct a request to the action endpoint; chain with disclosure to learn required parameters (other user's uuid, role names, etc.)</td>
+</tr>
+</tbody>
+</table>
+<p>The two often chain: disclosure leaks the values you need (the victim's uuid, the admin role name, the file hash format) to invoke the function call.</p>
+<h2 id="where-the-reference-lives">Where the reference lives</h2>
+<p>Look in this order - the first three account for most findings:</p>
+<table>
+<thead>
+<tr>
+<th>Location</th>
+<th>Example</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>URL query</strong></td>
+<td><code>?uid=1</code>, <code>?file_id=123</code></td>
+<td>Most common; visible in browser; easiest to fuzz</td>
+</tr>
+<tr>
+<td><strong>URL path</strong></td>
+<td><code>/users/74</code>, <code>/files/abc123.pdf</code></td>
+<td>REST APIs favor this; same risk</td>
+</tr>
+<tr>
+<td><strong>Request body</strong></td>
+<td><code>{"uid": 74, "uuid": "40f5..."}</code></td>
+<td>API mutations; check both the JSON keys <em>and</em> hidden form fields</td>
+</tr>
+<tr>
+<td><strong>Header</strong></td>
+<td><code>Cookie: uid=1</code>, <code>X-User-Id: 1</code>, <code>Authorization: Bearer ...</code></td>
+<td>Sometimes the only auth signal; the bearer token, if not bound to the resource, lets any logged-in user read anyone's data</td>
+</tr>
+<tr>
+<td><strong>AJAX call in JS</strong></td>
+<td><code>fetch('/api/admin/users')</code> triggered only when role=admin</td>
+<td>Read the front-end JS - find function-call references the server might accept from any session</td>
+</tr>
+</tbody>
+</table>
+<p>The front-end JS angle deserves emphasis. Many SPAs put the <em>whole</em> function catalog in JS and gate each call by role on the client. Read the JS, find the admin-only function:</p>
+<figure class="cx-code"><figcaption>javascript</figcaption><pre><code class="language-javascript">function changeUserPassword() {
+    $.ajax({
+        url: &quot;change_password.php&quot;,
+        type: &quot;post&quot;,
+        data: {uid: user.uid, password: user.password, is_admin: is_admin},
+        ...
+    });
+}</code></pre></figure>
+<p>The JS only invokes this when the user is admin. But the back-end endpoint accepts requests from anyone - that's the IDOR. The discovery method is reading the bundle, not poking the UI.</p>
+<h2 id="why-idor-is-so-common">Why IDOR is so common</h2>
+<p>Building an access-control system is a separate cross-cutting concern that has to be designed in from the start. RBAC (role-based access control), ABAC (attribute-based), or per-row ACLs are non-trivial to retrofit. Apps that grow organically tend to accumulate authentication (knowing who you are) without authorization (knowing what you're allowed to do at the resource level).</p>
+<p>The result: IDOR is one of the most common findings in modern web apps, including <a href="https://infosecwriteups.com/disclose-private-attachments-in-facebook-messenger-infrastructure-15-000-ae13602aa486">Facebook</a>, <a href="https://infosecwriteups.com/add-description-to-instagram-posts-on-behalf-of-other-users-6500-7d55b4a24c5a">Instagram</a>, and <a href="https://medium.com/@kedrisec/publish-tweets-by-any-other-user-6c9d892708e3">Twitter</a>.</p>
+<h2 id="impact-spectrum">Impact spectrum</h2>
+<table>
+<thead>
+<tr>
+<th>Severity</th>
+<th>Example</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Low</td>
+<td>Disclosure of public-ish data (other users' display names, profile pictures already shared elsewhere)</td>
+</tr>
+<tr>
+<td>Medium</td>
+<td>Disclosure of internal data (other users' email addresses, internal IDs, account creation dates)</td>
+</tr>
+<tr>
+<td>High</td>
+<td>Disclosure of sensitive personal data (credit cards, SSNs, addresses, private messages, uploaded documents)</td>
+</tr>
+<tr>
+<td>Critical</td>
+<td>Account takeover (change another user's password, email, recovery token); privilege escalation (set your own role to admin); mass data manipulation</td>
+</tr>
+</tbody>
+</table>
+<p>The "Critical" tier is where chained IDORs land. Information-disclosure IDOR + function-call IDOR + role-name leak together = unauthenticated admin compromise.</p>
+<h2 id="what-this-cluster-covers">What this cluster covers</h2>
+<table>
+<thead>
+<tr>
+<th>Page</th>
+<th>Focus</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="identifying/index.html">Identifying</a></td>
+<td>Where to find direct object references, AJAX-call discovery, hash/encoding inspection, comparing roles across test accounts</td>
+</tr>
+<tr>
+<td><a href="mass-enumeration/index.html">Mass enumeration</a></td>
+<td>Burp Intruder / ffuf / scripted bulk pulls; reversing MD5-of-base64-style "hashed" references</td>
+</tr>
+<tr>
+<td><a href="insecure-apis/index.html">Insecure APIs</a></td>
+<td>REST verb-by-verb attack surface (PUT/POST/DELETE on user objects), uid-mismatch / uuid-mismatch defense bypass, role-field manipulation</td>
+</tr>
+<tr>
+<td><a href="graphql/index.html">GraphQL</a></td>
+<td>Introspection mapping, direct <code>id</code>-argument access, Relay global-ID decoding, alias/batch mass-enumeration in one request, mutation IDOR</td>
+</tr>
+<tr>
+<td><a href="chaining/index.html">Chaining</a></td>
+<td>End-to-end: GET disclosure → uuid harvest → PUT modification → role escalation → admin function calls</td>
+</tr>
+<tr>
+<td><a href="defense/index.html">Defense</a></td>
+<td>Server-side object-level authorization on every request/verb, identity from the session not the request, unpredictable references as defence in depth</td>
+</tr>
+</tbody>
+</table>
+<h2 id="cross-cluster-references">Cross-cluster references</h2>
+<table>
+<thead>
+<tr>
+<th>Topic</th>
+<th>Page</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Verb-tampering bypasses (auth scoped to GET/POST only)</td>
+<td><a href="../auth/verb-tampering/index.html">Verb tampering</a></td>
+</tr>
+<tr>
+<td>Session attacks that often follow IDOR disclosure</td>
+<td><a href="../sessions/index.html">Sessions cluster</a></td>
+</tr>
+<tr>
+<td>When a leaked file URL points to disk content</td>
+<td><a href="../lfi/index.html">LFI cluster</a></td>
+</tr>
+<tr>
+<td>XSS payloads delivered via IDOR-modified profile fields</td>
+<td><a href="../sessions/xss-to-session/index.html">XSS to session</a></td>
+</tr>
+<tr>
+<td>Password reset flow chained with IDOR-modified email</td>
+<td><a href="../auth/reset-tokens/index.html">Reset tokens</a></td>
+</tr>
+<tr>
+<td>XXE for back-end file disclosure after IDOR foothold</td>
+<td><a href="../xxe/index.html">XXE cluster</a></td>
+</tr>
+</tbody>
+</table></article><nav class="cx-pager"><a class="cx-next" href="identifying/index.html">Next: Identifying</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../license.html">License</a></p></footer>
+<script src="../../../codex.js"></script></body></html>

