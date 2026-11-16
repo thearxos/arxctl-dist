@@ -1,0 +1,454 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SMTP · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Network › Service Footprinting</nav><h1>SMTP</h1><p class="cx-lede">SMTP footprinting - user enumeration via VRFY/EXPN/RCPT, open-relay testing, banner-based version disclosure, manual mail send for spoofing tests, and the smtp-user-enum / smtp-open-relay workflow.</p><div class="cx-tags"><span class="cx-tag">MITRE T1046, T1087, T1589.002, T1110.003</span><span class="cx-tag">D3FEND D3-NTA, D3-MENCR</span><span class="cx-tag">IMPACT CredentialTheft, InternalAccess</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>SMTP is the protocol that sends mail. It speaks plaintext by default on TCP 25, optionally upgraded to TLS via <code>STARTTLS</code> or running TLS-only on 465. Despite being one of the oldest internet protocols, SMTP enumeration remains useful - it leaks valid usernames, sometimes accepts mail from anyone (open relay), and the banner often reveals more than it should.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># 1. Banner grab and command listing
+nmap -sV -sC -p25 &lt;target&gt;
+
+# 2. Manual interaction
+telnet &lt;target&gt; 25
+&gt; EHLO test
+&gt; VRFY root
+
+# 3. Username enumeration via VRFY
+smtp-user-enum -M VRFY -U users.txt -t &lt;target&gt;
+
+# 4. Open relay test
+nmap -p25 --script smtp-open-relay -v &lt;target&gt;
+
+# 5. Manual mail send (for spoofing tests)
+swaks --to victim@target.com --from spoofed@target.com --server &lt;target&gt;</code></pre></figure>
+<p>Success indicator: user-existence confirmation via VRFY/EXPN/RCPT (different SMTP codes for valid vs. invalid users), or successful open-relay test (server accepts mail not destined for it).</p>
+<h2 id="protocol-overview">Protocol overview</h2>
+<p>SMTP is text-based, line-oriented, command-response. Conversation looks like:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>S: 220 mail.target.com ESMTP Postfix
+C: EHLO myhost
+S: 250-mail.target.com Hello myhost
+S: 250-PIPELINING
+S: 250-SIZE 10485760
+S: 250-VRFY
+S: 250-STARTTLS
+S: 250 ENHANCEDSTATUSCODES
+C: MAIL FROM:&lt;sender@example.com&gt;
+S: 250 2.1.0 Ok
+C: RCPT TO:&lt;recipient@target.com&gt;
+S: 250 2.1.5 Ok
+C: DATA
+S: 354 End data with &lt;CR&gt;&lt;LF&gt;.&lt;CR&gt;&lt;LF&gt;
+C: From: sender@example.com
+C: To: recipient@target.com
+C: Subject: hello
+C:
+C: body text
+C: .
+S: 250 2.0.0 Ok: queued as ABC123
+C: QUIT
+S: 221 2.0.0 Bye</code></pre></figure>
+<h3 id="the-three-smtp-ports">The three SMTP ports</h3>
+<table>
+<thead>
+<tr>
+<th>Port</th>
+<th>Use</th>
+<th>Encryption</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>25</strong></td>
+<td>Server-to-server mail transfer (MTA → MTA)</td>
+<td>Often plaintext, optionally STARTTLS</td>
+</tr>
+<tr>
+<td><strong>587</strong></td>
+<td>Mail submission from authenticated clients (MUA → MSA)</td>
+<td>STARTTLS expected, auth required</td>
+</tr>
+<tr>
+<td><strong>465</strong></td>
+<td>Mail submission (older, "SMTPS")</td>
+<td>Wrapped in TLS from the start</td>
+</tr>
+</tbody>
+</table>
+<p>Most of the time port 25 is what you encounter on internet-facing mail servers. Port 587 is for authenticated submission by clients (and is the right port for AUTH-related abuse), and 465 has been deprecated then un-deprecated by various standards bodies.</p>
+<h3 id="the-command-alphabet">The command alphabet</h3>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>HELO &lt;name&gt;</code></td>
+<td>SMTP greeting. Plain SMTP.</td>
+</tr>
+<tr>
+<td><code>EHLO &lt;name&gt;</code></td>
+<td>Extended SMTP greeting. Server replies with capabilities list.</td>
+</tr>
+<tr>
+<td><code>MAIL FROM:&lt;addr&gt;</code></td>
+<td>Sender address (envelope sender, not the visible "From:" header)</td>
+</tr>
+<tr>
+<td><code>RCPT TO:&lt;addr&gt;</code></td>
+<td>Recipient (envelope recipient)</td>
+</tr>
+<tr>
+<td><code>DATA</code></td>
+<td>Begin message body. End with <code>&lt;CR&gt;&lt;LF&gt;.&lt;CR&gt;&lt;LF&gt;</code> (a line containing only a period).</td>
+</tr>
+<tr>
+<td><code>RSET</code></td>
+<td>Reset transaction without disconnecting</td>
+</tr>
+<tr>
+<td><code>VRFY &lt;user&gt;</code></td>
+<td>Verify whether a user exists on this server</td>
+</tr>
+<tr>
+<td><code>EXPN &lt;list&gt;</code></td>
+<td>Expand a mailing list (return members)</td>
+</tr>
+<tr>
+<td><code>NOOP</code></td>
+<td>No-op, keeps the connection alive</td>
+</tr>
+<tr>
+<td><code>QUIT</code></td>
+<td>End session</td>
+</tr>
+<tr>
+<td><code>AUTH PLAIN/LOGIN/CRAM-MD5</code></td>
+<td>Authenticate (after STARTTLS in practice)</td>
+</tr>
+<tr>
+<td><code>STARTTLS</code></td>
+<td>Upgrade plaintext connection to TLS</td>
+</tr>
+</tbody>
+</table>
+<h3 id="the-mail-handling-pipeline">The mail-handling pipeline</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>Client (MUA)
+  → Submission Agent (MSA, often :587)
+    → Relay (MTA, :25)
+      → ... → MTA → Delivery Agent (MDA)
+        → User mailbox (POP3/IMAP for the user to fetch)</code></pre></figure>
+<p>The Mail User Agent (MUA) is the client app - Thunderbird, Outlook, etc. The Mail Transfer Agent (MTA) is the server-side daemon - Postfix, Exim, Sendmail. The Mail Submission Agent (MSA) is often the same daemon listening on a different port with different rules. The Mail Delivery Agent (MDA) takes the final delivered mail and writes it to the user's mailbox.</p>
+<p>Open-relay misconfigurations happen when the MTA on port 25 accepts mail not destined for one of its own hosted domains.</p>
+<h2 id="default-configuration-postfix">Default configuration - Postfix</h2>
+<p>Postfix is the most common Linux MTA. Main config at <code>/etc/postfix/main.cf</code>. Filtered for non-defaults:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>smtpd_banner = ESMTP Server
+biff = no
+append_dot_mydomain = no
+compatibility_level = 2
+smtp_tls_session_cache_database = btree:${data_directory}/smtp_scache
+myhostname = mail1.example.local
+alias_maps = hash:/etc/aliases
+alias_database = hash:/etc/aliases
+mydestination = $myhostname, localhost
+masquerade_domains = $myhostname
+mynetworks = 127.0.0.0/8 10.0.0.0/16
+mailbox_size_limit = 0
+recipient_delimiter = +
+smtp_bind_address = 0.0.0.0
+inet_protocols = ipv4
+smtpd_helo_restrictions = reject_invalid_hostname
+home_mailbox = /home/postfix</code></pre></figure>
+<p>Settings to recognize:</p>
+<ul>
+<li><code>mynetworks</code> - which networks are trusted (allowed to relay through this server without auth)</li>
+<li><code>mydestination</code> - which domains this server is the <em>final</em> destination for</li>
+<li><code>smtpd_helo_restrictions</code> - how strictly HELO/EHLO is policed</li>
+<li><code>smtpd_recipient_restrictions</code> (not in defaults shown) - usually the primary anti-relay control</li>
+</ul>
+<h2 id="dangerous-settings">Dangerous settings</h2>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>What it enables</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>mynetworks = 0.0.0.0/0</code></td>
+<td>Allow relay from anywhere → open relay → mass spoofing/spam</td>
+</tr>
+<tr>
+<td><code>mynetworks = 0.0.0.0/0, ::/0</code></td>
+<td>Same but explicit IPv4+IPv6</td>
+</tr>
+<tr>
+<td>Permissive <code>smtpd_recipient_restrictions</code></td>
+<td>If anti-relay rules don't <code>reject_unauth_destination</code>, the server relays</td>
+</tr>
+<tr>
+<td><code>smtpd_helo_restrictions =</code> (empty)</td>
+<td>No HELO validation</td>
+</tr>
+<tr>
+<td><code>disable_vrfy_command = no</code></td>
+<td>VRFY command works → enables user enumeration</td>
+</tr>
+<tr>
+<td><code>smtpd_banner = ESMTP Server &lt;version-string&gt;</code></td>
+<td>Discloses version, helps CVE matching</td>
+</tr>
+<tr>
+<td><code>smtpd_authorized_xclient_hosts = ...</code></td>
+<td>Allows XCLIENT command from listed hosts - if a host is wrongly included, attacker can spoof identity</td>
+</tr>
+</tbody>
+</table>
+<p>The big two: open relay (<code>mynetworks = 0.0.0.0/0</code> or equivalent) and VRFY enabled (<code>disable_vrfy_command = no</code>, which is also the default in older Postfix).</p>
+<h2 id="footprinting-commands">Footprinting commands</h2>
+<h3 id="banner-script-scan">Banner + script scan</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">sudo nmap 10.0.14.128 -sC -sV -p25</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>PORT   STATE SERVICE VERSION
+25/tcp open  smtp    Postfix smtpd
+|_smtp-commands: mail1.example.local, PIPELINING, SIZE 10240000, VRFY, ETRN,
+                 ENHANCEDSTATUSCODES, 8BITMIME, DSN, SMTPUTF8, CHUNKING,</code></pre></figure>
+<p>Two key data points in that output:</p>
+<ul>
+<li><strong><code>mail1.example.local</code></strong> - the server's <code>myhostname</code> setting, an internal-facing hostname</li>
+<li><strong><code>VRFY</code> is in the capability list</strong> - user enumeration is possible</li>
+</ul>
+<p>The default <code>smtp-commands</code> NSE script does the EHLO/capabilities probe automatically. Other scripts to consider:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">nmap -p25 --script smtp-commands,smtp-enum-users,smtp-open-relay,smtp-vuln-* &lt;target&gt;</code></pre></figure>
+<h3 id="manual-interaction-with-telnetnc">Manual interaction with telnet/nc</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">telnet 10.0.14.128 25</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>Trying 10.0.14.128...
+Connected to 10.0.14.128.
+220 ESMTP Server
+
+HELO test
+250 mail1.example.local
+
+EHLO test
+250-mail1.example.local
+250-PIPELINING
+250-SIZE 10240000
+250-ETRN
+250-ENHANCEDSTATUSCODES
+250-8BITMIME
+250-DSN
+250-SMTPUTF8
+250 CHUNKING</code></pre></figure>
+<p>The EHLO response advertises capabilities. If <code>VRFY</code> appears, user enumeration works. If <code>AUTH</code> appears in the list (sometimes after <code>STARTTLS</code>), authenticated submission is supported.</p>
+<h3 id="user-enumeration-via-vrfy">User enumeration via VRFY</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>VRFY root
+252 2.0.0 root
+
+VRFY jdoe
+252 2.0.0 jdoe
+
+VRFY testuser
+252 2.0.0 testuser
+
+VRFY xxxxxxxxxxxxxxxxxxxx
+252 2.0.0 xxxxxxxxxxxxxxxxxxxx</code></pre></figure>
+<p>Notice the problem here: 252 for <em>everything</em>, including obviously fake usernames. Some servers return 252 ("cannot verify but accept anyway") for <em>all</em> VRFY queries - making the command useless for enumeration.</p>
+<p>When VRFY actually works as designed, you get different codes for valid vs. invalid users:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>VRFY postmaster
+250 2.1.5 postmaster@example.local
+
+VRFY nonexistent_user
+550 5.1.1 &lt;nonexistent_user&gt;: Recipient address rejected: User unknown in local recipient table</code></pre></figure>
+<p>Different codes = enumeration primitive. Test with a known-valid user (<code>postmaster</code> and <code>root</code> usually exist) and a known-invalid one before treating any output as authoritative.</p>
+<h3 id="user-enumeration-via-rcpt-to">User enumeration via RCPT TO</h3>
+<p>When VRFY is disabled (or returns 252 for everything), try <code>MAIL FROM</code>/<code>RCPT TO</code>:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>MAIL FROM:&lt;test@test.com&gt;
+250 2.1.0 Ok
+
+RCPT TO:&lt;root@example.local&gt;
+250 2.1.5 Ok
+
+RCPT TO:&lt;nonexistent@example.local&gt;
+550 5.1.1 &lt;nonexistent@example.local&gt;: Recipient address rejected: User unknown in local recipient table</code></pre></figure>
+<p>Same primitive, different command. Often works when VRFY is locked down because <code>RCPT TO</code> can't easily be disabled (mail wouldn't work).</p>
+<h3 id="user-enumeration-via-expn">User enumeration via EXPN</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>EXPN admins
+250 2.1.5 admin1@example.local
+250 2.1.5 admin2@example.local</code></pre></figure>
+<p>EXPN expands a mailing list to its members. Often disabled, but when enabled it's better than VRFY because you get the membership of group aliases in one shot.</p>
+<h3 id="automated-user-enumeration">Automated user enumeration</h3>
+<p>The <code>smtp-user-enum</code> tool exists but as is well documented, results are sometimes wrong. The Metasploit module is more reliable:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">msfconsole
+&gt; use auxiliary/scanner/smtp/smtp_enum
+&gt; set RHOSTS 10.0.14.128
+&gt; set USER_FILE /usr/share/seclists/Usernames/Names/names.txt
+&gt; set THREADS 5
+&gt; run</code></pre></figure>
+<p>For a quick manual sweep:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">while read user; do
+  echo -e &quot;VRFY $user\nQUIT&quot; | nc -q 1 10.0.14.128 25 | grep -E &#x27;^25[02]&#x27;
+done &lt; users.txt</code></pre></figure>
+<h3 id="open-relay-test">Open-relay test</h3>
+<p>The dedicated NSE script runs 16 different relay tests:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">sudo nmap 10.0.14.128 -p25 --script smtp-open-relay -v</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>PORT   STATE SERVICE
+25/tcp open  smtp
+| smtp-open-relay: Server is an open relay (16/16 tests)
+|  MAIL FROM:&lt;&gt; -&gt; RCPT TO:&lt;relaytest@nmap.scanme.org&gt;
+|  MAIL FROM:&lt;antispam@nmap.scanme.org&gt; -&gt; RCPT TO:&lt;relaytest@nmap.scanme.org&gt;
+|  MAIL FROM:&lt;antispam@ESMTP&gt; -&gt; RCPT TO:&lt;relaytest@nmap.scanme.org&gt;
+|  ... (13 more variants) ...</code></pre></figure>
+<p>Each pattern tests a different way of fooling relay-check logic. Some servers reject simple cases but accept <code>&lt;@server:relay@elsewhere&gt;</code>-style source-routed paths. 16/16 = wide open; 1/16 means a single bypass technique works.</p>
+<p>The <code>relaytest@nmap.scanme.org</code> recipient is a mailbox actually monitored by the nmap project - if a relay test succeeds, the mail is delivered there. Don't be surprised when scanme.org gets your test mail; that's intentional.</p>
+<h3 id="manual-mail-send">Manual mail send</h3>
+<p>When you want to spoof a sender or test a specific path:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>telnet 10.0.14.128 25
+220 ESMTP Server
+
+EHLO example.local
+250-mail1.example.local
+...
+250 CHUNKING
+
+MAIL FROM: &lt;jdoe@example.local&gt;
+250 2.1.0 Ok
+
+RCPT TO: &lt;bjones@example.local&gt; NOTIFY=success,failure
+250 2.1.5 Ok
+
+DATA
+354 End data with &lt;CR&gt;&lt;LF&gt;.&lt;CR&gt;&lt;LF&gt;
+From: &lt;jdoe@example.local&gt;
+To: &lt;bjones@example.local&gt;
+Subject: Quick question
+Date: Tue, 28 Sept 2021 16:32:51 +0200
+
+Hey, can you check on the production DB? My creds aren&#x27;t working anymore.
+
+.
+250 2.0.0 Ok: queued as 6E1CF1681AB
+
+QUIT
+221 2.0.0 Bye</code></pre></figure>
+<p>Things to note:</p>
+<ul>
+<li><code>MAIL FROM</code> and <code>From:</code> header are different things. <code>MAIL FROM</code> is the <em>envelope</em> sender (controls bounce routing). <code>From:</code> is the <em>displayed</em> sender. Forging the latter is trivial.</li>
+<li><code>NOTIFY=success,failure</code> requests DSN - a delivery status notification. Useful for confirming the message landed.</li>
+<li>The blank line between headers and body is required by RFC.</li>
+<li>The terminating <code>.</code> on its own line ends the body.</li>
+</ul>
+<p>For repeatable testing, <a href="http://www.jetmore.org/john/code/swaks/"><code>swaks</code></a> automates all of this:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">swaks --to victim@target.com --from spoofed@target.com \
+      --server 10.0.14.128:25 \
+      --header &quot;Subject: Test&quot; \
+      --body &quot;Test body&quot;</code></pre></figure>
+<h3 id="working-through-a-web-proxy">Working through a web proxy</h3>
+<p>If you're tunneling through a CONNECT proxy (corporate proxy with allow-listed destinations):</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>CONNECT 10.0.14.128:25 HTTP/1.0
+
+HTTP/1.0 200 Connection established
+
+220 ESMTP Server
+EHLO test
+...</code></pre></figure>
+<p>Works when the proxy permits CONNECT to arbitrary ports (often it does, because HTTPS uses CONNECT to 443).</p>
+<h3 id="tls-wrapped-smtp">TLS-wrapped SMTP</h3>
+<p>For port 465 (SMTPS):</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">openssl s_client -connect 10.0.14.128:465</code></pre></figure>
+<p>For port 25 or 587 with STARTTLS:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">openssl s_client -connect 10.0.14.128:25 -starttls smtp</code></pre></figure>
+<p>After the TLS handshake, the SMTP conversation continues encrypted but with the same commands.</p>
+<h2 id="header-analysis">Header analysis</h2>
+<p>The mail <em>header</em> is intel-rich. When you receive (or capture) a mail from the target, the headers reveal the server chain it traversed:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>Received: from mail1.example.local (mail1.internal.example.local [10.0.18.200])
+    by mail.relay.example.com with ESMTPS id ABC123
+    for &lt;recipient@external.com&gt;; Tue, 28 Sep 2021 16:33:12 +0200
+Received: from web01.example.local (unknown [10.0.42.50])
+    by mail1.example.local (Postfix) with ESMTP id XYZ789
+    for &lt;sender@example.com&gt;; Tue, 28 Sep 2021 16:32:51 +0200</code></pre></figure>
+<p>What this reveals:</p>
+<ul>
+<li>Internal hostnames (<code>mail1.internal.example.local</code>, <code>web01.example.local</code>)</li>
+<li>Internal IP addresses (<code>10.0.18.200</code>, <code>10.0.42.50</code>)</li>
+<li>The path the mail took through internal infrastructure</li>
+<li>Software versions (<code>Postfix</code> here, sometimes with version)</li>
+</ul>
+<p><code>Received:</code> headers are added in reverse order - the bottom one is the original sender, the top one is the last hop before delivery.</p>
+<h3 id="rfc-5322-internet-message-format">RFC 5322 - Internet Message Format</h3>
+<p>The mail header format is defined by <a href="https://datatracker.ietf.org/doc/html/rfc5322">RFC 5322</a>. Worth a skim if you're going to spoof: many mail systems check things like <code>Date:</code> format compliance and reject obviously malformed messages.</p>
+<h2 id="common-chained-workflows">Common chained workflows</h2>
+<p><strong>User list → spray → SMTP-auth on 587:</strong>
+1. VRFY/RCPT enumeration → list of valid email addresses
+2. Try those as usernames against SMTP-AUTH on 587 with common passwords
+3. Valid creds → can send mail <em>as</em> that user</p>
+<p><strong>Open relay → phishing pretexts:</strong>
+1. Confirm open relay
+2. Send phishing mail with <code>MAIL FROM:&lt;ceo@target.com&gt;</code> through the target's own relay
+3. Mail arrives at internal employees with the company's own DKIM/SPF (because it was sent from the actual mail server)</p>
+<p><strong>Headers → internal recon:</strong>
+1. Get a legitimate email out of the target (signup form, support inquiry, anything)
+2. Read <code>Received:</code> chain
+3. Add internal hostnames and IPs to target list</p>
+<p><strong>SMTP banner → version → CVE:</strong>
+1. Identify Postfix/Exim/Sendmail version from banner
+2. Cross-reference for known RCEs (Exim has had several major RCE CVEs)
+3. Test carefully - SMTP CVEs that fail can DoS the server</p>
+<h2 id="quick-reference">Quick reference</h2>
+<table>
+<thead>
+<tr>
+<th>Task</th>
+<th>Command</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Service scan</td>
+<td><code>nmap -sV -sC -p25,465,587 &lt;target&gt;</code></td>
+</tr>
+<tr>
+<td>All SMTP NSE</td>
+<td><code>nmap -p25 --script "smtp-*" &lt;target&gt;</code></td>
+</tr>
+<tr>
+<td>Manual telnet</td>
+<td><code>telnet &lt;target&gt; 25</code> then <code>EHLO test</code></td>
+</tr>
+<tr>
+<td>User enum (VRFY)</td>
+<td><code>VRFY &lt;user&gt;</code> after EHLO</td>
+</tr>
+<tr>
+<td>User enum (RCPT)</td>
+<td><code>MAIL FROM:&lt;x@x&gt;</code> then <code>RCPT TO:&lt;user@target&gt;</code></td>
+</tr>
+<tr>
+<td>Mailing list expand</td>
+<td><code>EXPN &lt;list-name&gt;</code></td>
+</tr>
+<tr>
+<td>Open relay test</td>
+<td><code>nmap -p25 --script smtp-open-relay -v &lt;target&gt;</code></td>
+</tr>
+<tr>
+<td>Manual send (swaks)</td>
+<td><code>swaks --to &lt;to&gt; --from &lt;from&gt; --server &lt;target&gt;:25</code></td>
+</tr>
+<tr>
+<td>TLS connect</td>
+<td><code>openssl s_client -connect &lt;target&gt;:25 -starttls smtp</code></td>
+</tr>
+<tr>
+<td>TLS-wrapped (465)</td>
+<td><code>openssl s_client -connect &lt;target&gt;:465</code></td>
+</tr>
+<tr>
+<td>Metasploit enum</td>
+<td><code>use auxiliary/scanner/smtp/smtp_enum</code></td>
+</tr>
+</tbody>
+</table></article><nav class="cx-pager"><a class="cx-prev" href="../dns/index.html">Previous: DNS</a><a class="cx-next" href="../imap-pop3/index.html">Next: IMAP &amp; POP3</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

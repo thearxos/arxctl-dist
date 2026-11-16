@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# arxos-grub-theme: deploy or switch the ArxOS GRUB theme, sized to the display.
+#
+# Usage: arxos-grub-theme [THEME] [RES] [--regen]
+#   THEME  a Wuthering character background (yinlin is the 0.0.2 default), 'arxos' for the
+#          built-in ArxOS theme, or sys-<name> for another theme in /usr/share/grub/themes/<name>. Run with no args to get yinlin at the detected resolution.
+#   RES    1080p | 2k | 4k | auto   (default: auto, read the native display resolution)
+#   --regen  run grub-mkconfig afterwards. The INSTALLER regenerates grub.cfg itself, so it does
+#            NOT pass this; arxctl's runtime theme switch DOES, so the change takes effect at once.
+#
+# The theme SOURCE ships read-only at /usr/share/grub/themes-src/wuthering (vendored from
+# vinceliuice/Wuthering-grub2-themes, GPL-3.0) and /usr/share/grub/themes/arxos (built-in). This
+# assembles the chosen theme+resolution into /boot/grub/themes/<id> and points GRUB_THEME,
+# GRUB_BACKGROUND and GRUB_GFXMODE at it. Cosmetic: callers in the install path keep it best-effort
+# so a theme problem never blocks a bootable system.
+#
+# Runs as root, and arxctl reaches it through a passwordless polkit rule, so it trusts nothing it
+# is given: the theme name is checked character by character, a source that root does not own is
+# refused, the copy into /boot is always root-owned (GRUB parses these files before any OS
+# protection exists), the new theme is built beside the old one and swapped in only when complete,
+# and themes it assembled earlier are removed so repeated switching cannot fill a small /boot.
+set -u
+SRC_WUTHER=/usr/share/grub/themes-src/wuthering
+SRC_ARXOS=/usr/share/grub/themes/arxos
+GRUBDIR=/boot/grub
+DG=/etc/default/grub
+log(){ echo "arxos-grub-theme: $*"; }
+die(){ echo "arxos-grub-theme: $*" >&2; exit 1; }
+
+THEME=""; RES=""; REGEN=0
+for a in "$@"; do
+  case "$a" in
+    --regen) REGEN=1 ;;
+    1080p|2k|4k|auto) RES="$a" ;;
+    -*) die "unknown option $a" ;;
+    *) [ -z "$THEME" ] && THEME="$a" || die "unexpected argument $a" ;;
+  esac
+done
+THEME="${THEME:-yinlin}"
+RES="${RES:-auto}"
+# a name becomes part of paths that are deleted and rebuilt: letters, digits, - and _ only
+case "$THEME" in
+  *[!a-z0-9_-]*) die "a theme name is lower-case letters, digits, - and _ only (got '$THEME')" ;;
+esac
+
+# --- resolution detection: the tallest native mode across the connected DRM outputs --------------
+detect_height(){
+  local h=0 hh m
+  for f in /sys/class/drm/*/modes; do
+    [ -r "$f" ] || continue
+    m="$(head -1 "$f" 2>/dev/null)"           # preferred mode first, e.g. "1920x1080"
+    case "$m" in
+      *x*) hh="${m#*x}"; hh="${hh%%[^0-9]*}"; [ -n "$hh" ] && [ "$hh" -gt "$h" ] 2>/dev/null && h="$hh" ;;
+    esac
+  done
+  echo "$h"
+}
+bucket(){ local h="${1:-0}"; if [ "$h" -ge 2160 ] 2>/dev/null; then echo 4k; elif [ "$h" -ge 1440 ] 2>/dev/null; then echo 2k; else echo 1080p; fi; }
+
+if [ "$RES" = auto ]; then
+  _h="$(detect_height)"
+  RES="$(bucket "$_h")"
+  log "auto resolution: tallest native height ${_h:-0}px -> $RES"
+fi
+case "$RES" in 1080p) GFX=1920x1080 ;; 2k) GFX=2560x1440 ;; 4k) GFX=3840x2160 ;; *) RES=1080p; GFX=1920x1080 ;; esac
+
+# A source tree that anyone but root can write would let that user decide what GRUB parses.
+root_owned(){ [ -d "$1" ] && [ -z "$(find "$1" \( -not -uid 0 -o -perm -0002 \) -print -quit 2>/dev/null)" ]; }
+
+# --- assemble the theme beside the current one, then swap it in ---------------------------------
+mkdir -p "$GRUBDIR/themes"
+NEW="$GRUBDIR/themes/.arxos-new-$$"
+rm -rf "$NEW"; mkdir -p "$NEW"
+trap 'rm -rf "$NEW"' EXIT
+put(){ cp -r --no-preserve=ownership "$@" || die "copying the theme into $GRUBDIR failed"; }
+if [ "$THEME" = arxos ]; then
+  [ -d "$SRC_ARXOS" ] || die "built-in arxos theme not found at $SRC_ARXOS"
+  root_owned "$SRC_ARXOS" || die "$SRC_ARXOS has files root does not own or anyone can write; refusing to put them in $GRUBDIR"
+  TID=arxos
+  put "$SRC_ARXOS/." "$NEW/"
+  BG=""
+elif [ "${THEME#sys-}" != "$THEME" ]; then
+  # any other theme installed system-wide (a package's, e.g. GRUB's own starfield), used as shipped
+  SNAME="${THEME#sys-}"; SRC_SYS="/usr/share/grub/themes/$SNAME"
+  [ "$SNAME" != arxos ] && [ -f "$SRC_SYS/theme.txt" ] || die "no installed boot theme '$SNAME' in /usr/share/grub/themes"
+  root_owned "$SRC_SYS" || die "$SRC_SYS has files root does not own or anyone can write; refusing to put them in $GRUBDIR"
+  TID="sys-$SNAME"
+  put "$SRC_SYS/." "$NEW/"
+  BG=""
+else
+  [ -d "$SRC_WUTHER" ] || die "wuthering theme source not found at $SRC_WUTHER"
+  root_owned "$SRC_WUTHER" || die "$SRC_WUTHER has files root does not own or anyone can write; refusing to put them in $GRUBDIR"
+  [ -f "$SRC_WUTHER/backgrounds/background-$THEME.jpg" ] || die "unknown theme '$THEME' (no backgrounds/background-$THEME.jpg)"
+  [ -f "$SRC_WUTHER/config/theme-$RES.txt" ]            || die "no theme config for resolution $RES"
+  TID="wuthering-$THEME"
+  put "$SRC_WUTHER/common/"*.pf2                      "$NEW/"
+  put "$SRC_WUTHER/config/theme-$RES.txt"             "$NEW/theme.txt"
+  put "$SRC_WUTHER/backgrounds/background-$THEME.jpg" "$NEW/background.jpg"
+  put "$SRC_WUTHER/assets/assets-icons/icons-$RES"    "$NEW/icons"
+  cp -r --no-preserve=ownership "$SRC_WUTHER/assets/assets-other/other-$RES/"*.png "$NEW/" 2>/dev/null || true
+  BG="$GRUBDIR/themes/$TID/background.jpg"
+fi
+[ -s "$NEW/theme.txt" ] || die "theme.txt missing or empty after assembling $THEME"
+chown -R 0:0 "$NEW" && chmod -R u=rwX,go=rX "$NEW" || die "cannot make $NEW root-owned"
+TDIR="$GRUBDIR/themes/$TID"
+rm -rf "$TDIR" && mv "$NEW" "$TDIR" || die "cannot put the theme in place at $TDIR"
+trap - EXIT
+THEME_TXT="$TDIR/theme.txt"
+
+# --- wire /etc/default/grub (idempotent) --------------------------------------------------------
+[ -f "$DG" ] || die "$DG missing"
+set_kv(){ # set_kv KEY VALUE: replace an existing (maybe commented) line or append
+  local k="$1" v="$2"
+  if grep -qE "^[[:space:]]*#?[[:space:]]*$k=" "$DG"; then
+    sed -ri "s|^[[:space:]]*#?[[:space:]]*$k=.*|$k=\"$v\"|" "$DG"
+  else
+    printf '%s="%s"\n' "$k" "$v" >> "$DG"
+  fi
+}
+set_kv GRUB_THEME "$THEME_TXT"
+if [ -n "$BG" ]; then
+  set_kv GRUB_BACKGROUND "$BG"
+else
+  # the built-in theme draws its own background; a leftover one from a previous theme would not
+  # match it, and would point at a directory removed below
+  sed -ri '/^[[:space:]]*GRUB_BACKGROUND=/d' "$DG"
+fi
+set_kv GRUB_GFXMODE "$GFX,1024x768,auto"
+# the theme only draws in graphics mode; make the payload inherit it
+grep -qE '^[[:space:]]*GRUB_GFXPAYLOAD_LINUX=' "$DG" || printf 'GRUB_GFXPAYLOAD_LINUX="keep"\n' >> "$DG"
+log "theme '$THEME' ($RES) deployed -> $THEME_TXT ; GRUB_GFXMODE=$GFX"
+
+if [ "$REGEN" = 1 ]; then
+  grub-mkconfig -o "$GRUBDIR/grub.cfg" || die "grub-mkconfig failed"
+  log "grub.cfg regenerated"
+fi
+
+# Themes assembled earlier are only copies of the read-only sources: drop every one except the
+# theme now in use, so switching back and forth cannot fill a small /boot. Only this tool's own
+# directories are touched (wuthering-*, sys-*; the built-in arxos theme stays as the fallback).
+for d in "$GRUBDIR/themes"/wuthering-* "$GRUBDIR/themes"/sys-*; do
+  [ -d "$d" ] && [ "$d" != "$TDIR" ] && rm -rf "$d"
+done
+exit 0
