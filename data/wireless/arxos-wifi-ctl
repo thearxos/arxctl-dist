@@ -1,0 +1,139 @@
+#!/bin/bash
+# arxos-wifi-ctl: the narrow, validated helper behind the wireless-arsenal popup.
+#
+#   arxos-wifi-ctl iface <vid:pid>            the wireless interface of that adapter (waits up to 8s)
+#   arxos-wifi-ctl status <iface>             its state as one JSON line
+#   arxos-wifi-ctl ensure <iface>             make it usable: unblock its radio, bring the link up  [root]
+#   arxos-wifi-ctl ensure-usb <vid:pid>       the same, resolving the interface first (udev path)    [root]
+#   arxos-wifi-ctl monitor on|off <iface>     monitor mode (off restores managed mode)               [root]
+#   arxos-wifi-ctl managed on|off <iface>     whether NetworkManager may use it                      [root]
+#   arxos-wifi-ctl mac random|restore <iface> a random MAC, or the adapter's own one back            [root]
+#
+# The popup runs the root actions through pkexec, so THIS script is the security boundary: every
+# argument is checked against a fixed list or a strict pattern, and an action only ever touches a
+# USB wireless interface whose adapter is in the ArxOS arsenal database. It can never act on the
+# built-in Wi-Fi or on any other interface.
+set -u
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+STATE=/run/arxos-wifi
+
+die() { echo "arxos-wifi-ctl: $*" >&2; exit 2; }
+
+valid_usb()   { [[ "$1" =~ ^[0-9a-f]{4}:[0-9a-f]{4}$ ]]; }
+valid_iface() { [[ "$1" =~ ^[A-Za-z0-9_.-]{1,15}$ ]] && [ -e "/sys/class/net/$1/phy80211" ]; }
+
+# the vid:pid of the USB device an interface sits on (empty if it is not on USB)
+usb_of() {
+    local p; p=$(readlink -f "/sys/class/net/$1/device") || return 1
+    for _ in 1 2 3 4 5; do
+        if [ -f "$p/idVendor" ] && [ -f "$p/idProduct" ]; then echo "$(cat "$p/idVendor"):$(cat "$p/idProduct")"; return 0; fi
+        p=$(dirname "$p")
+    done
+    return 1
+}
+
+# true only for an adapter the arsenal database knows (the same lookup the popup uses)
+in_arsenal() { command -v arxpods >/dev/null 2>&1 && arxpods wifi-detect "$1" >/dev/null 2>&1; }
+
+# an interface we are allowed to act on: wireless, on USB, and an arsenal adapter
+checked_iface() {
+    valid_iface "$1" || die "not a wireless interface: $1"
+    local u; u=$(usb_of "$1") || die "$1 is not a USB adapter"
+    in_arsenal "$u" || die "$1 ($u) is not a wireless-arsenal adapter"
+}
+
+iface_for() {
+    local want=$1 n
+    for _ in $(seq 1 16); do
+        for n in /sys/class/net/*; do
+            n=${n##*/}
+            [ -e "/sys/class/net/$n/phy80211" ] || continue
+            [ "$(usb_of "$n" 2>/dev/null)" = "$want" ] && { echo "$n"; return 0; }
+        done
+        sleep 0.5
+    done
+    return 1
+}
+
+need_root() { [ "$(id -u)" = 0 ] || die "this action needs root (the popup asks through pkexec)"; }
+
+phy_of()  { basename "$(readlink -f "/sys/class/net/$1/phy80211")"; }
+rfkill_ids() { local phy; phy=$(phy_of "$1"); for r in /sys/class/ieee80211/"$phy"/rfkill*; do [ -e "$r" ] && echo "${r##*rfkill}"; done; }
+mode_of() { iw dev "$1" info 2>/dev/null | awk '/type/ {print $2; exit}'; }
+
+status() {
+    local i=$1 soft=0 hard=0 id nm up mac perm
+    for id in $(rfkill_ids "$i"); do
+        [ "$(cat /sys/class/rfkill/rfkill"$id"/soft 2>/dev/null)" = 1 ] && soft=1
+        [ "$(cat /sys/class/rfkill/rfkill"$id"/hard 2>/dev/null)" = 1 ] && hard=1
+    done
+    nm=$(nmcli -t -f GENERAL.STATE dev show "$i" 2>/dev/null | grep -q 'unmanaged' && echo false || echo true)
+    command -v nmcli >/dev/null 2>&1 || nm=null
+    up=$(grep -q up "/sys/class/net/$i/operstate" 2>/dev/null && echo true || echo false)
+    [ "$(cat "/sys/class/net/$i/flags" 2>/dev/null)" != "" ] && (( $(cat "/sys/class/net/$i/flags") & 1 )) && up=true
+    mac=$(cat "/sys/class/net/$i/address")
+    perm=$(cat "$STATE/$i.mac" 2>/dev/null || echo "$mac")
+    printf '{"iface":"%s","usb":"%s","mode":"%s","soft_blocked":%s,"hard_blocked":%s,"nm_managed":%s,"up":%s,"mac":"%s","mac_random":%s}\n' \
+        "$i" "$(usb_of "$i")" "$(mode_of "$i")" \
+        "$([ $soft = 1 ] && echo true || echo false)" "$([ $hard = 1 ] && echo true || echo false)" \
+        "$nm" "$up" "$mac" "$([ "$mac" != "$perm" ] && echo true || echo false)"
+}
+
+ensure() {
+    local i=$1 id
+    for id in $(rfkill_ids "$i"); do rfkill unblock "$id" 2>/dev/null; done
+    # a radio that is still hard-blocked (a physical switch) cannot be fixed from software: say so
+    for id in $(rfkill_ids "$i"); do
+        [ "$(cat /sys/class/rfkill/rfkill"$id"/hard 2>/dev/null)" = 1 ] && echo "arxos-wifi-ctl: $i is hard-blocked (a hardware switch)" >&2
+    done
+    ip link set "$i" up 2>/dev/null
+    return 0
+}
+
+monitor() {
+    local i=$1 on=$2
+    ensure "$i"
+    if [ "$on" = on ]; then
+        command -v nmcli >/dev/null 2>&1 && nmcli dev set "$i" managed no 2>/dev/null
+        ip link set "$i" down && iw dev "$i" set type monitor && ip link set "$i" up || die "could not switch $i to monitor mode"
+    else
+        ip link set "$i" down && iw dev "$i" set type managed && ip link set "$i" up || die "could not switch $i back to managed mode"
+        command -v nmcli >/dev/null 2>&1 && nmcli dev set "$i" managed yes 2>/dev/null
+    fi
+    [ "$(mode_of "$i")" = "$([ "$on" = on ] && echo monitor || echo managed)" ] || die "$i did not change mode"
+}
+
+managed() {
+    command -v nmcli >/dev/null 2>&1 || die "NetworkManager is not installed"
+    nmcli dev set "$1" managed "$([ "$2" = on ] && echo yes || echo no)" || die "NetworkManager refused"
+}
+
+mac() {
+    local i=$1 what=$2 cur new
+    mkdir -p -m 700 "$STATE"
+    cur=$(cat "/sys/class/net/$i/address")
+    [ -f "$STATE/$i.mac" ] || echo "$cur" > "$STATE/$i.mac"     # remember the adapter's own MAC once
+    if [ "$what" = random ]; then
+        # locally administered, unicast: first octet 02, then 5 random bytes from the kernel
+        new=$(od -An -N5 -tx1 /dev/urandom | tr -s ' ' ':' | sed 's/^:/02:/;s/:$//')
+    else
+        new=$(cat "$STATE/$i.mac")
+    fi
+    [[ "$new" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]] || die "bad MAC $new"
+    ip link set "$i" down && ip link set "$i" address "$new" && ip link set "$i" up || die "could not set the MAC on $i"
+    [ "$what" = restore ] && rm -f "$STATE/$i.mac"
+    return 0
+}
+
+cmd=${1:-}; shift || true
+case "$cmd" in
+    iface)      valid_usb "${1:-}" || die "usage: iface <vid:pid>"; iface_for "$1" ;;
+    status)     checked_iface "${1:-}"; status "$1" ;;
+    ensure)     need_root; checked_iface "${1:-}"; ensure "$1" ;;
+    ensure-usb) need_root; valid_usb "${1:-}" || die "usage: ensure-usb <vid:pid>"; in_arsenal "$1" || exit 0
+                i=$(iface_for "$1") || exit 0; checked_iface "$i"; ensure "$i" ;;
+    monitor)    need_root; [[ "${1:-}" =~ ^(on|off)$ ]] || die "usage: monitor on|off <iface>"; checked_iface "${2:-}"; monitor "$2" "$1" ;;
+    managed)    need_root; [[ "${1:-}" =~ ^(on|off)$ ]] || die "usage: managed on|off <iface>"; checked_iface "${2:-}"; managed "$2" "$1" ;;
+    mac)        need_root; [[ "${1:-}" =~ ^(random|restore)$ ]] || die "usage: mac random|restore <iface>"; checked_iface "${2:-}"; mac "$2" "$1" ;;
+    *)          sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

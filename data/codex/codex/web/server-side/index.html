@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Server-Side Attacks · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../index.html">Cheatsheets</a> › Web › Server-Side</nav><h1>Server-Side Attacks</h1><p class="cx-lede">Operator reference for server-side attack classes - intermediary services, SSRF, SSI/ESI injection, SSTI, and XSLT injection.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190</span><span class="cx-tag">D3FEND D3-MH, D3-NI, D3-OTF</span><span class="cx-tag">IMPACT InternalAccess, RCE</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Five distinct vulnerability classes that share one property: they make the application server execute, fetch, render, or include something on the attacker's behalf. Different bugs, different payloads, different detection - group them by <em>what the application is being tricked into doing</em>.</p>
+<table>
+<thead>
+<tr>
+<th>Class</th>
+<th>Server is tricked into…</th>
+<th>Start here</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Intermediary service abuse</td>
+<td>Routing through an unintended protocol/port (AJP, FastCGI)</td>
+<td><a href="intermediary/index.html">Intermediary</a></td>
+</tr>
+<tr>
+<td>SSRF</td>
+<td>Issuing HTTP/protocol requests to attacker-chosen targets</td>
+<td><a href="ssrf/index.html">SSRF</a></td>
+</tr>
+<tr>
+<td>SSI / ESI injection</td>
+<td>Parsing attacker-supplied include directives</td>
+<td><a href="../../../index.html">Server-Side Includes</a></td>
+</tr>
+<tr>
+<td>SSTI</td>
+<td>Evaluating attacker-supplied template expressions</td>
+<td><a href="ssti/index.html">SSTI</a></td>
+</tr>
+<tr>
+<td>XSLT injection</td>
+<td>Performing attacker-controlled XML transformations</td>
+<td><a href="xslt/index.html">XSLT</a></td>
+</tr>
+</tbody>
+</table>
+<h2 id="decision-flow">Decision flow</h2>
+<ol>
+<li><strong>Open port that doesn't speak HTTP</strong> (8009, 9000, 1099, 11211) → <a href="intermediary/index.html">Intermediary services</a></li>
+<li><strong>Parameter that takes a URL or hostname</strong> (avatar fetcher, webhook, "test connection," PDF-from-URL) → <a href="ssrf/index.html">SSRF</a></li>
+<li><strong><code>{{...}}</code> evaluates as math</strong> (<code>{{7*7}}</code> returns 49) → <a href="ssti/index.html">SSTI</a></li>
+<li><strong><code>&lt;!--#... --&gt;</code> directives processed</strong> by the page → <a href="includes/ssi/index.html">SSI</a></li>
+<li><strong><code>&lt;esi:...&gt;</code> tags fetched</strong> by an upstream surrogate → <a href="includes/esi/index.html">ESI</a></li>
+<li><strong>Application transforms XML you control</strong> with a stylesheet → <a href="xslt/index.html">XSLT</a></li>
+<li><strong>No idea where to start</strong> → <a href="ssrf/index.html">SSRF</a> - most prevalent and highest-yield</li>
+</ol>
+<h2 id="placeholder-legend">Placeholder legend</h2>
+<table>
+<thead>
+<tr>
+<th>Placeholder</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code class="cx-ph" title="Replace with your target value">&lt;TARGET&gt;</code></td>
+<td>External target host or URL (the public-facing app)</td>
+</tr>
+<tr>
+<td><code class="cx-ph" title="Internal target reachable only via SSRF">&lt;INTERNAL_HOST&gt;</code></td>
+<td>Internal target reachable only via SSRF/proxy</td>
+</tr>
+<tr>
+<td><code class="cx-ph" title="Cloud metadata endpoint (169.254.169.254 for AWS/Azure/GCP)">&lt;METADATA_IP&gt;</code></td>
+<td>Cloud metadata endpoint (<code>169.254.169.254</code> for AWS/Azure/GCP/Alibaba; varies elsewhere)</td>
+</tr>
+<tr>
+<td><code class="cx-ph" title="Replace with your param value">&lt;PARAM&gt;</code></td>
+<td>Vulnerable parameter name</td>
+</tr>
+<tr>
+<td><code class="cx-ph" title="OOB callback host (Burp Collaborator, interactsh, your own VPS)">&lt;COLLAB&gt;</code></td>
+<td>OOB callback host (Burp Collaborator, interactsh, your VPS)</td>
+</tr>
+<tr>
+<td><code class="cx-ph" title="Replace with your attacker value">&lt;ATTACKER&gt;</code></td>
+<td>Your host for HTTP/DNS exfil and OOB callbacks</td>
+</tr>
+<tr>
+<td><code class="cx-ph" title="Listener host - your reverse-shell IP">&lt;LHOST&gt;</code>, <code class="cx-ph" title="Listener port - your reverse-shell port">&lt;LPORT&gt;</code></td>
+<td>Reverse shell listener</td>
+</tr>
+<tr>
+<td><code class="cx-ph" title="Replace with your token value">&lt;TOKEN&gt;</code>, <code class="cx-ph" title="Replace with your hash value">&lt;HASH&gt;</code></td>
+<td>Captured credentials, session tokens</td>
+</tr>
+</tbody>
+</table>
+<h2 id="scope-notes">Scope notes</h2>
+<div class="cx-aside cx-note">
+<p class="cx-aside-title">Note</p>
+<p><strong>XXE (XML External Entity) is not in this section.</strong> XXE is server-side and frequently appears alongside the topics here, but its payload catalog (entity expansion, parameter entities, blind exfil via DTD, parser-quirk variants for libxml/Java/.NET) deserves dedicated treatment. It will get its own section. When you encounter XXE during an engagement that started here - typically via XSLT or SOAP endpoints - that's the cross-link.</p>
+</div>
+<div class="cx-aside cx-caution">
+<p class="cx-aside-title">Caution</p>
+<p>The attacks in this section reach internal infrastructure: cloud metadata, internal services, source code on disk, hash-stealing UNC paths. They escalate quickly - an SSRF on a public-facing app frequently turns into AWS credential theft and full account takeover within minutes. Confirm scope before exploiting; document the chain as you go because reproducing a multi-hop SSRF later is painful.</p>
+</div>
+<h2 id="operating-notes">Operating notes</h2>
+<p>The bugs in this section often chain. SSRF reaches an internal service that is vulnerable to SSTI, which yields RCE. AJP exposes a Tomcat manager that accepts a war upload. SSI executes a command that triggers an outbound DNS request used as a confirmation channel. The decision flow above is a starting point - the <em>real</em> engagement is recognizing when one primitive sets up another.</p></article><nav class="cx-pager"><a class="cx-prev" href="ssti/index.html">Previous: SSTI</a><a class="cx-next" href="ssti/detection/index.html">Next: Detection &amp; Fingerprinting</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../license.html">License</a></p></footer>
+<script src="../../../codex.js"></script></body></html>
