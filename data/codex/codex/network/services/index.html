@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Service Footprinting · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../index.html">Cheatsheets</a> › Network › Service Footprinting</nav><h1>Service Footprinting</h1><p class="cx-lede">Active per-service enumeration once recon has produced a host list - protocol behavior, default configurations, dangerous settings, and footprinting commands across the 16 most common services exposed by Linux and Windows hosts.</p><div class="cx-tags"><span class="cx-tag">MITRE T1046, T1018, T1133, T1210, T1135, T1087</span><span class="cx-tag">D3FEND D3-NTA, D3-RAPA</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Once <a href="../recon/index.html">reconnaissance</a> hands you a host list with banners, the next stage is per-service enumeration. Each service has its own protocol, default config, common misconfigurations, and operator playbook. This cluster covers the 16 services that account for the vast majority of "open port → finding" paths in real engagements.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Port-driven decision flow:
+#  port 21          → FTP                       (anon auth, file enum)
+#  port 22          → SSH                       (banner version, auth methods, key files)
+#  port 25/587/465  → SMTP                      (VRFY user enum, open relay)
+#  port 53          → DNS                       (AXFR zone transfer, version probe)
+#  port 110/995     → POP3                      (cred test, IMAP fallback)
+#  port 111/2049    → NFS                       (showmount, mount, file enum)
+#  port 135         → MS-RPC / WMI              (wmiexec)
+#  port 139/445     → SMB                       (anonymous shares, RID enum)
+#  port 143/993     → IMAP                      (cred test, folder browse)
+#  port 161/udp     → SNMP                      (community string bruteforce, OID walk)
+#  port 512/513/514 → R-services                (rlogin/rsh, .rhosts trust)
+#  port 623/udp     → IPMI                      (RAKP hash extraction)
+#  port 873         → Rsync                     (share enum, anon access)
+#  port 1433        → MSSQL                     (sa creds, xp_cmdshell)
+#  port 1521        → Oracle TNS                (SID enum, default creds)
+#  port 3306        → MySQL                     (empty root, db enum)
+#  port 3389        → RDP                       (NLA check, cert info)
+#  port 5985/5986   → WinRM                     (credentialed shell)</code></pre></figure>
+<p>Success indicator: per-service findings - credentials, file access, configuration disclosures, or chained vulnerabilities that lead to host compromise.</p>
+<h2 id="operator-mindset-for-this-cluster">Operator mindset for this cluster</h2>
+<p>Each page follows the same four-act structure because that's how an operator actually approaches a service:</p>
+<ol>
+<li><strong>Protocol overview</strong> - what's the service for, what's the wire protocol, what's the default port? You need a working mental model before you can spot what's wrong.</li>
+<li><strong>Default configuration</strong> - what does an out-of-the-box deployment look like? Knowing the baseline lets you spot deviations, which is where the findings come from.</li>
+<li><strong>Dangerous settings</strong> - the specific config knobs that admins flip for convenience and forget to flip back. Each one maps to a class of finding.</li>
+<li><strong>Footprinting commands</strong> - the actual commands that test for each dangerous setting and surface the data the operator needs.</li>
+</ol>
+<p>Every page is a self-contained reference. Read it linearly the first time you encounter the service; thereafter, jump to the footprinting section.</p>
+<h2 id="how-services-group-operationally">How services group operationally</h2>
+<p>Different services share tooling and mental models. For triage:</p>
+<table>
+<thead>
+<tr>
+<th>Family</th>
+<th>Pages</th>
+<th>Shared concern</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>File shares</strong></td>
+<td><a href="ftp/index.html">FTP</a>, <a href="smb/index.html">SMB</a>, <a href="nfs/index.html">NFS</a>, <a href="rsync/index.html">Rsync</a></td>
+<td>Anonymous access, world-readable shares, file enumeration</td>
+</tr>
+<tr>
+<td><strong>Mail</strong></td>
+<td><a href="smtp/index.html">SMTP</a>, <a href="imap-pop3/index.html">IMAP / POP3</a></td>
+<td>User enumeration, open relay, credential testing</td>
+</tr>
+<tr>
+<td><strong>Name resolution</strong></td>
+<td><a href="dns/index.html">DNS</a></td>
+<td>Zone transfer, subdomain disclosure</td>
+</tr>
+<tr>
+<td><strong>Network management</strong></td>
+<td><a href="snmp/index.html">SNMP</a>, <a href="ipmi/index.html">IPMI</a></td>
+<td>Community string defaults, hash retrieval</td>
+</tr>
+<tr>
+<td><strong>Databases</strong></td>
+<td><a href="mysql/index.html">MySQL</a>, <a href="mssql/index.html">MSSQL</a>, <a href="oracle-tns/index.html">Oracle TNS</a></td>
+<td>Default credentials, schema enumeration, file write primitives</td>
+</tr>
+<tr>
+<td><strong>Linux remote management</strong></td>
+<td><a href="ssh/index.html">SSH</a>, <a href="r-services/index.html">R-services</a></td>
+<td>Auth method enum, weak trust relationships</td>
+</tr>
+<tr>
+<td><strong>Windows remote management</strong></td>
+<td><a href="rdp/index.html">RDP</a>, <a href="winrm/index.html">WinRM</a>, <a href="wmi/index.html">WMI</a></td>
+<td>Credential reuse, NLA checks, named pipes</td>
+</tr>
+</tbody>
+</table>
+<p>These families share tooling: <code>smbclient</code>/<code>rpcclient</code> cover several Windows-adjacent services; <code>impacket</code> covers most of them; <code>nmap</code>'s NSE scripts have per-service coverage for everything in this list.</p>
+<h2 id="what-this-cluster-doesnt-cover">What this cluster doesn't cover</h2>
+<ul>
+<li><strong>Web services (HTTP/HTTPS)</strong> - handled in the <a href="../../../index.html">web cluster</a>. HTTP is its own universe and gets its own treatment.</li>
+<li><strong>Active Directory–specific protocols</strong> (LDAP, Kerberos, MS-RPC AD enumeration) - coming in a future cluster. SMB and WinRM here cover the basics that bleed into AD work but the AD-domain semantics need their own pages.</li>
+<li><strong>VPN / IPSec / SSL-VPN protocols</strong> - coming in a future cluster.</li>
+<li><strong>Industrial control / IoT protocols</strong> (Modbus, BACnet, MQTT) - niche, not currently covered.</li>
+</ul>
+<h2 id="a-note-on-stealth">A note on stealth</h2>
+<p>Active enumeration is loud. Every connection you make to a target service shows up in its logs and can trigger IDS/IPS alerts. Patterns to keep in mind:</p>
+<ul>
+<li><strong>Nmap default scripts</strong> identify themselves explicitly. RDP scans send a cookie <code>mstshash=nmap</code>; SMTP scans send recognizable HELO patterns. On hardened targets, these get caught.</li>
+<li><strong>Authentication failures cascade.</strong> A brute-force attempt against SSH that locks out an account creates a help-desk ticket and possibly a detection alert. <code>fail2ban</code> will block your source after a few failures.</li>
+<li><strong>Specific NSE scripts are noisier than others.</strong> <code>smb-vuln-*</code> scripts probe known CVEs and will trip any modern SIEM. <code>mssql-brute</code> and <code>mysql-brute</code> attempt credential pairs.</li>
+<li><strong>Volume matters.</strong> Scanning every port on every host at full speed across a /24 is unmistakable. Slow scans (<code>-T2</code> or <code>-T1</code> in nmap) trade time for stealth.</li>
+</ul>
+<p>Calibrate to the engagement. Black-box pen-tests usually accept the noise; red-team engagements often require careful pacing.</p>
+<h2 id="order-to-work-through-this-cluster">Order to work through this cluster</h2>
+<p>If you're learning the cluster sequentially: file shares first (highest immediate-finding rate), then databases (often defaulted credentials), then mail (cleanest user-enum primitives), then management protocols (highest-impact when credentials work).</p>
+<p>If you've found a specific port open: jump directly to the relevant page from the port lookup table at the top of this page.</p></article><nav class="cx-pager"><a class="cx-next" href="ftp/index.html">Next: FTP</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../license.html">License</a></p></footer>
+<script src="../../../codex.js"></script></body></html>

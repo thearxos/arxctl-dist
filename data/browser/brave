@@ -1,0 +1,23 @@
+#!/bin/sh
+# ArxOS: start Brave, first clearing a profile lock that no running Brave holds.
+# Chromium-based browsers refuse to start when their profile lock names another host, and anond's
+# hostname protection (hostname "localhost" during a session) leaves exactly that behind if Brave
+# was open across a session: Brave then never starts again, silently. A lock is only removed when
+# none of this user's Brave processes is running, so a live profile is never touched.
+# A running Brave is found by its executable, not its name: this script and its subshells are
+# also named brave, and they must not count as a running browser.
+brave_running() {
+  for p in /proc/[0-9]*; do
+    [ -O "$p" ] || continue
+    case "$(readlink "$p/exe" 2>/dev/null)" in
+      */brave-bin/brave|*/brave-browser/brave|*/brave.com/brave/brave) return 0 ;;
+    esac
+  done
+  return 1
+}
+for d in "$HOME/.config/BraveSoftware/Brave-Browser" "$HOME/.config/BraveSoftware/Brave-Browser-Beta"; do
+  if [ -L "$d/SingletonLock" ] && ! brave_running; then
+    rm -f -- "$d/SingletonLock" "$d/SingletonCookie" "$d/SingletonSocket"
+  fi
+done
+exec /usr/bin/brave "$@"

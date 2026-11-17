@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=ArxOS Bluetooth Audio
+Comment=AirPods and headphone battery/connect notifications
+Exec=/usr/local/bin/arxpods run
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

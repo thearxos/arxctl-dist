@@ -1,0 +1,13 @@
+[Unit]
+Description=ArxOS performance mode at start (Control Center, Performance)
+Documentation=https://arxos.uk/docs.html
+# set by the Control Center switch; without it this unit does nothing
+ConditionPathExists=/etc/arxos/performance-at-start
+After=systemd-modules-load.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/arxctl --perf-system boot
+
+[Install]
+WantedBy=multi-user.target

