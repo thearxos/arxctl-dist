@@ -1,0 +1,421 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SNMP · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Network › Service Footprinting</nav><h1>SNMP</h1><p class="cx-lede">Simple Network Management Protocol enumeration - community string brute-force, OID-tree walking, internal information extraction via SNMPv1/v2c, and the snmpwalk / onesixtyone / braa tool chain on UDP 161.</p><div class="cx-tags"><span class="cx-tag">MITRE T1046, T1016, T1049, T1082, T1018</span><span class="cx-tag">D3FEND D3-NTA</span><span class="cx-tag">IMPACT InternalAccess, CredentialTheft</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>SNMP is a network-device monitoring protocol. Versions 1 and 2c authenticate with a plaintext "community string" - basically a shared password - that's often left at the default <code>public</code>. When SNMPv1/v2c is exposed with a guessable community string, you get a read-out of the entire device's state: installed packages, running processes, network config, user accounts, sometimes more.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># 1. UDP scan (SNMP is UDP, won&#x27;t show on TCP scans)
+sudo nmap -sU -p161 &lt;target&gt;
+
+# 2. Brute-force community string
+onesixtyone -c /usr/share/seclists/Discovery/SNMP/snmp.txt &lt;target&gt;
+
+# 3. Walk the entire OID tree with the discovered community
+snmpwalk -v2c -c public &lt;target&gt;
+
+# 4. Faster brute-force walk
+braa public@&lt;target&gt;:.1.3.6.*
+
+# 5. Specific high-value OIDs
+snmpwalk -v2c -c public &lt;target&gt; 1.3.6.1.2.1.25.4.2.1.2     # running processes
+snmpwalk -v2c -c public &lt;target&gt; 1.3.6.1.2.1.25.6.3.1.2     # installed software
+snmpwalk -v2c -c public &lt;target&gt; 1.3.6.1.4.1.77.1.2.25      # Windows users</code></pre></figure>
+<p>Success indicator: <code>snmpwalk</code> returns OID/value pairs from the target (anything past the device basic-info OIDs). Common community string <code>public</code> is the highest-incidence finding.</p>
+<h2 id="protocol-overview">Protocol overview</h2>
+<p>SNMP queries devices for management information. It supports both reads ("what's the CPU temperature?") and writes ("set this configuration value"), plus an unsolicited "trap" channel for the device to push events to a manager.</p>
+<table>
+<thead>
+<tr>
+<th>Port</th>
+<th>Purpose</th>
+<th>Transport</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>UDP 161</strong></td>
+<td>Manager → agent queries (most operator work happens here)</td>
+<td>UDP</td>
+</tr>
+<tr>
+<td><strong>UDP 162</strong></td>
+<td>Agent → manager unsolicited traps</td>
+<td>UDP</td>
+</tr>
+</tbody>
+</table>
+<p>UDP-based: the protocol is connectionless, you fire requests at the device and it responds (or doesn't). Won't show on TCP port scans - must explicitly <code>-sU</code> to see it.</p>
+<h3 id="version-differences">Version differences</h3>
+<table>
+<thead>
+<tr>
+<th>Version</th>
+<th>Year</th>
+<th>Auth</th>
+<th>Encryption</th>
+<th>State</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>SNMPv1</strong></td>
+<td>1988</td>
+<td>Community string (plaintext)</td>
+<td>None</td>
+<td>Still in deprecated deployments, primary target for guessable-community attacks</td>
+</tr>
+<tr>
+<td><strong>SNMPv2c</strong></td>
+<td>1996</td>
+<td>Community string (plaintext)</td>
+<td>None</td>
+<td>Most common version actually deployed</td>
+</tr>
+<tr>
+<td><strong>SNMPv3</strong></td>
+<td>1998</td>
+<td>Username + password (HMAC)</td>
+<td>Optional (DES/AES)</td>
+<td>Best-practice modern deployment</td>
+</tr>
+</tbody>
+</table>
+<p>For operator purposes: v1 and v2c are functionally equivalent - both use community strings, both transmit them in cleartext. v3 is a different beast with proper authentication and optional encryption. This page focuses on v1/v2c because they're far more common and far more vulnerable.</p>
+<h3 id="mib-and-oids">MIB and OIDs</h3>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What it means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>MIB</strong> (Management Information Base)</td>
+<td>A text file describing the queryable objects on a device, in a tree structure</td>
+</tr>
+<tr>
+<td><strong>OID</strong> (Object Identifier)</td>
+<td>A specific node in the MIB tree, addressed by a dot-separated string of integers: <code>1.3.6.1.2.1.1.1.0</code></td>
+</tr>
+<tr>
+<td><strong>ASN.1</strong></td>
+<td>The notation MIBs are written in</td>
+</tr>
+</tbody>
+</table>
+<p>The OID tree is hierarchical:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>1                       iso
+1.3                     identified-organization
+1.3.6                   dod
+1.3.6.1                 internet
+1.3.6.1.2               mgmt
+1.3.6.1.2.1             mib-2
+1.3.6.1.2.1.1           system
+1.3.6.1.2.1.1.1.0       sysDescr (system description, full)
+1.3.6.1.2.1.1.4.0       sysContact (admin contact email)
+1.3.6.1.2.1.1.5.0       sysName (hostname)</code></pre></figure>
+<p>You don't need to memorize the tree. <code>snmpwalk</code> walks it for you; the <a href="https://www.alvestrand.no/objectid/">OID registry</a> is a searchable index.</p>
+<p>High-value OID subtrees:</p>
+<table>
+<thead>
+<tr>
+<th>OID</th>
+<th>Contents</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>1.3.6.1.2.1.1</code></td>
+<td>System info - hostname, OS description, contact, location, uptime</td>
+</tr>
+<tr>
+<td><code>1.3.6.1.2.1.2.2</code></td>
+<td>Network interfaces</td>
+</tr>
+<tr>
+<td><code>1.3.6.1.2.1.4.20</code></td>
+<td>IP addresses</td>
+</tr>
+<tr>
+<td><code>1.3.6.1.2.1.6.13</code></td>
+<td>TCP connection table</td>
+</tr>
+<tr>
+<td><code>1.3.6.1.2.1.25.1</code></td>
+<td>Host resources - uptime, RAM, mounted filesystems</td>
+</tr>
+<tr>
+<td><code>1.3.6.1.2.1.25.4.2.1</code></td>
+<td>Running processes</td>
+</tr>
+<tr>
+<td><code>1.3.6.1.2.1.25.6.3.1.2</code></td>
+<td>Installed software packages</td>
+</tr>
+<tr>
+<td><code>1.3.6.1.4.1.77.1.2.25</code></td>
+<td>(Windows) local user accounts</td>
+</tr>
+<tr>
+<td><code>1.3.6.1.4.1.77.1.4.1</code></td>
+<td>(Windows) primary domain</td>
+</tr>
+<tr>
+<td><code>1.3.6.1.4.1.77.1.2.27</code></td>
+<td>(Windows) shared printers</td>
+</tr>
+</tbody>
+</table>
+<h2 id="default-configuration-net-snmp">Default configuration - Net-SNMP</h2>
+<p>The Linux Net-SNMP daemon's config is at <code>/etc/snmp/snmpd.conf</code>. Filtered to non-comments:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>sysLocation    Sitting on the Dock of the Bay
+sysContact     Me &lt;me@example.org&gt;
+sysServices    72
+master         agentx
+agentaddress   127.0.0.1,[::1]
+view           systemonly  included   .1.3.6.1.2.1.1
+view           systemonly  included   .1.3.6.1.2.1.25.1
+rocommunity    public default -V systemonly
+rocommunity6   public default -V systemonly
+rouser         authPrivUser authpriv -V systemonly</code></pre></figure>
+<p>Settings to recognize:</p>
+<ul>
+<li><code>agentaddress</code> - which interface SNMP listens on (<code>127.0.0.1</code> = localhost only, <code>0.0.0.0</code> = all interfaces)</li>
+<li><code>view</code> definitions - subsets of the OID tree exposed to specific communities</li>
+<li><code>rocommunity &lt;string&gt;</code> - read-only access for the named community</li>
+<li><code>rwcommunity &lt;string&gt;</code> - read+write access for the named community</li>
+<li><code>rouser</code> / <code>rwuser</code> - SNMPv3 equivalents, named user instead of community</li>
+</ul>
+<p>By default, Net-SNMP exposes only a narrow <code>systemonly</code> view (basic system info + host resources) over the <code>public</code> community to localhost only. Real deployments often deviate to expose more, sometimes carelessly.</p>
+<h2 id="dangerous-settings">Dangerous settings</h2>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Why it's bad</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>agentaddress 0.0.0.0</code> (or <code>udp:161</code> without bind-IP)</td>
+<td>Listening on all interfaces - accessible from external networks</td>
+</tr>
+<tr>
+<td><code>rocommunity public</code> (or any weak string) on a publicly accessible interface</td>
+<td>Anyone who guesses <code>public</code> reads the whole tree</td>
+</tr>
+<tr>
+<td><code>rwcommunity &lt;weak&gt; &lt;wide-source&gt;</code></td>
+<td>Read+write access from a wide IP range - attacker can change device config</td>
+</tr>
+<tr>
+<td><code>view full included .1</code></td>
+<td>Wide-open view definition - the community has access to everything, not just <code>systemonly</code></td>
+</tr>
+<tr>
+<td>Multiple <code>rocommunity</code> lines</td>
+<td>Multiple community strings, each a potential weak point</td>
+</tr>
+<tr>
+<td><code>rwuser noauth</code></td>
+<td>SNMPv3 user with no authentication required</td>
+</tr>
+<tr>
+<td><code>rocommunity public 0.0.0.0/0</code></td>
+<td>The classic - <code>public</code> accessible from anywhere</td>
+</tr>
+</tbody>
+</table>
+<p>A misconfigured snmpd typically looks like this in the wild:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>agentaddress 0.0.0.0
+rocommunity public
+view all included .1</code></pre></figure>
+<p>That's: listen on all interfaces, accept <code>public</code>, expose the entire OID tree. Walking it yields the entire device state.</p>
+<h2 id="footprinting-commands">Footprinting commands</h2>
+<h3 id="port-discovery">Port discovery</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">sudo nmap -sU -p161 10.0.14.128</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>PORT    STATE  SERVICE
+161/udp open|filtered snmp</code></pre></figure>
+<p>UDP port states are tricky:</p>
+<ul>
+<li><strong><code>open|filtered</code></strong> - nmap can't tell. Could be open with a silent service, could be filtered. Almost always means "try snmpwalk and see if you get a response."</li>
+<li><strong><code>open</code></strong> - nmap got a positive UDP response back, confirming an SNMP service.</li>
+<li><strong><code>filtered</code></strong> - ICMP "port unreachable" returned, meaning a firewall is dropping.</li>
+<li><strong><code>closed</code></strong> - TCP-RST equivalent for UDP, very rare.</li>
+</ul>
+<p>The <code>--script snmp-info</code> NSE script can probe further:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">sudo nmap -sU -p161 --script snmp-info &lt;target&gt;</code></pre></figure>
+<h3 id="community-string-brute-force">Community string brute-force</h3>
+<p><code>onesixtyone</code> is purpose-built for this - fast, asynchronous, designed for sweeping many IPs with many community-string candidates:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">onesixtyone -c /usr/share/seclists/Discovery/SNMP/snmp.txt 10.0.14.128</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>Scanning 1 hosts, 3220 communities
+10.0.14.128 [public] Linux srv01 5.11.0-37-generic #41~20.04.2-Ubuntu SMP ... x86_64</code></pre></figure>
+<p>The <code>[public]</code> brackets mean that's the community string that worked, followed by the <code>sysDescr</code> (default OID <code>1.3.6.1.2.1.1.1.0</code>) - the device's self-description.</p>
+<p>The default wordlist (<code>snmp.txt</code> in SecLists) covers thousands of common community strings. For broader coverage, build a custom wordlist from the target's hostname patterns. Companies often name community strings after the hostname, the location, or the device role:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>public
+private
+community
+manager
+admin
+&lt;companyname&gt;
+&lt;companyname&gt;-snmp
+&lt;companyname&gt;-ro
+&lt;companyname&gt;-rw
+&lt;location&gt;-&lt;role&gt;     # e.g., dc1-router</code></pre></figure>
+<p>Tools like <a href="https://secf00tprint.github.io/blog/passwords/crunch/advanced/en"><code>crunch</code></a> can generate permutation-heavy lists, but most real-world community strings are short and memorable - admins picked them by hand.</p>
+<h3 id="full-oid-tree-walk">Full OID tree walk</h3>
+<p>Once you have a working community string:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">snmpwalk -v2c -c public 10.0.14.128</code></pre></figure>
+<p>Output is verbose. Example excerpts:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>iso.3.6.1.2.1.1.1.0 = STRING: &quot;Linux srv01 5.11.0-34-generic #36~20.04.1-Ubuntu SMP Fri Aug 27 ... x86_64&quot;
+iso.3.6.1.2.1.1.2.0 = OID: iso.3.6.1.4.1.8072.3.2.10
+iso.3.6.1.2.1.1.3.0 = Timeticks: (5134) 0:00:51.34
+iso.3.6.1.2.1.1.4.0 = STRING: &quot;bjones@example.local&quot;
+iso.3.6.1.2.1.1.5.0 = STRING: &quot;srv01&quot;
+iso.3.6.1.2.1.1.6.0 = STRING: &quot;Sitting on the Dock of the Bay&quot;
+iso.3.6.1.2.1.25.1.4.0 = STRING: &quot;BOOT_IMAGE=/boot/vmlinuz-5.11.0-34-generic root=UUID=9a6a5c52-... ro quiet splash&quot;</code></pre></figure>
+<p>What this leaks:</p>
+<ul>
+<li>Exact kernel version (<code>5.11.0-34-generic</code>) and distribution (<code>Ubuntu 20.04</code>)</li>
+<li>Admin contact email (<code>bjones@example.local</code>)</li>
+<li>Hostname (<code>srv01</code>)</li>
+<li>Boot command line, including UUID of the root filesystem</li>
+<li>Patch level - match the kernel to known privilege-escalation exploits</li>
+</ul>
+<p>Further down the walk:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>iso.3.6.1.2.1.25.6.3.1.2.1232 = STRING: &quot;printer-driver-sag-gdi_0.1-7_all&quot;
+iso.3.6.1.2.1.25.6.3.1.2.1235 = STRING: &quot;proftpd-basic_1.3.6c-2_amd64&quot;
+iso.3.6.1.2.1.25.6.3.1.2.1239 = STRING: &quot;pulseaudio_1:13.99.1-1ubuntu3.12_amd64&quot;
+iso.3.6.1.2.1.25.6.3.1.2.1243 = STRING: &quot;python3_3.8.2-0ubuntu2_amd64&quot;</code></pre></figure>
+<p>That's the full installed-package list with versions. Cross-reference against vulnerability databases for known CVEs in any package.</p>
+<h3 id="walking-specific-oids">Walking specific OIDs</h3>
+<p>To narrow the walk to interesting subtrees:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># System info
+snmpwalk -v2c -c public &lt;target&gt; 1.3.6.1.2.1.1
+
+# Network interfaces
+snmpwalk -v2c -c public &lt;target&gt; 1.3.6.1.2.1.2
+
+# IP addresses bound to this host
+snmpwalk -v2c -c public &lt;target&gt; 1.3.6.1.2.1.4.20
+
+# Running processes
+snmpwalk -v2c -c public &lt;target&gt; 1.3.6.1.2.1.25.4.2
+
+# Installed software
+snmpwalk -v2c -c public &lt;target&gt; 1.3.6.1.2.1.25.6.3.1.2
+
+# Active TCP connections
+snmpwalk -v2c -c public &lt;target&gt; 1.3.6.1.2.1.6.13
+
+# Windows: local users
+snmpwalk -v2c -c public &lt;target&gt; 1.3.6.1.4.1.77.1.2.25
+
+# Windows: primary domain
+snmpwalk -v2c -c public &lt;target&gt; 1.3.6.1.4.1.77.1.4.1
+
+# Cisco: running config (if accessible)
+snmpwalk -v2c -c public &lt;target&gt; 1.3.6.1.4.1.9.9.96.1.1.1.1.2</code></pre></figure>
+<h3 id="faster-braa">Faster: braa</h3>
+<p><code>snmpwalk</code> queries one OID at a time, walking sequentially. <code>braa</code> is asynchronous - fires many SNMP requests in parallel - and is dramatically faster for full-tree dumps.</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">braa public@10.0.14.128:.1.3.6.*</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>10.0.14.128:20ms:.1.3.6.1.2.1.1.1.0:Linux srv01 5.11.0-34-generic ... x86_64
+10.0.14.128:20ms:.1.3.6.1.2.1.1.2.0:.1.3.6.1.4.1.8072.3.2.10
+10.0.14.128:20ms:.1.3.6.1.2.1.1.3.0:548
+10.0.14.128:20ms:.1.3.6.1.2.1.1.4.0:bjones@example.local
+10.0.14.128:20ms:.1.3.6.1.2.1.1.5.0:srv01
+...</code></pre></figure>
+<p>Output is one-line-per-result, easy to grep:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">braa public@10.0.14.128:.1.3.6.* | grep -i &quot;process\|user\|password\|admin&quot;</code></pre></figure>
+<h3 id="verifying-writability-if-rw-is-enabled">Verifying writability - if <code>rw</code> is enabled</h3>
+<p>When <code>rwcommunity</code> is set, you can change device values via <code>snmpset</code>. This is mostly relevant for network devices (routers, switches) where SNMP-SET can:</p>
+<ul>
+<li>Change the running config</li>
+<li>Reboot the device</li>
+<li>Modify routing tables</li>
+<li>Disable interfaces</li>
+</ul>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">snmpset -v2c -c private &lt;target&gt; 1.3.6.1.2.1.1.5.0 s &quot;owned&quot;</code></pre></figure>
+<p>This sets the hostname (<code>sysName</code>) to "owned" - a benign test that confirms write access without breaking anything. <strong>Do not</strong> run write operations against production gear without explicit permission; one wrong OID can take down a router.</p>
+<h3 id="snmpv3-enumeration">SNMPv3 enumeration</h3>
+<p>If you find SNMPv3, brute-force is much slower (HMAC verification) but possible:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># Identify v3 users (engine ID enumeration is sometimes possible)
+snmpwalk -v3 -u testuser -l noAuthNoPriv &lt;target&gt;</code></pre></figure>
+<p>Most v3 deployments require both auth and priv (encryption). Without valid credentials, you don't get further than the engine-ID response. Brute-forcing v3 with <code>hydra</code> is possible but slow and noisy.</p>
+<h2 id="common-chained-workflows">Common chained workflows</h2>
+<p><strong>Community string → installed packages → kernel exploit:</strong>
+1. <code>onesixtyone</code> finds <code>public</code>
+2. <code>snmpwalk</code> reveals kernel version and patch level
+3. Cross-reference for unpatched kernel exploits
+4. After gaining a foothold elsewhere, the kernel exploit gets root</p>
+<p><strong>Community string → user list → password spray:</strong>
+1. Walk the user-accounts OID subtree (Windows targets especially)
+2. Extracted user list goes into a password-spray against RDP/SMB
+3. Hits give shell</p>
+<p><strong>Community string → running processes → finger services to target:</strong>
+1. Process list shows what's actually running
+2. Compare against open TCP ports - sometimes processes listen on internal-only interfaces
+3. Use SSRF or other paths to reach those internal services</p>
+<p><strong>Read community → write community guess:</strong>
+1. Once you've guessed <code>public</code> (read), try <code>private</code> (write) - many admins set both, just changing one letter
+2. Verify write access non-destructively
+3. Now you can modify device config - for routers/switches, that's a serious finding</p>
+<h2 id="quick-reference">Quick reference</h2>
+<table>
+<thead>
+<tr>
+<th>Task</th>
+<th>Command</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>UDP scan</td>
+<td><code>sudo nmap -sU -p161 &lt;target&gt;</code></td>
+</tr>
+<tr>
+<td>Community brute</td>
+<td><code>onesixtyone -c snmp.txt &lt;target&gt;</code></td>
+</tr>
+<tr>
+<td>Full walk</td>
+<td><code>snmpwalk -v2c -c public &lt;target&gt;</code></td>
+</tr>
+<tr>
+<td>Specific OID</td>
+<td><code>snmpwalk -v2c -c public &lt;target&gt; 1.3.6.1.2.1.25</code></td>
+</tr>
+<tr>
+<td>Fast walk</td>
+<td><code>braa public@&lt;target&gt;:.1.3.6.*</code></td>
+</tr>
+<tr>
+<td>Get one OID</td>
+<td><code>snmpget -v2c -c public &lt;target&gt; 1.3.6.1.2.1.1.5.0</code></td>
+</tr>
+<tr>
+<td>Set one OID (rw)</td>
+<td><code>snmpset -v2c -c private &lt;target&gt; &lt;OID&gt; s "value"</code></td>
+</tr>
+<tr>
+<td>System info</td>
+<td>OID <code>1.3.6.1.2.1.1</code></td>
+</tr>
+<tr>
+<td>Running processes</td>
+<td>OID <code>1.3.6.1.2.1.25.4.2</code></td>
+</tr>
+<tr>
+<td>Installed software</td>
+<td>OID <code>1.3.6.1.2.1.25.6.3.1.2</code></td>
+</tr>
+<tr>
+<td>Windows users</td>
+<td>OID <code>1.3.6.1.4.1.77.1.2.25</code></td>
+</tr>
+</tbody>
+</table></article><nav class="cx-pager"><a class="cx-prev" href="../imap-pop3/index.html">Previous: IMAP &amp; POP3</a><a class="cx-next" href="../mysql/index.html">Next: MySQL</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>

